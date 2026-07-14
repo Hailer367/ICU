@@ -1,3 +1,7 @@
 # JADX tooling (not part of source)
 tools/
 *.zip
+
+# Python build cache
+__pycache__/
+*.pyc
