@@ -3,3 +3,5 @@ cache/
 broadcast/
 .env
 .venv/
+lib/
+lcov.info
