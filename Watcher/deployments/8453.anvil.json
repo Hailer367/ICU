@@ -1,0 +1,36 @@
+{
+  "chainId": 8453,
+  "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "blockNumber": "53253680",
+  "timestamp": "1793296734",
+  "core": "0x7Be6E341624D7f730f91CAa7867416D63DbEA219",
+  "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
+  "owner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "operator": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "profitRecipient": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "adapters": {
+    "univ3": "0x9eaEb6Ffb89E80A5f7e926ef7cee0831C9348516",
+    "univ2": "0x5c7e41E0bDc3C406a3c99BC5f03D79e8cABE7Cad",
+    "aerodrome": "0x9EEaBc0705aecfd61dDb488598261EB11e7C2438",
+    "slipstream": "0x9Ba9F602B84D46f9c511518520aFb773162A0df3"
+  },
+  "routers": {
+    "univ3": "0x2626664c2603336E57B271c5C0b26F421741e481",
+    "univ2": "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24",
+    "aerodrome": "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43",
+    "slipstream": "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"
+  },
+  "tokens": {
+    "WETH": "0x4200000000000000000000000000000000000006",
+    "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "cbBTC": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+    "EURC": "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42",
+    "AERO": "0x940181a94A35A4569E4529A3CDfB74e38FD98631"
+  },
+  "caps": {
+    "USDC": "8000000000",
+    "WETH": "4000000000000000000"
+  },
+  "maxGasPrice": "3000000000",
+  "version": 1
+}
