@@ -192,6 +192,9 @@ pub struct Settings {
     pub fallback_gas: u64,
     /// USD amounts used to probe route profitability before grid refinement.
     pub probe_amounts_usd: Vec<f64>,
+    /// Swaps smaller than this USD notional are ignored before quoting. Stored
+    /// as configured; the scanner always enforces a hard floor on top.
+    pub min_swap_usd: f64,
 }
 
 impl Default for Settings {
@@ -213,6 +216,7 @@ impl Default for Settings {
             assets: vec!["USDC".to_string(), "WETH".to_string()],
             fallback_gas: 450_000,
             probe_amounts_usd: vec![500.0, 2_000.0, 8_000.0],
+            min_swap_usd: 500.0,
         }
     }
 }
@@ -252,6 +256,9 @@ impl Settings {
         }
         if !self.min_net_profit_usd.is_finite() || self.min_net_profit_usd < 0.0 {
             bail!("min_net_profit_usd must be a non-negative number");
+        }
+        if !self.min_swap_usd.is_finite() || self.min_swap_usd < 0.0 {
+            bail!("min_swap_usd must be a non-negative number");
         }
         if !self.max_gas_price_gwei.is_finite() || self.max_gas_price_gwei <= 0.0 {
             bail!("max_gas_price_gwei must be a positive number");
@@ -309,5 +316,6 @@ mod tests {
         assert_eq!(settings.max_candidates, 16);
         assert_eq!(settings.max_simulations, 8);
         assert_eq!(settings.probe_amounts_usd, vec![500.0, 2_000.0, 8_000.0]);
+        assert_eq!(settings.min_swap_usd, 500.0);
     }
 }

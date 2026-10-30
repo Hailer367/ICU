@@ -233,77 +233,80 @@ impl Registry {
         );
 
         let pools = vec![
+            // Chain order for every pool below: WETH is token0, USDC is
+            // token1. Quoting does not depend on this, but amount decoding
+            // does (see scanner::swap_notional_usd).
             Pool {
                 address: address!("b4cb800910b228ed3d0834cf79d697127bbb00e5"),
                 venue: Venue::UniV3 { fee: 100 },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("d0b53d9277642d899df5c87a3966a349a798f224"),
                 venue: Venue::UniV3 { fee: 500 },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("6c561b446416e1a00e8e93e221854d6ea4171372"),
                 venue: Venue::UniV3 { fee: 3000 },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("0b1c2dcbbfa744ebd3fc17ff1a96a1e1eb4b2d69"),
                 venue: Venue::UniV3 { fee: 10000 },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("88a43bbdf9d098eec7bceda4e2494615dfd9bb9c"),
                 venue: Venue::UniV2,
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("cdac0d6c6c59727a65f871236188350531885c43"),
                 venue: Venue::Aerodrome { stable: false },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("3548029694fbb241d45fb24ba0cd9c9d4e745f16"),
                 venue: Venue::Aerodrome { stable: true },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("dbc6998296caa1652a810dc8d3baf4a8294330f1"),
                 venue: Venue::Slipstream { tick_spacing: 1 },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("b150768cf55d1625e2337a08fbd1b0f02ff94bdb"),
                 venue: Venue::Slipstream { tick_spacing: 10 },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("aad23a67f2ac693abbe543489aeb3f24f561d517"),
                 venue: Venue::Slipstream { tick_spacing: 50 },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59"),
                 venue: Venue::Slipstream { tick_spacing: 100 },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
             Pool {
                 address: address!("148bc43946a902258916e580b0e6d92aaa74746f"),
                 venue: Venue::Slipstream { tick_spacing: 200 },
-                token0: usdc,
-                token1: weth,
+                token0: weth,
+                token1: usdc,
             },
         ];
 

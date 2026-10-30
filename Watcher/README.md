@@ -111,6 +111,7 @@ default `mainnet.base.org` endpoint rejects `eth_getLogs` with
 | `--max-candidates` | `RYO_MAX_CANDIDATES` | `16` | Routes refined per asset |
 | `--max-simulations` | `RYO_MAX_SIMULATIONS` | `8` | `simulate` calls per asset per trigger |
 | `--probe-usd` | `RYO_PROBE_USD` | `500,2000,8000` | Probe sizes in USD |
+| `--min-swap-usd` | `RYO_MIN_SWAP_USD` | `500` | Ignore trigger swaps below this USD notional ($45 hard floor) |
 | `--max-hops` | `RYO_MAX_HOPS` | `2` | Route length (2 = one pool out, one back) |
 | `--assets` | `RYO_ASSETS` | `USDC,WETH` | Assets scanned, in order |
 | `--fallback-gas` | `RYO_FALLBACK_GAS` | `450000` | Gas estimate used if `eth_estimateGas` fails |
@@ -118,6 +119,12 @@ default `mainnet.base.org` endpoint rejects `eth_getLogs` with
 Opportunities must pass **all** gates: core not paused, watcher gas ceiling,
 core `maxGasPrice`, positive simulated profit, and net USD ≥
 `min-net-profit-usd`. Trade size is capped by `min(manifest cap, core cap)`.
+
+In `watch`, a swap in one of the 12 pools is the trigger. Swaps below
+`--min-swap-usd` are ignored before any quoting; the 24h dataset shows this
+drops ~78 % of events while keeping ~99 % of the swaps that can open a
+$0.25 opportunity. Logs that are not swaps (mints, burns, collects) are not
+size-filtered.
 
 ## Tests
 

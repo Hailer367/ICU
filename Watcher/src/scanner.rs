@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, Bytes, I256, U256};
+use alloy::rpc::types::Log;
 use alloy::sol_types::SolCall;
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
@@ -20,7 +21,8 @@ use crate::chain::{self, ChainProvider};
 use crate::config::{Manifest, Settings, base};
 use crate::events::Trigger;
 use crate::gas::{self, GasSnapshot, TradeCost};
-use crate::routes::{Registry, Route, enumerate_cycles};
+use crate::history;
+use crate::routes::{Registry, Route, Venue, enumerate_cycles};
 use crate::simulate::{self, SimulateError};
 use crate::venues::{self, QuoteRequest};
 
@@ -30,6 +32,10 @@ const GAS_CACHE_TTL: Duration = Duration::from_secs(2);
 /// Remember this many recent triggers so `logs` + `pendingLogs` duplicates do
 /// not cause two identical scans.
 const DEDUPE_CAPACITY: usize = 2_048;
+/// A swap smaller than this cannot repay the minimum profit: at ~0.56 % round
+/// trip (pool fees + profit buffer), $0.25 needs about $45 of notional. The
+/// floor applies even when `min_swap_usd` is configured lower.
+const ABSOLUTE_MIN_SWAP_USD: f64 = 45.0;
 
 #[derive(Debug, Clone)]
 pub struct Opportunity {
@@ -253,6 +259,25 @@ impl Scanner {
         &self.provider
     }
 
+    /// Effective swap-size filter: the configured value, never below the hard
+    /// floor derived from the profit target and round-trip cost.
+    fn min_swap_usd(&self) -> f64 {
+        effective_min_swap_usd(self.settings.min_swap_usd)
+    }
+
+    /// USD notional of a swap log, read from its USDC leg (USDC ≈ $1).
+    /// `None` when the log is not a swap or the pool is unknown; those logs are
+    /// left unfiltered rather than silently dropped.
+    fn swap_notional_usd(&self, log: &Log) -> Option<f64> {
+        let pool = self.registry.pool(*self.pool_index.get(&log.address())?);
+        let decimals = self
+            .registry
+            .token(base::USDC)
+            .map(|token| token.decimals)
+            .unwrap_or(6);
+        swap_notional_usd(log, pool, decimals)
+    }
+
     pub async fn scan_once(&self) -> Result<ScanReport> {
         self.evaluate(None, ScanBlock::Latest).await
     }
@@ -343,8 +368,14 @@ impl Scanner {
             // when blocks were skipped since the last evaluate (a reorg or a
             // dropped WebSocket message), in which case one full rescan is due.
             Trigger::Head { number } => {
-                let last = *self.last_block.lock().expect("last block mutex poisoned");
-                if head_requires_rescan(last, *number) {
+                let mut last = self.last_block.lock().expect("last block mutex poisoned");
+                let previous = *last;
+                // Heads are liveness markers. Advance the marker on every head
+                // so idle stretches do not look like gaps; only a real jump or
+                // a backwards head triggers the full rescan.
+                *last = Some(*number);
+                drop(last);
+                if head_requires_rescan(previous, *number) {
                     gap_rescan = true;
                     None
                 } else {
@@ -355,23 +386,42 @@ impl Scanner {
                 }
             }
             Trigger::Reconnect => None,
-            Trigger::Log { log, .. } => self
-                .pool_index
-                .get(&log.address())
-                .map(|index| vec![*index]),
+            Trigger::Log { log, .. } => {
+                if let Some(notional) = self.swap_notional_usd(log) {
+                    let floor = self.min_swap_usd();
+                    if notional < floor {
+                        return Ok(ScanReport {
+                            notes: vec![format!(
+                                "swap ~${notional:.0} below the ${floor:.0} minimum; skipped"
+                            )],
+                            ..Default::default()
+                        });
+                    }
+                }
+                self.pool_index
+                    .get(&log.address())
+                    .map(|index| vec![*index])
+            }
             Trigger::Flashblock { logs, .. } => {
+                let floor = self.min_swap_usd();
                 let mut set = HashSet::new();
                 for log in logs {
-                    if let Some(index) = self.pool_index.get(&log.address()) {
-                        set.insert(*index);
+                    let Some(index) = self.pool_index.get(&log.address()).copied() else {
+                        continue;
+                    };
+                    if let Some(notional) = self.swap_notional_usd(log)
+                        && notional < floor
+                    {
+                        continue;
                     }
+                    set.insert(index);
                 }
                 if set.is_empty() {
                     // A flashblock transaction list without logs does not tell
                     // us which pools changed. Skip rather than scan everything
                     // on every flashblock.
                     return Ok(ScanReport {
-                        notes: vec!["flashblock contained no known pool logs".to_string()],
+                        notes: vec!["flashblock contained no qualifying pool logs".to_string()],
                         ..Default::default()
                     });
                 }
@@ -998,6 +1048,23 @@ fn head_requires_rescan(last: Option<u64>, head: u64) -> bool {
     }
 }
 
+fn effective_min_swap_usd(configured: f64) -> f64 {
+    configured.max(ABSOLUTE_MIN_SWAP_USD)
+}
+
+fn swap_notional_usd(log: &Log, pool: &crate::routes::Pool, usdc_decimals: u8) -> Option<f64> {
+    let concentrated = matches!(pool.venue, Venue::UniV3 { .. } | Venue::Slipstream { .. });
+    let (amount0, amount1) = history::swap_deltas(log, concentrated)?;
+    let usdc = if pool.token0 == base::USDC {
+        amount0
+    } else if pool.token1 == base::USDC {
+        amount1
+    } else {
+        return None;
+    };
+    Some(gas::raw_to_f64(usdc.unsigned_abs(), usdc_decimals))
+}
+
 /// Return the reason gas is too expensive, or `None` when both ceilings pass.
 fn gas_ceiling_note(
     settings: &Settings,
@@ -1059,7 +1126,145 @@ fn u256_to_f64(value: U256) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::Registry;
+    use crate::routes::{Pool, Registry};
+    use alloy::primitives::keccak256;
+    use serde_json::json;
+
+    const SWAP_V3_SIG: &str = "Swap(address,address,int256,int256,uint160,uint128,int24)";
+    const SWAP_SOLIDLY_SIG: &str = "Swap(address,address,uint256,uint256,uint256,uint256)";
+
+    fn hex_word(value: &str) -> String {
+        format!("{value:0>64}")
+    }
+
+    fn signed_word(value: i64) -> String {
+        let raw = if value < 0 {
+            U256::MAX - U256::from(value.unsigned_abs() - 1)
+        } else {
+            U256::from(value as u64)
+        };
+        format!("{raw:064x}")
+    }
+
+    fn log_from_json(value: serde_json::Value) -> Log {
+        serde_json::from_value(value).expect("log json")
+    }
+
+    /// All USDC/WETH pools list WETH as token0 and USDC as token1.
+    fn weth_usdc_pool(venue: Venue) -> Pool {
+        Pool {
+            address: base::WETH,
+            venue,
+            token0: base::WETH,
+            token1: base::USDC,
+        }
+    }
+
+    /// Concentrated swap with `usdc` (6-decimal units) as the token1 leg.
+    fn v3_swap(usdc: i64) -> Log {
+        let data = format!(
+            "0x{}{}{}{}{}",
+            hex_word("0"),
+            signed_word(usdc),
+            hex_word("0"),
+            hex_word("0"),
+            hex_word("0")
+        );
+        log_from_json(json!({
+            "address": base::WETH.to_string(),
+            "topics": [format!("{:#x}", keccak256(SWAP_V3_SIG.as_bytes()))],
+            "data": data,
+            "blockNumber": "0x1",
+            "transactionIndex": "0x0",
+            "logIndex": "0x0"
+        }))
+    }
+
+    /// Solidly swap with the USDC leg as token1: `usdc_in - usdc_out`.
+    fn solidly_swap(usdc_in: u64, usdc_out: u64) -> Log {
+        let data = format!(
+            "0x{}{}{}{}",
+            hex_word("0"),
+            hex_word(&format!("{usdc_in:x}")),
+            hex_word("0"),
+            hex_word(&format!("{usdc_out:x}"))
+        );
+        log_from_json(json!({
+            "address": base::WETH.to_string(),
+            "topics": [format!("{:#x}", keccak256(SWAP_SOLIDLY_SIG.as_bytes()))],
+            "data": data,
+            "blockNumber": "0x1",
+            "transactionIndex": "0x0",
+            "logIndex": "0x0"
+        }))
+    }
+
+    #[test]
+    fn notional_reads_the_usdc_leg() {
+        let pool = weth_usdc_pool(Venue::UniV3 { fee: 500 });
+        // Direction does not matter for size: +750 and -750 are both $750.
+        assert_eq!(
+            swap_notional_usd(&v3_swap(750_000_000), &pool, 6),
+            Some(750.0)
+        );
+        assert_eq!(
+            swap_notional_usd(&v3_swap(-750_000_000), &pool, 6),
+            Some(750.0)
+        );
+    }
+
+    #[test]
+    fn solidly_notional_uses_signed_delta() {
+        let pool = weth_usdc_pool(Venue::Aerodrome { stable: false });
+        // 2,000 USDC into the pool: positive token1 delta.
+        assert_eq!(
+            swap_notional_usd(&solidly_swap(2_000_000_000, 0), &pool, 6),
+            Some(2_000.0)
+        );
+        // 500 USDC out and no USDC in: negative delta, same size.
+        assert_eq!(
+            swap_notional_usd(&solidly_swap(0, 500_000_000), &pool, 6),
+            Some(500.0)
+        );
+    }
+
+    #[test]
+    fn dust_swaps_fall_below_the_default_floor() {
+        let pool = weth_usdc_pool(Venue::UniV3 { fee: 500 });
+        let floor = effective_min_swap_usd(Settings::default().min_swap_usd);
+        let dust = swap_notional_usd(&v3_swap(30_000_000), &pool, 6).expect("notional");
+        assert!(dust < floor, "dust {dust} should be below floor {floor}");
+        let large = swap_notional_usd(&v3_swap(5_000_000_000), &pool, 6).expect("notional");
+        assert!(large >= floor, "large {large} should pass floor {floor}");
+    }
+
+    #[test]
+    fn pool_without_a_usdc_leg_has_no_notional() {
+        let pool = Pool {
+            address: base::WETH,
+            venue: Venue::UniV3 { fee: 500 },
+            token0: base::WETH,
+            token1: base::EURC,
+        };
+        assert!(swap_notional_usd(&v3_swap(750_000_000), &pool, 6).is_none());
+    }
+
+    #[test]
+    fn non_swap_log_has_no_notional() {
+        let pool = weth_usdc_pool(Venue::UniV3 { fee: 500 });
+        let log = log_from_json(json!({
+            "address": base::WETH.to_string(),
+            "topics": [format!(
+                "{:#x}",
+                keccak256("Mint(address,address,int24,int24,uint256,uint256)".as_bytes())
+            )],
+            "data": format!("0x{}", hex_word("0")),
+            "blockNumber": "0x1",
+            "transactionIndex": "0x0",
+            "logIndex": "0x0"
+        }));
+        assert!(swap_notional_usd(&log, &pool, 6).is_none());
+    }
 
     #[test]
     fn builds_floors_with_slippage() {
@@ -1099,6 +1304,14 @@ mod tests {
         assert!(!head_requires_rescan(Some(100), 101));
         assert!(head_requires_rescan(Some(100), 102));
         assert!(head_requires_rescan(Some(100), 99));
+    }
+
+    #[test]
+    fn swap_size_filter_has_a_hard_floor() {
+        assert_eq!(effective_min_swap_usd(0.0), ABSOLUTE_MIN_SWAP_USD);
+        assert_eq!(effective_min_swap_usd(10.0), ABSOLUTE_MIN_SWAP_USD);
+        assert_eq!(effective_min_swap_usd(500.0), 500.0);
+        assert_eq!(effective_min_swap_usd(1_000.0), 1_000.0);
     }
 
     #[test]

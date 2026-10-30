@@ -297,6 +297,40 @@ cargo run -- --http-rpc http://127.0.0.1:8545 \
   --manifest deployments/8453.anvil.json --max-gas-price-gwei 3 scan
 ```
 
+### 0f. Swap-size trigger filter (2026-10-30, same session)
+
+The 24h dataset showed most trigger traffic is dust: 40 % of swaps are under
+$50, 78 % under $500, 86 % under $1,000. A simple model (closable edge ≈
+½ × price move × swap size) puts only ~5 % of swaps above the $0.25 profit
+threshold, and 99 % of those are ≥ $500.
+
+- **Hard floor $45** (`ABSOLUTE_MIN_SWAP_USD`): at ~0.56 % round-trip cost
+  (pool fees + profit buffer), $0.25 needs ~$45 of notional; smaller swaps
+  cannot pay for a scan regardless of configuration.
+- **`--min-swap-usd` / `RYO_MIN_SWAP_USD`, default 500**: swaps below this USD
+  notional are skipped before quoting (effective floor is
+  `max(configured, 45)`). A $500 default removes ~78 % of trigger scans and
+  loses ~0.7 % of the estimated ≥ $0.25 events.
+- **Only decodable `Swap` logs are filtered.** Notional comes from the USDC
+  leg, so no ETH price fetch is needed. Non-swap pool events (Mint/Burn/
+  Collect) stay unfiltered, as do logs whose pool is unknown.
+- `history::swap_deltas` now checks topic0 against the V3/V2/Solidly swap
+  signatures before decoding; previously a V3 Mint (five data words) could be
+  mis-decoded as a swap.
+- **Registry token order corrected.** All 12 pools list WETH as `token0` and
+  USDC as `token1` on-chain (verified for every pool). The registry had them
+  reversed. Quoting was unaffected (routers read the pool's own order), but
+  amount decoding now depends on the correct mapping.
+- **Head marker fix.** `last_block` advanced only inside `evaluate`, so in idle
+  stretches consecutive `newHeads` looked like gaps and forced a full rescan
+  every other block — effectively 2-block polling, and much worse once dust
+  filtering made idle periods common. Every head now advances the marker; only
+  a real jump or a backwards head triggers the gap rescan.
+
+Tests: 44 lib tests + 1 WS test pass (`swap_size_filter_has_a_hard_floor`,
+`rejects_non_swap_events`, and five notional tests: USDC-leg reading, Solidly
+signed deltas, dust vs. large, non-USDC pool, non-swap log). Clippy/fmt clean.
+
 ---
 
 ## 1. Goal and hard constraints
@@ -416,7 +450,7 @@ Important Alloy mapping details:
   and `maxGasPrice`.
 - `Settings` holds runtime knobs: RPC URLs, mode, source, profit/gas gates,
   slippage, buffer, grid points, candidates, hops, asset symbols, fallback gas,
-  probe USD amounts.
+  probe USD amounts, and the swap-size filter (`min_swap_usd`, default 500).
 - `Mode`: `dry-run`, `paper`, `live` (clap `ValueEnum`).
 - `EventSource`: `logs`, `pending-logs`, `flashblocks`, `both`, `once`.
 - `base`: verified Base mainnet constants (see section 7).
@@ -494,7 +528,8 @@ only.
   `Slipstream{tick_spacing}`.
 - `Venue::data()` encodes adapter-specific bytes (empty for UniV2, 32-byte
   word for fee/stable/tick spacing).
-- `Registry::base_usdc_weth()`: **12 verified pools** (see section 7).
+- `Registry::base_usdc_weth()`: **12 verified pools** (see section 7). Pools
+  declare the chain order, WETH first and USDC second.
 - `enumerate_cycles(registry, asset, max_hops)` with pool/token reuse rules.
 - `parse_route(registry, asset, "univ3:500,univ3:100")`.
 - `Route::to_steps(manifest, floors)` and `route_hash(manifest, floors)`.
@@ -541,6 +576,10 @@ only.
 - Routes are enumerated once per asset at construction.
 - `scan_trigger` drops duplicate `(tx hash, log index)` events and duplicate
   flashblock hash sets.
+- Swap triggers below `max(min_swap_usd, $45)` USD notional return before any
+  quoting; non-swap logs are not size-filtered.
+- Every `newHeads` tick advances the last-seen block marker; only a forward
+  jump or a backwards head forces a full rescan.
 - Reads core `paused`, `maxGasPrice`, `maxTradeSize(asset)`.
 - Resolves caps as `min(manifest cap, core cap)`, skips zero caps.
 - Event filter: only routes containing affected pool indices.
@@ -599,6 +638,7 @@ Global options and env vars:
 --max-candidates RYO_MAX_CANDIDATES
 --max-simulations RYO_MAX_SIMULATIONS
 --probe-usd      RYO_PROBE_USD
+--min-swap-usd   RYO_MIN_SWAP_USD
 --max-hops       RYO_MAX_HOPS
 --assets         RYO_ASSETS
 --fallback-gas   RYO_FALLBACK_GAS
@@ -618,9 +658,10 @@ cd Watcher
 cargo test
 ```
 
-Result: **37 lib tests + 1 WebSocket integration test passed, 0 failed**
+Result: **44 lib tests + 1 WebSocket integration test passed, 0 failed**
 (2026-10-30; 27 before the completion pass, 31 after it, 36 after the history
-module, 37 after the replay staleness fix). `cargo clippy --all-targets` is
+module, 37 after the replay staleness fix, 39 after the swap-size filter,
+44 after adding notional decoding tests). `cargo clippy --all-targets` is
 clean after fixes.
 `tests/events_ws.rs` uses an in-process mock server and needs no network.
 `tests/fork_opportunity.rs` is `#[ignore]`d and needs a local Anvil fork; it is
@@ -640,6 +681,8 @@ Coverage of unit tests:
 - settings defaults, dedupe semantics, head-gap rescan, gas ceiling gate
 - historical swap decoding (V3, V2, Solidly topics, int24 sign)
 - Chainlink staleness against chain time (historical fork replay)
+- swap-size filter floor, USDC-leg notional decoding (V3 and Solidly), and
+  non-swap event rejection
 
 ### Live Base HTTP checks
 

@@ -107,6 +107,9 @@ struct Cli {
     )]
     probe_usd: Vec<f64>,
 
+    #[arg(long, env = "RYO_MIN_SWAP_USD", default_value_t = 500.0, global = true)]
+    min_swap_usd: f64,
+
     #[arg(long, env = "RYO_MAX_HOPS", default_value_t = 2, global = true)]
     max_hops: usize,
 
@@ -312,6 +315,7 @@ fn settings_from_cli(cli: &Cli) -> Settings {
         assets: cli.assets.clone(),
         fallback_gas: cli.fallback_gas,
         probe_amounts_usd: cli.probe_usd.clone(),
+        min_swap_usd: cli.min_swap_usd,
     }
 }
 

@@ -116,6 +116,46 @@ fn int_word(data: &[u8], index: usize) -> Option<I256> {
     word(data, index).map(I256::from_raw)
 }
 
+fn signature_topic(signature: &str) -> B256 {
+    keccak256(signature.as_bytes())
+}
+
+fn is_swap_topic(log: &Log, concentrated: bool) -> bool {
+    let Some(topic) = log.topics().first() else {
+        return false;
+    };
+    if concentrated {
+        *topic == signature_topic(SWAP_V3_SIG)
+    } else {
+        *topic == signature_topic(SWAP_V2_SIG) || *topic == signature_topic(SWAP_SOLIDLY_SIG)
+    }
+}
+
+/// Signed pool-balance deltas (positive = the pool received that token) for a
+/// `Swap` log. Returns `None` for another event type or a truncated payload.
+pub fn swap_deltas(log: &Log, concentrated: bool) -> Option<(I256, I256)> {
+    if !is_swap_topic(log, concentrated) {
+        return None;
+    }
+    let data = &log.data().data;
+    if concentrated {
+        if data.len() < 160 {
+            return None;
+        }
+        Some((int_word(data, 0)?, int_word(data, 1)?))
+    } else {
+        if data.len() < 128 {
+            return None;
+        }
+        // Constant-product events carry amount0In, amount1In, amount0Out,
+        // amount1Out. Normalize to the V3 convention.
+        Some((
+            signed_delta(word(data, 0)?, word(data, 2)?)?,
+            signed_delta(word(data, 1)?, word(data, 3)?)?,
+        ))
+    }
+}
+
 /// Decode one swap log into a record. Returns `None` for a pool or payload
 /// shape the registry does not recognise.
 pub fn decode_swap(log: &Log, concentrated: bool, registry: &Registry) -> Option<SwapRecord> {
@@ -124,33 +164,16 @@ pub fn decode_swap(log: &Log, concentrated: bool, registry: &Registry) -> Option
     let sender = topics.get(1).map(topic_address).unwrap_or(Address::ZERO);
     let recipient = topics.get(2).map(topic_address).unwrap_or(Address::ZERO);
     let data = &log.data().data;
+    let (amount0, amount1) = swap_deltas(log, concentrated)?;
 
-    let (amount0, amount1, sqrt_price_x96, liquidity, tick) = if concentrated {
-        if data.len() < 160 {
-            return None;
-        }
-        let tick = i24_from_word(word(data, 4)?);
+    let (sqrt_price_x96, liquidity, tick) = if concentrated {
         (
-            int_word(data, 0)?.to_string(),
-            int_word(data, 1)?.to_string(),
             Some(word(data, 2)?.to_string()),
             Some(word(data, 3)?.to_string()),
-            Some(tick),
+            Some(i24_from_word(word(data, 4)?)),
         )
     } else {
-        if data.len() < 128 {
-            return None;
-        }
-        // Constant-product events carry amount0In, amount1In, amount0Out,
-        // amount1Out. Normalize to the V3 convention: the pool's balance delta
-        // for the token, positive when the pool received it.
-        (
-            signed_delta(word(data, 0)?, word(data, 2)?),
-            signed_delta(word(data, 1)?, word(data, 3)?),
-            None,
-            None,
-            None,
-        )
+        (None, None, None)
     };
 
     Some(SwapRecord {
@@ -162,22 +185,16 @@ pub fn decode_swap(log: &Log, concentrated: bool, registry: &Registry) -> Option
         venue: pool.venue.label(),
         sender: sender.to_string(),
         recipient: recipient.to_string(),
-        amount0,
-        amount1,
+        amount0: amount0.to_string(),
+        amount1: amount1.to_string(),
         sqrt_price_x96,
         liquidity,
         tick,
     })
 }
 
-fn signed_delta(input: U256, output: U256) -> String {
-    let delta = I256::try_from(input)
-        .ok()
-        .zip(I256::try_from(output).ok())
-        .map(|(input, output)| input - output);
-    delta
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "0".to_string())
+fn signed_delta(input: U256, output: U256) -> Option<I256> {
+    Some(I256::try_from(input).ok()? - I256::try_from(output).ok()?)
 }
 
 /// Interpret the low three bytes of a two's-complement int24 word.
@@ -433,6 +450,34 @@ mod tests {
             "transactionIndex": "0x0",
             "logIndex": "0x0"
         }));
+        assert!(decode_swap(&log, true, &registry).is_none());
+    }
+
+    #[test]
+    fn rejects_non_swap_events() {
+        let registry = Registry::base_usdc_weth().unwrap();
+        // A V3 Mint has five data words, enough to look like a swap payload,
+        // but its topic0 identifies a different event.
+        let data = format!(
+            "0x{}{}{}{}{}",
+            hex_word("0"),
+            hex_word("0"),
+            hex_word("0"),
+            hex_word("0"),
+            hex_word("0")
+        );
+        let log = log_from_json(json!({
+            "address": POOL,
+            "topics": [format!(
+                "{:#x}",
+                keccak256("Mint(address,address,int24,int24,uint256,uint256)".as_bytes())
+            )],
+            "data": data,
+            "blockNumber": "0x10",
+            "transactionIndex": "0x0",
+            "logIndex": "0x0"
+        }));
+        assert!(swap_deltas(&log, true).is_none());
         assert!(decode_swap(&log, true, &registry).is_none());
     }
 }
