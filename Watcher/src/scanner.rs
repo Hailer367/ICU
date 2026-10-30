@@ -227,7 +227,9 @@ impl Scanner {
             }
         }
         let snapshot = gas::snapshot(&self.provider, 2_000).await?;
-        let eth_usd = gas::eth_usd_price(&self.provider).await.unwrap_or(0.0);
+        let eth_usd = gas::eth_usd_price(&self.provider, snapshot.timestamp)
+            .await
+            .unwrap_or(0.0);
         if eth_usd > 0.0 {
             let mut cache = self.gas_cache.lock().expect("gas cache mutex poisoned");
             *cache = Some(CachedGas {
@@ -267,7 +269,8 @@ impl Scanner {
             bail!("core is paused");
         }
         let (gas_snapshot, eth_usd) = self.gas_context().await?;
-        let asset_usd = gas::asset_usd_price(&self.provider, route.asset).await?;
+        let asset_usd =
+            gas::asset_usd_price(&self.provider, route.asset, gas_snapshot.timestamp).await?;
         let symbol = self
             .manifest
             .token_symbol(route.asset)
@@ -557,7 +560,8 @@ impl Scanner {
             return Ok(());
         }
 
-        let price = match gas::asset_usd_price(&self.provider, asset).await {
+        let price = match gas::asset_usd_price(&self.provider, asset, gas_snapshot.timestamp).await
+        {
             Ok(price) if price > 0.0 => price,
             _ => {
                 report

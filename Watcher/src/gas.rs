@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, I256, U256};
 use alloy::providers::Provider;
@@ -13,6 +11,9 @@ use crate::config::base;
 #[derive(Debug, Clone)]
 pub struct GasSnapshot {
     pub block_number: u64,
+    /// Timestamp of the block the snapshot was read from. Used as "now" for
+    /// feed staleness so historical forks are judged against chain time.
+    pub timestamp: u64,
     pub base_fee: U256,
     pub priority_fee: U256,
     pub gas_price: U256,
@@ -65,6 +66,7 @@ pub async fn snapshot(provider: &ChainProvider, tx_size: usize) -> Result<GasSna
 
     Ok(GasSnapshot {
         block_number,
+        timestamp: block.header.timestamp,
         base_fee,
         priority_fee,
         gas_price,
@@ -86,10 +88,28 @@ async fn call_u256(
     Ok(value)
 }
 
+/// Latest block timestamp, for callers that need chain time without a full
+/// gas snapshot.
+pub async fn latest_timestamp(provider: &ChainProvider) -> Result<u64> {
+    let block = provider
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .await
+        .context("failed to read latest block")?
+        .context("latest block not found")?;
+    Ok(block.header.timestamp)
+}
+
+/// A feed is stale when the chain is more than `max_age_secs` past its last
+/// update. Comparing two chain timestamps keeps historical forks usable.
+pub fn is_stale(updated_at: u64, now: u64, max_age_secs: u64) -> bool {
+    now > updated_at.saturating_add(max_age_secs)
+}
+
 pub async fn chainlink_price(
     provider: &ChainProvider,
     feed: Address,
     max_age_secs: u64,
+    now_secs: u64,
 ) -> Result<f64> {
     let data = chainlink::latestRoundDataCall {}.abi_encode().into();
     let bytes = chain::eth_call(provider, feed, data, BlockId::latest())
@@ -101,9 +121,8 @@ pub async fn chainlink_price(
         bail!("Chainlink feed {feed} returned a non-positive answer");
     }
     let updated_at: u64 = result.updatedAt.try_into().unwrap_or(0);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    if now > updated_at.saturating_add(max_age_secs) {
-        bail!("Chainlink feed {feed} is stale: updatedAt={updated_at}, now={now}");
+    if is_stale(updated_at, now_secs, max_age_secs) {
+        bail!("Chainlink feed {feed} is stale: updatedAt={updated_at}, now={now_secs}");
     }
 
     let decimals = call_u8(
@@ -134,7 +153,11 @@ async fn call_u8(
 /// Resolve a token's USD price from the verified Base Chainlink feeds.
 ///
 /// AERO is intentionally unsupported until a feed is verified.
-pub async fn asset_usd_price(provider: &ChainProvider, asset: Address) -> Result<f64> {
+pub async fn asset_usd_price(
+    provider: &ChainProvider,
+    asset: Address,
+    now_secs: u64,
+) -> Result<f64> {
     let (feed, max_age) = if asset == base::USDC {
         // Stablecoin feeds on Base are intentionally slow; a day-old answer is
         // still a valid peg check.
@@ -148,11 +171,11 @@ pub async fn asset_usd_price(provider: &ChainProvider, asset: Address) -> Result
     } else {
         bail!("no verified USD feed for asset {asset}");
     };
-    chainlink_price(provider, feed, max_age).await
+    chainlink_price(provider, feed, max_age, now_secs).await
 }
 
-pub async fn eth_usd_price(provider: &ChainProvider) -> Result<f64> {
-    chainlink_price(provider, base::ETH_USD_FEED, 7_200).await
+pub async fn eth_usd_price(provider: &ChainProvider, now_secs: u64) -> Result<f64> {
+    chainlink_price(provider, base::ETH_USD_FEED, 7_200, now_secs).await
 }
 
 pub fn raw_to_f64(value: U256, decimals: u8) -> f64 {
@@ -200,6 +223,15 @@ mod tests {
     fn converts_raw_units() {
         assert!((raw_to_f64(U256::from(1_000_000u64), 6) - 1.0).abs() < 1e-12);
         assert!((raw_to_f64(U256::from(1_000_000_000_000_000_000u64), 18) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn staleness_uses_the_supplied_chain_time() {
+        assert!(!is_stale(1_000, 1_000, 7_200));
+        assert!(!is_stale(1_000, 8_200, 7_200));
+        assert!(is_stale(1_000, 8_201, 7_200));
+        // A fresh chain timestamp keeps an old feed usable.
+        assert!(!is_stale(1_000_000, 1_000_600, 7_200));
     }
 
     #[test]

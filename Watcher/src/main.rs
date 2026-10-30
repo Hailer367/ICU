@@ -486,7 +486,7 @@ async fn read_address(provider: &ChainProvider, to: Address, data: Vec<u8>) -> R
 async fn print_gas(settings: &Settings) -> Result<()> {
     let provider = chain::connect_http(&settings.http_rpc).await?;
     let snapshot = gas::snapshot(&provider, 2_000).await?;
-    let eth_usd = gas::eth_usd_price(&provider).await?;
+    let eth_usd = gas::eth_usd_price(&provider, snapshot.timestamp).await?;
     println!("block:          {}", snapshot.block_number);
     println!("base fee:       {} wei", snapshot.base_fee);
     println!("priority fee:   {} wei", snapshot.priority_fee);
@@ -496,7 +496,7 @@ async fn print_gas(settings: &Settings) -> Result<()> {
     println!("L1 upper bound: {} wei", snapshot.l1_fee_upper_bound);
     println!("ETH/USD:        ${eth_usd:.2}");
     for (symbol, asset) in [("USDC", base::USDC), ("WETH", base::WETH)] {
-        match gas::asset_usd_price(&provider, asset).await {
+        match gas::asset_usd_price(&provider, asset, snapshot.timestamp).await {
             Ok(price) => println!("{symbol}/USD:        ${price:.6}"),
             Err(err) => println!("{symbol}/USD:        unavailable ({err})"),
         }
@@ -603,6 +603,7 @@ async fn simulate_command(
     let route = parse_route(&registry, asset, route_spec)?;
     let provider = chain::connect_http(&settings.http_rpc).await?;
     let steps = simulate::discovery_steps(&route, &manifest)?;
+    let now_secs = gas::latest_timestamp(&provider).await?;
     println!("core:  {}", manifest.core);
     println!("route: {}", route.venues().join(" > "));
     match simulate::simulate(
@@ -623,7 +624,9 @@ async fn simulate_command(
                 );
             } else {
                 let profit_raw: U256 = simulation.profit.try_into().unwrap_or(U256::ZERO);
-                let price = gas::asset_usd_price(&provider, asset).await.unwrap_or(0.0);
+                let price = gas::asset_usd_price(&provider, asset, now_secs)
+                    .await
+                    .unwrap_or(0.0);
                 let profit_usd = gas::profit_usd(profit_raw, decimals, price);
                 println!(
                     "profit: {} {} (~${:.4})",

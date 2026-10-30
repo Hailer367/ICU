@@ -258,10 +258,44 @@ state: pin Anvil with `--fork-block-number` and deploy the core to that block
 (the manifest written by `Deploy.s.sol` is a starting point). The file is
 deliberately not committed; regenerate it with the command above.
 
-Tests added with the module (36 lib tests total now): V3 decode, V2 decode,
-int24 sign extension, unknown-pool/short-data rejection, and a group test
-asserting the constant-product query covers both the V2 and Solidly topics and
-includes an Aerodrome pool.
+Tests added with the module (36 lib tests then; 37 after the replay fix below):
+V3 decode, V2 decode, int24 sign extension, unknown-pool/short-data rejection,
+and a group test asserting the constant-product query covers both the V2 and
+Solidly topics and includes an Aerodrome pool. The replay fix added a pure
+`is_stale` test.
+
+Replay verification against the dataset (same session):
+
+- Forked Anvil at **53,258,575** (the busiest dataset block, 147 swaps) via
+  `https://mainnet.base.org` (publicnode serves storage at that block but
+  rejects archive `eth_feeHistory` with "Archive requests require a personal
+  token", which breaks deployment), then ran `Deploy.s.sol` onto the fork and
+  `validate` → 12 pools OK.
+- **Price cross-check:** the last `univ3:500` swap in that block implies
+  2,277.10 USDC/WETH from `sqrtPriceX96`; the fork quote for 1,000 USDC →
+  WETH → USDC executed leg 1 at 2,278.32 USDC/WETH. The 0.05% pool fee
+  explains the 0.05% difference, confirming the dataset decodes the same state
+  the chain serves.
+- **Blocker found and fixed:** the full `scan` first aborted with
+  "ETH/USD feed unavailable" because Chainlink `updatedAt` was compared to the
+  host clock — a 22 h-old fork looked stale. Staleness now uses the latest
+  block timestamp (`GasSnapshot.timestamp`, `gas::latest_timestamp`), which is
+  correct for live runs too. After the fix, `scan` at that block completed:
+  **264 routes, 1,624 quotes, 4 simulations, 0 opportunities** (the 4
+  pre-gas-profitable routes did not clear the net threshold). `gas` on live
+  mainnet still reports ETH/USD normally after the change.
+- The manifest produced by the fork deploy was restored to the checked-in
+  `deployments/8453.anvil.json` afterwards.
+
+Replay recipe:
+
+```bash
+anvil --fork-url https://mainnet.base.org --fork-block-number 53258575 \
+  --chain-id 8453 --port 8545
+# from ryo/: deploy with MANIFEST_PATH=../Watcher/deployments/8453.anvil.json
+cargo run -- --http-rpc http://127.0.0.1:8545 \
+  --manifest deployments/8453.anvil.json --max-gas-price-gwei 3 scan
+```
 
 ---
 
@@ -443,10 +477,14 @@ only.
 
 ### `src/gas.rs`
 
-- `snapshot(provider, tx_size)`: block number, base fee, priority fee,
-  gas price, L1 base/blob fee, `getL1FeeUpperBound`.
-- `chainlink_price(provider, feed, max_age_secs)`.
-- `asset_usd_price`: USDC/EURC 24h staleness, WETH/cbBTC 2h.
+- `snapshot(provider, tx_size)`: block number, block timestamp, base fee,
+  priority fee, gas price, L1 base/blob fee, `getL1FeeUpperBound`.
+- `chainlink_price(provider, feed, max_age_secs, now_secs)`;
+  `latest_timestamp(provider)`; `is_stale(updated_at, now, max_age)`.
+- Staleness is measured against the latest **block timestamp**, not the local
+  clock, so a historical fork judges feeds as of its fork point.
+- `asset_usd_price(provider, asset, now_secs)`: USDC/EURC 24h staleness,
+  WETH/cbBTC 2h.
 - `trade_cost(gas_used, effective_gas_price, l1_fee, eth_usd)`.
 - `profit_usd`, `raw_to_f64`, `wei_to_eth`.
 
@@ -580,9 +618,10 @@ cd Watcher
 cargo test
 ```
 
-Result: **36 lib tests + 1 WebSocket integration test passed, 0 failed**
+Result: **37 lib tests + 1 WebSocket integration test passed, 0 failed**
 (2026-10-30; 27 before the completion pass, 31 after it, 36 after the history
-module). `cargo clippy --all-targets` is clean after fixes.
+module, 37 after the replay staleness fix). `cargo clippy --all-targets` is
+clean after fixes.
 `tests/events_ws.rs` uses an in-process mock server and needs no network.
 `tests/fork_opportunity.rs` is `#[ignore]`d and needs a local Anvil fork; it is
 not part of a plain `cargo test`.
@@ -600,6 +639,7 @@ Coverage of unit tests:
 - scanner floor math, USD conversion, amount scaling, affected-route filter
 - settings defaults, dedupe semantics, head-gap rescan, gas ceiling gate
 - historical swap decoding (V3, V2, Solidly topics, int24 sign)
+- Chainlink staleness against chain time (historical fork replay)
 
 ### Live Base HTTP checks
 
