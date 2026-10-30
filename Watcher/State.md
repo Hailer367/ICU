@@ -331,6 +331,46 @@ Tests: 44 lib tests + 1 WS test pass (`swap_size_filter_has_a_hard_floor`,
 `rejects_non_swap_events`, and five notional tests: USDC-leg reading, Solidly
 signed deltas, dust vs. large, non-USDC pool, non-swap log). Clippy/fmt clean.
 
+### 0g. Live Alchemy WebSocket test (2026-10-30, same session)
+
+Ran the watcher against the user's Alchemy Base endpoint (key inline in the
+environment only; never written to a file or the repo).
+
+Subscription support and payloads:
+
+- `logs` (mined) — works; pool swaps arrive as normal log objects.
+- `pendingLogs` — works, and delivers the swap log roughly 1 s before the
+  block lands. This is the useful preconfirmation signal.
+- `newFlashblocks` — **returns a preconfirmed block object with transactions
+  but no `logs` field**; `newFlashblockTransactions` returns a single tx hash
+  per message. Neither can identify which pool traded, so a flashblock trigger
+  carries no pool information and the scanner skips it. `newHeads` also
+  subscribed; heads are only used for gap detection.
+- Therefore `--source pending-logs` (default) or `both` is the working live
+  configuration; `flashblocks` alone cannot produce scans with Alchemy's
+  current Base API.
+
+Full scan loop against live events (local Anvil fork of Base at the latest
+block, core + adapters deployed from `script/Deploy.s.sol`, fork manifest in
+`deployments/8453.fork.json`, deleted afterwards):
+
+- Unskewed run: 120 live triggers, 120 scans, 0 failures, 1,232 routes,
+  7,392 quotes, 0 simulations. Real markets showed no positive edge in the
+  sample window.
+- Skewed run (60,000 USDC into univ3:500, same method as the fork test):
+  100 live triggers, 0 failures, 924 routes, 6,044 quotes, 50 simulations,
+  16 opportunities. Best was `univ3:500 -> slipstream:100`, 4 WETH, simulated
+  profit $12.01, gas $1.51 (Anvil reports 1 gwei; real Base is ~0.005), net
+  $10.50. A $0.227 net near-miss was correctly rejected by the $0.25 gate.
+- Dust filter and duplicate suppression both visible in the trigger log
+  (e.g. `swap ~$354 below the $500 minimum`, `duplicate trigger skipped`).
+- `--mode live` prints the "transaction sending is not enabled" warning and
+  sends nothing; every scan was an `eth_call`/quote against the fork.
+
+Anvil reports a synthetic ~1 gwei gas price, so the default 0.05 gwei watcher
+ceiling blocks every scan on a fork; use `--max-gas-price-gwei 2` for local
+runs. Real Base gas is ~0.005 gwei, which passes the default.
+
 ---
 
 ## 1. Goal and hard constraints

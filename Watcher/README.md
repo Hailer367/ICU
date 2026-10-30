@@ -126,6 +126,13 @@ drops ~78 % of events while keeping ~99 % of the swaps that can open a
 $0.25 opportunity. Logs that are not swaps (mints, burns, collects) are not
 size-filtered.
 
+On Alchemy's Base endpoint, `newFlashblocks` sends preconfirmed block objects
+and `newFlashblockTransactions` sends bare transaction hashes; neither carries
+logs, so those events cannot identify which pool traded. Use
+`--source pending-logs` (default) or `both`: pending logs deliver the actual
+swap roughly a second before the block lands. `flashblocks` still subscribes
+to `newHeads`, which is only used to notice skipped blocks.
+
 ## Tests
 
 ```bash
