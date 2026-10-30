@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, U256};
@@ -11,6 +11,7 @@ use ryo_watch::config::{EventSource, Manifest, Mode, Settings, base};
 use ryo_watch::errors::{self, DecodedError};
 use ryo_watch::events::{EventStream, redact_url};
 use ryo_watch::gas;
+use ryo_watch::history;
 use ryo_watch::routes::{Registry, enumerate_cycles, parse_route};
 use ryo_watch::scanner::{Opportunity, ScanBlock, ScanReport, Scanner};
 use ryo_watch::simulate;
@@ -193,6 +194,24 @@ enum Command {
         #[arg(long, env = "RYO_METRICS_EVERY", default_value_t = 0)]
         metrics_every: usize,
     },
+    /// Download historical swap logs for the registry pools as JSONL.
+    History {
+        /// Window length in blocks, ending at `to_block` (or the latest block).
+        #[arg(long, default_value_t = 43_200)]
+        blocks: u64,
+        /// First block to include. Overrides `--blocks` when set.
+        #[arg(long)]
+        from_block: Option<u64>,
+        /// Last block to include. Defaults to the latest block.
+        #[arg(long)]
+        to_block: Option<u64>,
+        /// Output JSONL path.
+        #[arg(long, default_value = "data/swaps.jsonl")]
+        out: PathBuf,
+        /// Blocks per request; failed ranges are split automatically.
+        #[arg(long, default_value_t = 500)]
+        chunk: u64,
+    },
     /// Decode revert data from a selector and payload.
     Decode {
         /// Hex data, with or without the 0x prefix.
@@ -265,6 +284,13 @@ async fn run() -> Result<()> {
             .await
         }
         Command::Decode { data } => decode_command(&data),
+        Command::History {
+            blocks,
+            from_block,
+            to_block,
+            out,
+            chunk,
+        } => history_command(&settings, blocks, from_block, to_block, &out, chunk).await,
     }
 }
 
@@ -812,6 +838,46 @@ async fn watch_command(
             return Ok(());
         }
     }
+}
+
+async fn history_command(
+    settings: &Settings,
+    blocks: u64,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    out: &Path,
+    chunk: u64,
+) -> Result<()> {
+    let provider = chain::connect_http(&settings.http_rpc).await?;
+    let registry = Registry::base_usdc_weth()?;
+    let to_block = match to_block {
+        Some(block) => block,
+        None => chain::block_number(&provider).await?,
+    };
+    let from_block = match from_block {
+        Some(block) => block,
+        None => to_block.saturating_sub(blocks.saturating_sub(1)),
+    };
+    info!(
+        from_block,
+        to_block,
+        chunk,
+        out = %out.display(),
+        "downloading swap history"
+    );
+    let summary = history::download(&provider, &registry, from_block, to_block, chunk, out).await?;
+    println!(
+        "blocks {}-{} | swaps {} | {} bytes | out {}",
+        summary.from_block,
+        summary.to_block,
+        summary.total,
+        summary.bytes,
+        out.display()
+    );
+    for (venue, count) in &summary.per_venue {
+        println!("  {venue:20} {count}");
+    }
+    Ok(())
 }
 
 fn decode_command(data: &str) -> Result<()> {

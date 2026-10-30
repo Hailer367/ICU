@@ -1,6 +1,6 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-10-30 (completion pass; see §0d)
+Last updated: 2026-10-30 (completion pass + historical dataset; see §0d, §0e)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -199,6 +199,70 @@ What is still open, and why:
 - **Per-stage latency metrics** — total scan time and counters exist; split
   quote/simulate timings are not instrumented.
 
+### 0e. Historical swap dataset (2026-10-30, same session)
+
+Added `src/history.rs` and a `history` subcommand so scanner work can be tested
+against real Base activity instead of only live/fork snapshots.
+
+- Lists the 12 verified USDC/WETH pools from `Registry::base_usdc_weth()`.
+- Queries `eth_getLogs` in chunks (default 500 blocks) and splits a range
+  recursively (up to 5 levels, 500 ms pause) when the RPC rejects a result that
+  is too large.
+- Decodes two event shapes:
+  - concentrated liquidity (UniV3, Slipstream):
+    `Swap(address,address,int256,int256,uint160,uint128,int24)`
+    (topic `0xc42079f9...`), keeping `sqrtPriceX96`, liquidity, and tick;
+  - constant product: Uniswap V2
+    `Swap(address,uint256,uint256,uint256,uint256,address)` and
+    **Solidly/Aerodrome** `Swap(address,address,uint256,uint256,uint256,uint256)`.
+    Aerodrome pools do **not** emit the V2 signature (verified on-chain:
+    209 Solidly logs vs 0 V2 logs for the volatile pool in the same window),
+    so both topic0 values are queried for the group and amount words are
+    normalized to `amountIn - amountOut`, matching the V3 sign convention
+    (positive = pool received the token).
+- Writes one JSON object per swap to JSONL, sorted by `(block, log_index)`,
+  skipping `removed` logs. `data/` is git-ignored.
+
+RPC note: `https://mainnet.base.org` rejects `eth_getLogs` with
+`{"code":-32011,"message":"request limit reached"}` even for small ranges.
+`https://base-rpc.publicnode.com` serves the same queries, so the dataset was
+built with:
+
+```bash
+cargo run -- --http-rpc https://base-rpc.publicnode.com \
+  history --blocks 43200 --chunk 500 --out data/swaps_24h.jsonl
+```
+
+Dataset written on 2026-10-30 (`data/swaps_24h.jsonl`, 76,592,413 bytes):
+
+| metric | value |
+| --- | --- |
+| blocks | 53,255,340 – 53,298,539 (43,200 blocks ≈ 24 h) |
+| swaps | 166,623 |
+| blocks with ≥1 swap | 36,214 (83.8 %) |
+| busiest block | 53,258,575 (147 swaps) |
+| time span | 2026-10-29 18:53:47 – 2026-10-30 18:53:45 UTC |
+| venues | all 12 (counts below) |
+
+```
+univ3:100        73,374     slipstream:100   29,537
+univ3:500        30,796     aerodrome:volatile 7,719
+univ3:3000       13,216     slipstream:1      7,409
+univ2             3,197     univ3:10000         374
+aerodrome:stable    586     slipstream:10       285
+slipstream:50        93     slipstream:200       37
+```
+
+The dataset is a log-only record. Replaying a block still requires historical
+state: pin Anvil with `--fork-block-number` and deploy the core to that block
+(the manifest written by `Deploy.s.sol` is a starting point). The file is
+deliberately not committed; regenerate it with the command above.
+
+Tests added with the module (36 lib tests total now): V3 decode, V2 decode,
+int24 sign extension, unknown-pool/short-data rejection, and a group test
+asserting the constant-product query covers both the V2 and Solidly topics and
+includes an Aerodrome pool.
+
 ---
 
 ## 1. Goal and hard constraints
@@ -238,10 +302,11 @@ Watcher/                        Rust crate (this work)
   State.md                      this file
   README.md                     quick start, commands, settings, fork test
   .env.example                  documented environment variables (no secrets)
-  .gitignore                    ignores target/, .env, local manifests
+  .gitignore                    ignores target/, data/, .env, local manifests
   deployments/
     8453.anvil.json             manifest for the local Anvil deployment
     8453.example.json           placeholder manifest showing the expected shape
+  data/                         generated swap history (git-ignored)
   src/
     abi.rs                      hand-written sol! bindings
     chain.rs                    Alloy provider + eth_call helpers
@@ -249,8 +314,9 @@ Watcher/                        Rust crate (this work)
     errors.rs                   revert decoding for core/adapters/OZ/routers
     events.rs                   raw WebSocket event stream + trigger parser
     gas.rs                      gas snapshot, L1 fee, Chainlink USD, cost math
+    history.rs                  historical Swap log downloader (JSONL)
     lib.rs                      module exports
-    main.rs                     CLI (validate/gas/routes/quote/simulate/plan/scan/watch/decode)
+    main.rs                     CLI (validate/gas/routes/quote/simulate/plan/scan/watch/history/decode)
     routes.rs                   pool registry, cycle enumeration, route parser
     scanner.rs                  event-driven affected-pool scanning + simulation
     simulate.rs                 core.simulate call and decode
@@ -414,6 +480,19 @@ only.
 - `SimulateError` distinguishes revert/transport/unexpected success.
 - `#[allow(clippy::result_large_err)]` on `simulate`.
 
+### `src/history.rs`
+
+- `download(provider, registry, from_block, to_block, chunk, out)` writes
+  sorted JSONL and returns `HistorySummary` (range, total, per-venue counts,
+  bytes).
+- `decode_swap(log, concentrated, registry)` → `SwapRecord` with `block`,
+  optional `timestamp`/`tx_hash`, `log_index`, `pool`, `venue`, `sender`,
+  `recipient`, signed `amount0`/`amount1`, and (concentrated only)
+  `sqrt_price_x96`, `liquidity`, `tick`.
+- Groups: concentrated pools query the V3 topic; Uniswap V2 and Aerodrome
+  query their own V2/Solidly topics in one request.
+- Failed `eth_getLogs` ranges split recursively (5 levels) instead of aborting.
+
 ### `src/scanner.rs`
 
 - `Scanner::new(provider, manifest, settings)`.
@@ -462,6 +541,7 @@ simulate --asset USDC --amount 1000 --route univ3:500,univ3:100
 plan   --asset USDC --amount 1000 --route univ3:500,univ3:100
 scan   [--pools 0,1] [--pending] [--json]
 watch  [--max-events N] [--json] [--show-empty] [--no-scan] [--metrics-every N]
+history [--blocks 43200] [--from-block N] [--to-block N] [--chunk 500] [--out data/swaps.jsonl]
 decode 0x...
 ```
 
@@ -500,8 +580,9 @@ cd Watcher
 cargo test
 ```
 
-Result: **27 lib tests + 1 WebSocket integration test passed, 0 failed**
-(2026-10-30). `cargo clippy --all-targets` is clean after fixes.
+Result: **36 lib tests + 1 WebSocket integration test passed, 0 failed**
+(2026-10-30; 27 before the completion pass, 31 after it, 36 after the history
+module). `cargo clippy --all-targets` is clean after fixes.
 `tests/events_ws.rs` uses an in-process mock server and needs no network.
 `tests/fork_opportunity.rs` is `#[ignore]`d and needs a local Anvil fork; it is
 not part of a plain `cargo test`.
@@ -517,6 +598,8 @@ Coverage of unit tests:
 - Multicall `uint256[]` decoding
 - event subscription params, log parsing, flashblock extraction, URL redaction
 - scanner floor math, USD conversion, amount scaling, affected-route filter
+- settings defaults, dedupe semantics, head-gap rescan, gas ceiling gate
+- historical swap decoding (V3, V2, Solidly topics, int24 sign)
 
 ### Live Base HTTP checks
 
@@ -916,6 +999,10 @@ cargo run -- --http-rpc http://127.0.0.1:8545 \
 RYO_FORK_RPC=http://127.0.0.1:8545 RYO_FORK_EXECUTE=1 \
   cargo test --test fork_opportunity -- --ignored --nocapture
 
+# Historical swap dataset (Base public RPC; mainnet.base.org rejects getLogs)
+cargo run -- --http-rpc https://base-rpc.publicnode.com \
+  history --blocks 43200 --chunk 500 --out data/swaps_24h.jsonl
+
 # Live watch (needs Alchemy)
 cargo run -- --http-rpc <alchemy-http> --ws-rpc <alchemy-wss> \
   --manifest deployments/8453.json --source pending-logs watch --max-events 5
@@ -942,5 +1029,6 @@ for you.
 ## 11. Next move (one line)
 
 Wire the live Alchemy WebSocket (`RYO_WS_RPC`) and confirm `pendingLogs` /
-`newFlashblocks` payload shapes against a real endpoint; everything else that
-can be verified locally already is.
+`newFlashblocks` payload shapes against a real endpoint; use the 24h
+`data/swaps_24h.jsonl` dataset to pick high-activity blocks for fork replay.
+Everything else that can be verified locally already is.

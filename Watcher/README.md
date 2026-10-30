@@ -74,6 +74,7 @@ The script writes the manifest in the exact shape this crate expects
 | `plan ...` | `simulate` plus calldata, floors, route hash, gas estimate |
 | `scan [--pools 0,1] [--pending] [--json]` | One scan (all pools, or only affected ones) |
 | `watch [--show-empty] [--no-scan] [--metrics-every N] [--json]` | Event loop |
+| `history [--blocks 43200] [--chunk 500] [--out data/swaps.jsonl]` | Downloads historical swap logs for the 12 pools as JSONL |
 | `decode 0x...` | Decodes revert data |
 
 `--pools` uses the indices printed by `routes` / `validate`.
@@ -87,6 +88,11 @@ univ3:100  univ3:500  univ3:3000  univ3:10000
 aerodrome:stable  aerodrome:volatile
 slipstream:1  slipstream:10  slipstream:50  slipstream:100  slipstream:200
 ```
+
+`history` only reads logs and writes them under `data/` (git-ignored). The
+default `mainnet.base.org` endpoint rejects `eth_getLogs` with
+`-32011 request limit reached`; point `--http-rpc` at
+`https://base-rpc.publicnode.com` for this command.
 
 ## Settings
 

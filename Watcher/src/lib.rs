@@ -4,6 +4,7 @@ pub mod config;
 pub mod errors;
 pub mod events;
 pub mod gas;
+pub mod history;
 pub mod routes;
 pub mod scanner;
 pub mod simulate;
