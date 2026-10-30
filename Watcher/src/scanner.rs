@@ -567,7 +567,7 @@ impl Scanner {
             return Ok(());
         }
 
-        let mut best: HashMap<usize, (U256, Vec<U256>, f64)> = HashMap::new();
+        let mut best: HashMap<usize, (U256, Vec<U256>, U256)> = HashMap::new();
         for amount in &probe_amounts {
             let amounts = vec![*amount; all_routes.len()];
             let quotes = self
@@ -577,12 +577,14 @@ impl Scanner {
             update_best(&mut best, &amounts, quotes);
         }
 
-        // Refine the best routes on a local amount grid.
-        let mut ranked: Vec<(usize, f64)> = best
+        // Refine the best routes on a local amount grid. Rank by absolute
+        // profit, not by output/input ratio: ratio favours tiny trades and
+        // systematically walks the bot away from the most profitable size.
+        let mut ranked: Vec<(usize, U256)> = best
             .iter()
-            .filter_map(|(index, (_, _, ratio))| (*ratio > 1.0).then_some((*index, *ratio)))
+            .filter_map(|(index, (_, _, profit))| (!profit.is_zero()).then_some((*index, *profit)))
             .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         ranked.truncate(self.settings.max_candidates.max(1));
         if ranked.is_empty() {
             debug!(asset = %symbol, "no route quoted above break-even");
@@ -611,25 +613,25 @@ impl Scanner {
             report.quotes += count_quotes(&quotes);
             let mut local_best = HashMap::new();
             update_best(&mut local_best, &amounts, quotes);
-            for (local_index, (amount, quotes, ratio)) in local_best {
+            for (local_index, (amount, quotes, profit)) in local_best {
                 let route_index = ranked[local_index].0;
                 let replace = best
                     .get(&route_index)
-                    .map(|(_, _, old_ratio)| ratio > *old_ratio)
+                    .map(|(_, _, old_profit)| profit > *old_profit)
                     .unwrap_or(true);
                 if replace {
-                    best.insert(route_index, (amount, quotes, ratio));
+                    best.insert(route_index, (amount, quotes, profit));
                 }
             }
         }
 
         // Simulate the most promising routes. Quote profitability is only a
         // ranking signal; `simulate` is the source of truth.
-        let mut finalists: Vec<(usize, f64)> = ranked
+        let mut finalists: Vec<(usize, U256)> = ranked
             .iter()
-            .filter_map(|(index, _)| best.get(index).map(|(_, _, ratio)| (*index, *ratio)))
+            .filter_map(|(index, _)| best.get(index).map(|(_, _, profit)| (*index, *profit)))
             .collect();
-        finalists.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        finalists.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         finalists.truncate(
             self.settings
                 .max_candidates
@@ -658,7 +660,7 @@ impl Scanner {
             let (amount, quotes, _) =
                 best.get(&index)
                     .cloned()
-                    .unwrap_or((U256::ZERO, Vec::new(), 0.0));
+                    .unwrap_or((U256::ZERO, Vec::new(), U256::ZERO));
             let provider = self.provider.clone();
             let manifest = self.manifest.clone();
             let settings = self.settings.clone();
@@ -887,6 +889,18 @@ async fn simulate_route(
     );
     let profit_usd = gas::profit_usd(profit_raw, decimals, asset_usd);
     let net_usd = profit_usd - cost.total_fee_usd;
+    debug!(
+        route = ?route.venues(),
+        amount = %amount,
+        profit_raw = %profit_raw,
+        profit_usd,
+        gas_used,
+        gas_price = %gas_snapshot.gas_price,
+        gas_usd = cost.total_fee_usd,
+        net_usd,
+        min_net_usd = settings.min_net_profit_usd,
+        "simulation economics"
+    );
     if net_usd < settings.min_net_profit_usd {
         return None;
     }
@@ -921,7 +935,7 @@ fn count_quotes(quotes: &[Option<Vec<U256>>]) -> usize {
 }
 
 fn update_best(
-    best: &mut HashMap<usize, (U256, Vec<U256>, f64)>,
+    best: &mut HashMap<usize, (U256, Vec<U256>, U256)>,
     amounts: &[U256],
     quotes: Vec<Option<Vec<U256>>>,
 ) {
@@ -936,16 +950,18 @@ fn update_best(
         if amount.is_zero() {
             continue;
         }
-        let ratio = u256_to_f64(output) / u256_to_f64(amount);
-        if !ratio.is_finite() || ratio <= 0.0 {
+        // `asset -> ... -> asset`, so output and input share units. Absolute
+        // profit is the right ranking signal; ratio would prefer 1 wei trades.
+        let profit = output.saturating_sub(amount);
+        if profit.is_zero() {
             continue;
         }
         let replace = best
             .get(&index)
-            .map(|(_, _, old_ratio)| ratio > *old_ratio)
+            .map(|(_, _, old_profit)| profit > *old_profit)
             .unwrap_or(true);
         if replace {
-            best.insert(index, (amount, values, ratio));
+            best.insert(index, (amount, values, profit));
         }
     }
 }

@@ -1,6 +1,6 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-10-30 (session snapshot)
+Last updated: 2026-10-30 (post-review session; see §0c)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -65,6 +65,89 @@ Not done in this session: live Alchemy WebSocket test (no key supplied), a
 profitable-route fork scenario after the batching changes, the manifest writer,
 and transaction sending.
 
+### 0b. Continuation later on 2026-10-30
+
+The watcher was then exercised end-to-end against a profitable fork scenario and
+the contract/deploy backlog items were implemented.
+
+Watcher changes:
+
+- **Profit ranking fixed.** `update_best` ranked routes by output/input *ratio*,
+  which favours tiny trades (a 1 wei round trip can have a great ratio). It now
+  ranks by absolute profit in asset units. This was the reason a real
+  `$12.50` WETH opportunity was ranked below a `$0.51` one.
+- Added a `simulation economics` debug line (route, amount, profit, gas, net) so
+  filtered opportunities can be explained without re-running.
+- `min_net_profit_usd` is now the single gate (previously a separate
+  `net_usd <= 0` check plus the settings gate).
+
+Verification:
+
+- Foundry suite: **122 tests pass**, including the 14 Base fork tests.
+- New fork integration test `tests/fork_opportunity.rs` (ignored, env-gated):
+  impersonates the Balancer vault, swaps 60,000 USDC into UniV3 0.05%, asserts
+  the scanner reports an opportunity, and — with `RYO_FORK_EXECUTE=1` — sends
+  the built calldata and asserts realized profit equals simulated profit.
+  Ran green three times; the test snapshots and reverts the fork.
+- Manual `plan` + `cast send` on a skewed fork: `execute` succeeded, `Executed`
+  was emitted, and the recipient received exactly the simulated
+  `5,630,906,016,821,367` WETH wei.
+- Full scan on a **cold** fork: 1m47s (dominated by Anvil fetching missing
+  state from the upstream RPC). Same scan on a **warm** fork: **0.6s** for
+  264 routes / 1584 quotes. The watcher itself is no longer the bottleneck.
+
+Contract/deploy changes:
+
+- `ryo/script/Deploy.s.sol` now writes the watcher manifest
+  (`MANIFEST_PATH`, default `../Watcher/deployments/<chainId>.json`,
+  `SKIP_MANIFEST=true` to disable). Shape matches `Watcher::Manifest`; every
+  `uint256` is a decimal string. `ryo/foundry.toml` grants write access to
+  `../Watcher/deployments`.
+- `RyoCore.renounceOwnership()` now always reverts with
+  `OwnershipRenunciationDisabled`; renouncing would brick pause/adapters/caps/
+  operator rotation. Two-step transfer still works (3 new tests).
+- Added `Watcher/README.md` and `Watcher/deployments/8453.example.json`.
+
+Still not done: live Alchemy WebSocket verification (no key) and transaction
+sending (intentionally out of scope for now).
+
+### 0c. Full review + continuation (2026-10-30)
+
+A later session did a full read-through of every source file, test, manifest,
+and doc, then committed and pushed the §0b work that was still uncommitted.
+
+Verified at review time (this machine, Rust 1.99.1):
+
+- `cargo test`: 27 lib tests + 1 WebSocket integration test pass; the fork
+  test is `#[ignore]`d as designed.
+- `cargo clippy --all-targets`: clean.
+- `cargo fmt --all --check`: clean.
+- `Watcher/target`: 3.8 GB (the 2.9 GB figure earlier in this file was stale).
+- The 1.1 GB `Watcher.tar.gz` at the repo root was deleted and never pushed.
+
+Findings recorded at review time (some fixed in §0d below):
+
+- Adapter `ZeroAddress` / `NotContract` / `ZeroAmount` selectors collide with
+  the core's; core is decoded first, so adapter instances are labelled `Core`.
+  Cosmetic only.
+- `Trigger::addresses()` and `EventStream::source_specs()` have no production
+  callers.
+- `venues.rs` said "chunks of 40" while the code uses 80.
+- `Settings::default()` disagreed with the CLI defaults for
+  `min_profit_buffer_bps` (10 vs 50) and `amount_grid_points` (6 vs 5). The
+  fork test uses `..Settings::default()`, so it inherited the old values.
+- Trigger dedupe marked an event as seen before the scan ran, so a transient
+  scan failure suppressed the later mined duplicate of the same log.
+- `newHeads` was parsed but had no gap/reorg use: a skipped block was never
+  re-scanned.
+- The gas-ceiling gate ran after all quoting, wasting RPC work when gas was
+  already too high.
+- Hash-only flashblock notifications are skipped by design (the payload does
+  not identify a pool); `newFlashblockTransactions` is therefore only useful
+  if the real endpoint includes logs. Still unverified live.
+- `deployments/8453.json` (the CLI default) does not exist until a mainnet
+  deployment writes it.
+
 ---
 
 ## 1. Goal and hard constraints
@@ -102,10 +185,12 @@ Watcher/                        Rust crate (this work)
   Cargo.toml                    package `ryo-watch`, Rust 2024
   Cargo.lock                    locked dependency graph
   State.md                      this file
+  README.md                     quick start, commands, settings, fork test
   .env.example                  documented environment variables (no secrets)
   .gitignore                    ignores target/, .env, local manifests
   deployments/
     8453.anvil.json             manifest for the local Anvil deployment
+    8453.example.json           placeholder manifest showing the expected shape
   src/
     abi.rs                      hand-written sol! bindings
     chain.rs                    Alloy provider + eth_call helpers
@@ -121,10 +206,13 @@ Watcher/                        Rust crate (this work)
     venues.rs                   per-venue quote encoding, decoding, Multicall3 batches
   tests/
     events_ws.rs                mock-WebSocket reconnect/queue/ack integration test
+    fork_opportunity.rs         ignored Anvil-fork end-to-end arb test
   target/                       build output (exclude from zip)
 ```
 
-`Watcher/target` is ~2.9 GB. Never commit or zip it.
+`Watcher/target` is ~3.8 GB. Never commit or zip it. A 1.1 GB
+`Watcher.tar.gz` created by an earlier session was deleted on 2026-10-30 and
+was never pushed.
 
 ---
 
@@ -291,8 +379,11 @@ only.
 - If a flashblock has no known pool logs, it skips instead of scanning all.
 - Probe: all candidate routes at `probe_amounts_usd` (CLI `--probe-usd`,
   default `[500, 2000, 8000]`), batched two legs at a time.
+- Ranking uses **absolute profit** (`output - amount` in asset units), not
+  output/input ratio. Ratio favoured 1 wei trades and pushed the most
+  profitable size out of the simulator's top list.
 - Refine top `max_candidates` on factors `[0.5, 0.75, 1.0, 1.5, 2.0]`,
-  truncated by `amount_grid_points`.
+  truncated by `amount_grid_points`; the best absolute profit is kept.
 - Simulate top `min(max_candidates, max_simulations)` concurrently (buffer 4).
 - `eth_estimateGas` uses `manifest.operator` as the sender.
 - Gas snapshot + ETH/USD is cached for 2 seconds to smooth event bursts.
@@ -361,6 +452,8 @@ cargo test
 Result: **27 lib tests + 1 WebSocket integration test passed, 0 failed**
 (2026-10-30). `cargo clippy --all-targets` is clean after fixes.
 `tests/events_ws.rs` uses an in-process mock server and needs no network.
+`tests/fork_opportunity.rs` is `#[ignore]`d and needs a local Anvil fork; it is
+not part of a plain `cargo test`.
 
 Coverage of unit tests:
 
@@ -397,17 +490,18 @@ Public RPC `https://mainnet.base.org` worked (chain 8453). Verified:
 Anvil fork was started with:
 
 ```
-anvil --fork-url https://mainnet.base.org --chain-id 8453 --port 8545 --block-time 1
+anvil --fork-url https://mainnet.base.org --chain-id 8453 --port 8545
 ```
 
-`forge script` was run from `/tmp/opencode/ryo-check` (the copy with Foundry
-deps):
+`forge script` is run from `ryo/` (with Foundry deps installed) and now writes
+the watcher manifest itself:
 
 ```
 PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-MAX_GAS_PRICE=50000000 \
+MAX_GAS_PRICE=3000000000 \
 MAX_TRADE_USDC=8000000000 \
 MAX_TRADE_WETH=4000000000000000000 \
+MANIFEST_PATH=../Watcher/deployments/8453.anvil.json \
 forge script script/Deploy.s.sol:Deploy --rpc-url http://127.0.0.1:8545 --broadcast
 ```
 
@@ -454,41 +548,84 @@ cargo run -- --http-rpc http://127.0.0.1:8545 \
 
 ### Full scan on the fork
 
-A full `scan` on the Anvil fork completed end-to-end on 2026-10-30:
+Full scans on the Anvil fork:
 
 ```
-block 53295017 | routes 264 | quotes 1582 | simulations 0 | opportunities 0
+# cold fork (Anvil fetches missing Base state on demand)
+block 53295421 | routes 264 | quotes 1584 | simulations 0 | opportunities 0
 real 1m47
+
+# same scan again, state now cached in Anvil
+block 53295421 | routes 264 | quotes 1584 | simulations 0 | opportunities 0
+real 0m0.646
 ```
 
-That was against a cold Anvil fork (every quote fetches missing Base state).
-The batching/dedupe changes made afterwards are intended to reduce this. The
-scan did not error, but it found no route above break-even, which is expected
-for a quiet market. A profitable-route scenario still has to be manufactured.
+The watcher's own work is sub-second. The cold number is Anvil's upstream
+fetch cost, not RPC round-trip count from the watcher; quote batching and
+dedupe did their job.
+
+### Profitable-route scenario (proven end-to-end)
+
+Manufactured on the fork by impersonating the Balancer vault and swapping
+60,000 USDC into UniV3 0.05%:
+
+```
+cast rpc anvil_impersonateAccount 0xBA12222222228d8Ba445958a75a0704d566BF2C8
+cast rpc anvil_setBalance 0xBA12222222228d8Ba445958a75a0704d566BF2C8 0x8ac7230489e80000
+cast send <USDC> "approve(address,uint256)" <SwapRouter02> 60000000000 --from <vault> --unlocked
+cast send <SwapRouter02> "exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))" \
+  "(<USDC>,<WETH>,500,<vault>,60000000000,0,0)" --from <vault> --unlocked
+```
+
+`scan --pools 1 --min-net-profit-usd 0.05 --max-gas-price-gwei 3` then reported:
+
+```
+opportunity asset=WETH net_usd=11.07 profit_usd=12.50 gas_usd=1.43
+  venues=["univ3:500", "slipstream:100"]
+```
+
+`plan --asset WETH --amount 4 --route univ3:500,slipstream:100` produced
+calldata; sending it from the operator with `cast send` succeeded, emitted
+`Executed`, and the recipient received exactly `5630906016821367` WETH wei —
+the same number `simulate` reported.
+
+### `tests/fork_opportunity.rs`
+
+Same scenario, automated. The test snapshots the fork, impersonates the vault,
+does the approval + swap, runs `Scanner::evaluate` on the affected pool,
+asserts an opportunity, and with `RYO_FORK_EXECUTE=1` sends the calldata and
+asserts `realized == simulated` (exact match observed, 1% tolerance in the
+assertion). It reverts the snapshot afterwards, so it is re-runnable.
+
+```
+RYO_FORK_RPC=http://127.0.0.1:8545 RYO_FORK_EXECUTE=1 \
+  cargo test --test fork_opportunity -- --ignored --nocapture
+```
+
+Observed: `routes=44 quotes=452 simulations=10 opportunities=4`,
+best `WETH univ3:500 > slipstream:100` at 4 WETH, then 4.1s on a warm fork.
+
+### Manifest writer verification
+
+`forge script ... --broadcast` with `MANIFEST_PATH=../Watcher/deployments/8453.anvil.json`
+produced the same addresses as before, plus a correct `blockNumber`/`timestamp`.
+`ryo-watch validate` accepts it (`pools: 12 verified`, `OK`).
 
 ---
 
 ## 6. What is left (ordered)
 
-### A. Finish scanner validation (highest priority)
+### A. Scanner validation — done
 
-1. Re-run `scan` after the quote dedupe/concurrency change and record the new
-   runtime. Check for:
-   - Multicall batch size / gas limits (now chunks of 80, up to 3 concurrent).
-   - Whether `eth_call` with `BlockId::pending()` works on Alchemy.
-   - Any `simulation unexpectedly succeeded` or ABI mismatches.
-2. Manufacture a profitable route on the fork, e.g. impersonate the Balancer
-   vault or a large holder, swap a large amount in one pool to skew its price,
-   then run `scan --pools <index>`. Confirm the scanner finds it, `plan` builds
-   calldata, and `eth_estimateGas` succeeds from the operator.
-3. Add a fork integration test that:
-   - deploys `RyoCore` + adapters,
-   - sets caps,
-   - skews a pool,
-   - calls `Scanner::evaluate`,
-   - asserts an opportunity exists.
-   This should live in `Watcher/tests/` and be gated by an env var / ignored by
-   default.
+1. ~~Re-run `scan` and record runtime.~~ Done: cold 1m47s (Anvil upstream
+   fetch), warm **0.6s** for 264 routes / 1584 quotes.
+2. ~~Manufacture a profitable route and verify plan/estimateGas.~~ Done: see
+   "Profitable-route scenario" above. `eth_estimateGas` succeeds from the
+   operator and the built calldata pays out exactly the simulated profit.
+3. ~~Add a fork integration test.~~ Done: `tests/fork_opportunity.rs`.
+
+Open sub-item: `eth_call` with `BlockId::pending()` on Alchemy is still
+unverified (only Anvil and the public HTTP endpoint were used).
 
 ### B. Live Alchemy WebSocket verification
 
@@ -500,12 +637,16 @@ for a quiet market. A profitable-route scenario still has to be manufactured.
    ```
 3. Verify:
    - `pendingLogs` is supported on Base and delivers `Log` objects.
-   - `newFlashblockTransactions` shape; current code extracts hashes and logs.
+   - `newFlashblockTransactions` / `newFlashblocks` shapes; current code extracts
+     hashes and logs from both.
    - `newHeads` parsing.
    - Reconnect behavior by killing the connection / rotating the key.
 4. If `pendingLogs` is unavailable, fall back to `logs` + `newHeads` and
    document it. Flashblocks may be deprecated in Base’s Denim upgrade; keep
-   `EventSource` abstraction.
+   the `EventSource` abstraction.
+
+Local coverage exists (`tests/events_ws.rs`), but no real endpoint has been
+tested.
 
 ### C. Execution path (not built)
 
@@ -521,47 +662,47 @@ Current code only logs. To send transactions later:
 - Add a dry-run/paper/live mode gate; live must require explicit opt-in.
 - Consider private orderflow / sequencer submission later; not now.
 
-### D. Deployment manifest writer
+### D. Deployment manifest writer — done
 
-- Extend `ryo/script/Deploy.s.sol` to write `deployments/<chainId>.json`
-  matching `Manifest` (camelCase, decimal strings).
-- Include core, vault, owner, operator, profitRecipient, adapters, routers,
-  tokens, caps, maxGasPrice, version, block number, timestamp, deployer.
-- Add a test that the written manifest passes `Manifest::validate`.
-- The current `deployments/8453.anvil.json` is hand-written for the fork.
+- `ryo/script/Deploy.s.sol` writes the manifest (`MANIFEST_PATH`, default
+  `../Watcher/deployments/<chainId>.json`, `SKIP_MANIFEST=true` to skip).
+- Shape matches `config::Manifest` (camelCase, every `uint256` a decimal string).
+- `ryo/foundry.toml` allows writes to `../Watcher/deployments`.
+- Verified by broadcasting on the fork and then running
+  `ryo-watch validate` against the written file.
+- No automated Solidity test asserts the JSON; it is covered by that manual
+  round trip. Adding a small test would need file reads in Forge.
 
-### E. Docs and packaging
+### E. Docs and packaging — done
 
-- Add `Watcher/README.md` with:
-  - what it does and does not do,
-  - build/run commands,
-  - env vars,
-  - safety limits,
-  - how to add a pool/venue,
-  - how to deploy and validate.
-- `Watcher/.env.example` and `Watcher/.gitignore` are already present.
-- Add `Watcher/deployments/8453.example.json` with placeholder non-zero
-  addresses or a clear "copy and fill" template.
+- `Watcher/README.md`: what it does/does not do, layout, commands, settings,
+  tests, local Anvil playbook, safety notes.
+- `Watcher/deployments/8453.example.json` shows the manifest shape with
+  placeholder addresses.
+- `.env.example` and `.gitignore` updated.
 
-### F. Contract safety changes (deferred, approved)
+### F. Contract safety changes — done
 
-- Add `renounceOwnership` override that reverts (prevent accidental
-  renouncement).
-- Add deployment manifest writer (above).
-- Re-run the full Foundry suite after changes. Last known result: 119/119 pass
-  (105 non-fork + 14 fork); core 98.30% line / 72.41% branch, adapters 100%.
+- `renounceOwnership()` override always reverts with
+  `OwnershipRenunciationDisabled`; two-step transfer still works.
+- Three new tests in `test/RyoSecurity.t.sol` (renounce reverts, transfer then
+  renounce reverts, non-owner cannot renounce or setOperator).
+- Full Foundry suite after changes: **122/122 pass** (108 non-fork + 14 fork).
 
 ### G. Performance and robustness
 
+Done: route enumeration cache, gas/ETH cache, quote dedupe + concurrent chunks,
+duplicate-trigger suppression, bounded event queue, metrics line, debug-level
+quote failures.
+
+Still open:
+
 - Cache token decimals/symbols/caps; they do not change per block.
-- Cache route enumeration per asset/max_hops.
-- Debounce duplicate events for the same pool/block.
 - Consider `eth_call` batching for core state reads.
-- Bound the event queue if scans are slower than events; drop/merge stale
-  triggers.
-- Handle reorgs: a preconfirmed log may disappear. Re-scan on `newHeads`.
-- Log quote failure reasons at debug, not warn, to avoid log spam.
-- Add metrics (events, quotes, simulations, opportunities, latency).
+- Handle reorgs beyond "removed log forces a rescan": track the last scanned
+  block and re-scan when a head arrives after a gap.
+- Add per-stage latency metrics (quote / simulate / gas) rather than only
+  total scan time.
 
 ---
 
@@ -684,7 +825,18 @@ cargo run -- routes --asset USDC
 cargo run -- decode 0x2c10b304...
 
 # Anvil fork (if not running)
-anvil --fork-url https://mainnet.base.org --chain-id 8453 --port 8545 --block-time 1
+anvil --fork-url https://mainnet.base.org --chain-id 8453 --port 8545
+
+# Deploy + write the manifest in one step (from ryo/)
+cd ../ryo
+PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+MAX_GAS_PRICE=3000000000 MAX_TRADE_USDC=8000000000 MAX_TRADE_WETH=4000000000000000000 \
+MANIFEST_PATH=../Watcher/deployments/8453.anvil.json \
+  forge script script/Deploy.s.sol:Deploy --rpc-url http://127.0.0.1:8545 --broadcast
+cd ../Watcher
+
+# Foundry contract tests (fork tests hit Base over the network)
+cd ../ryo && forge test && cd ../Watcher
 
 # Validate the fork deployment
 cargo run -- --http-rpc http://127.0.0.1:8545 \
@@ -700,12 +852,16 @@ cargo run -- --http-rpc http://127.0.0.1:8545 \
   simulate --asset USDC --amount 1000 --route univ3:500,univ3:100
 
 cargo run -- --http-rpc http://127.0.0.1:8545 \
-  --manifest deployments/8453.anvil.json \
-  plan --asset USDC --amount 1000 --route univ3:500,univ3:100
+  --manifest deployments/8453.anvil.json --max-gas-price-gwei 3 \
+  plan --asset WETH --amount 4 --route univ3:500,slipstream:100
 
-# Full scan (next thing to verify)
-RUST_LOG=info cargo run -- --http-rpc http://127.0.0.1:8545 \
-  --manifest deployments/8453.anvil.json scan
+# Full scan (first run is slow on a cold fork; the repeat is ~0.6s)
+cargo run -- --http-rpc http://127.0.0.1:8545 \
+  --manifest deployments/8453.anvil.json --max-gas-price-gwei 3 scan
+
+# Automated fork scenario: skew the pool, scan, optionally execute
+RYO_FORK_RPC=http://127.0.0.1:8545 RYO_FORK_EXECUTE=1 \
+  cargo test --test fork_opportunity -- --ignored --nocapture
 
 # Live watch (needs Alchemy)
 cargo run -- --http-rpc <alchemy-http> --ws-rpc <alchemy-wss> \
@@ -713,8 +869,8 @@ cargo run -- --http-rpc <alchemy-http> --ws-rpc <alchemy-wss> \
 ```
 
 If the Anvil fork was restarted, its deployed addresses and state are gone.
-Redeploy with the forge command in section 5 and regenerate
-`deployments/8453.anvil.json`.
+Redeploy with the forge command above; it rewrites `deployments/8453.anvil.json`
+for you.
 
 ---
 
@@ -732,6 +888,6 @@ Redeploy with the forge command in section 5 and regenerate
 
 ## 11. Next move (one line)
 
-Re-run the full `scan` with the new batching, then manufacture a profitable
-route on the fork and add the ignored fork integration test before wiring the
-live Alchemy WebSocket.
+Wire the live Alchemy WebSocket (`RYO_WS_RPC`) and confirm `pendingLogs` /
+`newFlashblocks` payload shapes against a real endpoint; everything else that
+can be verified locally already is.
