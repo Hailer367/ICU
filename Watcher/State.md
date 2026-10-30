@@ -1,6 +1,7 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-10-30 (completion pass + historical dataset; see §0d, §0e)
+Last updated: 2026-10-30 (completion pass, historical dataset, swap-size
+filter, and live Alchemy test; see §0d–§0g)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -61,9 +62,9 @@ Local verification this session:
   a cold Anvil fork. The quote dedupe/concurrency changes above are intended to
   cut this; re-measure before drawing conclusions.
 
-Not done in this session: live Alchemy WebSocket test (no key supplied), a
-profitable-route fork scenario after the batching changes, the manifest writer,
-and transaction sending.
+Not done in this session (later completed in §0g): live Alchemy WebSocket
+test, a profitable-route fork scenario after the batching changes, the
+manifest writer, and transaction sending.
 
 ### 0b. Continuation later on 2026-10-30
 
@@ -108,8 +109,8 @@ Contract/deploy changes:
   operator rotation. Two-step transfer still works (3 new tests).
 - Added `Watcher/README.md` and `Watcher/deployments/8453.example.json`.
 
-Still not done: live Alchemy WebSocket verification (no key) and transaction
-sending (intentionally out of scope for now).
+Transaction sending remains intentionally out of scope (live WebSocket
+verification was later completed in §0g).
 
 ### 0c. Full review + continuation (2026-10-30)
 
@@ -179,11 +180,11 @@ Verification after the changes:
 
 What is still open, and why:
 
-- **Live Alchemy WebSocket** — no endpoint/API key was supplied. The
-  reconnect/ack/queue state machine is covered by `tests/events_ws.rs`, but
-  the `pendingLogs` / `newFlashblockTransactions` / `newFlashblocks` payload
-  shapes remain assumptions. This is the one path that cannot be finished
-  locally.
+- **Live Alchemy WebSocket** — resolved in §0g. The user supplied a Base
+  endpoint; `logs`, `pendingLogs`, and `newHeads` work. `pendingLogs` delivers
+  swap logs ~1 s early, so it is the live trigger source (`pending-logs` or
+  `both`). `newFlashblocks` / `newFlashblockTransactions` carry no logs, so a
+  flashblock trigger cannot identify a pool.
 - **Mainnet deployment manifest** (`deployments/8453.json`) — requires an
   actual deployment transaction and owner/operator keys.
 - **Transaction sending** — intentionally out of scope. `--mode live` still
@@ -391,8 +392,10 @@ Constraints agreed with the user:
   dry-run/paper only.
 - Explain technical topics in simple language to the user.
 
-The Alchemy Base `https://` and `wss://` endpoints have **not** been supplied
-yet. HTTP/fork testing works against public Base RPC and Anvil.
+The Alchemy Base `https://` and `wss://` endpoints were supplied and tested on
+2026-10-30 (§0g). The key is kept in the environment only; it is not stored in
+the repo or any file. HTTP/fork testing still works against public Base RPC and
+Anvil.
 
 ---
 
@@ -544,10 +547,13 @@ names (`pendingLogs`, `newFlashblockTransactions`) that Alloy’s typed
 - `tests/events_ws.rs` runs a local mock server and covers first connect,
   multi-notification frames, reconnect, and post-reconnect ack mapping.
 
-**Still unverified:** no live Alchemy WebSocket test yet. `pendingLogs`,
-`newFlashblockTransactions`, and `newFlashblocks` payload shapes are
-assumptions; verify with the real endpoint. `newHeads` is parsed for liveness
-only.
+**Verified live (2026-10-30, §0g):** against the real Alchemy endpoint,
+`logs`, `pendingLogs`, and `newHeads` subscribe and deliver the expected
+payloads; `pendingLogs` carries full pool logs ~1 s before the block.
+`newFlashblocks` returns a preconfirmed block object with transactions but no
+`logs` field, and `newFlashblockTransactions` returns a bare transaction hash:
+neither identifies a pool, so flashblock triggers are skipped. Reconnect
+against the live endpoint was not exercised (the mock test covers it).
 
 ### `src/gas.rs`
 
@@ -881,29 +887,32 @@ produced the same addresses as before, plus a correct `blockNumber`/`timestamp`.
    operator and the built calldata pays out exactly the simulated profit.
 3. ~~Add a fork integration test.~~ Done: `tests/fork_opportunity.rs`.
 
-Open sub-item: `eth_call` with `BlockId::pending()` on Alchemy is still
-unverified (only Anvil and the public HTTP endpoint were used).
+Open sub-item: `eth_call` with `BlockId::pending()` against Alchemy's HTTP
+endpoint is still unverified. The live run used Alchemy for the WebSocket and
+Anvil for HTTP/pending calls; the public HTTP endpoint and Anvil both accept
+the `pending` tag.
 
-### B. Live Alchemy WebSocket verification
+### B. Live Alchemy WebSocket verification — done 2026-10-30
 
-1. Add the real Alchemy Base `wss://` URL via `RYO_WS_RPC`.
-2. Run:
-   ```
-   cargo run -- --http-rpc <alchemy-http> --ws-rpc <alchemy-wss> \
-     --manifest deployments/8453.json --source pending-logs watch --max-events 5
-   ```
-3. Verify:
-   - `pendingLogs` is supported on Base and delivers `Log` objects.
-   - `newFlashblockTransactions` / `newFlashblocks` shapes; current code extracts
-     hashes and logs from both.
-   - `newHeads` parsing.
-   - Reconnect behavior by killing the connection / rotating the key.
-4. If `pendingLogs` is unavailable, fall back to `logs` + `newHeads` and
-   document it. Flashblocks may be deprecated in Base’s Denim upgrade; keep
-   the `EventSource` abstraction.
+Results are in §0g. Summary:
 
-Local coverage exists (`tests/events_ws.rs`), but no real endpoint has been
-tested.
+1. ~~Add the real Alchemy Base `wss://` URL via `RYO_WS_RPC`.~~ Done (key kept
+   in the environment only).
+2. Ran `watch --no-scan` per source, then full `watch --source both` against a
+   local Anvil fork with the core deployed.
+3. Findings:
+   - `pendingLogs` is supported on Base and delivers `Log` objects ~1 s before
+     the block; this is the preconfirmation signal.
+   - `newFlashblocks` returns a preconfirmed block object with transactions
+     and **no logs**; `newFlashblockTransactions` returns a single tx hash.
+     Neither can identify the affected pool, so `flashblocks` alone cannot
+     trigger scans.
+   - `newHeads` parses and is used only for gap detection.
+4. Reconnect against the live socket was not exercised; `tests/events_ws.rs`
+   covers the state machine locally.
+5. Live scan results (skewed fork): 100 triggers, 924 routes, 6,044 quotes,
+   50 simulations, 16 opportunities, best net $10.50. Unskewed: 120 triggers,
+   7,392 quotes, 0 opportunities.
 
 ### C. Execution path (not built)
 
@@ -1058,13 +1067,16 @@ those two.
 - `maxGasPrice == 0` disables the core gas check.
 - Base has a private sequencer mempool, priority-fee ordering, and 200ms
   Flashblocks. Preconfirmation is not finality.
-- Alchemy `alchemy_pendingTransactions` is not supported on Base. Webhooks
-  require a public HTTPS endpoint and are not the fast trigger.
+- Alchemy `alchemy_pendingTransactions` is not supported on Base, but the
+  `pendingLogs` subscription is (verified live 2026-10-30). Webhooks require a
+  public HTTPS endpoint and are not the fast trigger.
 - No priority-fee bidding: use the network/default tip. This will lose some
   contested races; measure it rather than hide it.
 - USDC/USD Chainlink on Base can be hours old; use a 24h staleness window.
 - Anvil’s priority-fee estimate can be ~1 gwei, so its effective gas price can
-  exceed a mainnet-tuned core `maxGasPrice`. Set a fork-only cap.
+  exceed a mainnet-tuned core `maxGasPrice`. Set a fork-only cap; the live run
+  used `--max-gas-price-gwei 2`. Real Base gas was ~0.005 gwei and passes the
+  default 0.05 gwei ceiling.
 
 ---
 
@@ -1126,9 +1138,17 @@ RYO_FORK_RPC=http://127.0.0.1:8545 RYO_FORK_EXECUTE=1 \
 cargo run -- --http-rpc https://base-rpc.publicnode.com \
   history --blocks 43200 --chunk 500 --out data/swaps_24h.jsonl
 
-# Live watch (needs Alchemy)
+# Live watch (needs the Alchemy WSS key in the environment, not a file)
 cargo run -- --http-rpc <alchemy-http> --ws-rpc <alchemy-wss> \
-  --manifest deployments/8453.json --source pending-logs watch --max-events 5
+  --manifest deployments/8453.json --source both watch --show-empty --metrics-every 25
+
+# Live triggers + local fork state (the configuration used in §0g)
+# 1) anvil --fork-url <alchemy-http> --chain-id 8453
+# 2) deploy with script/Deploy.s.sol (see the forge command above) to
+#    MANIFEST_PATH=../Watcher/deployments/8453.fork.json
+RYO_WS_RPC=<alchemy-wss> RYO_HTTP_RPC=http://127.0.0.1:8545 \
+  cargo run -- --manifest deployments/8453.fork.json --source both \
+  --max-gas-price-gwei 2 watch --show-empty --metrics-every 25
 ```
 
 If the Anvil fork was restarted, its deployed addresses and state are gone.
@@ -1139,9 +1159,10 @@ for you.
 
 ## 10. Warnings / security
 
-- The GitHub token used to push this snapshot was pasted in chat and is
-  session-scoped. **Revoke it after use.** Do not put it in the repo, State.md,
-  `.env`, or the zip.
+- Two GitHub tokens were pasted in chat (the first expired before the final
+  push; a fine-grained PAT completed it). Both are session-scoped.
+  **Revoke them after use.** Do not put them in the repo, State.md, `.env`, or
+  the zip.
 - Never commit `PRIVATE_KEY`, Alchemy URLs with API keys, or `.env`.
 - The zip intentionally excludes `target/`, `.git/`, and any `.env`.
 - `watch --mode live` currently does not send transactions. Do not assume it
@@ -1151,7 +1172,8 @@ for you.
 
 ## 11. Next move (one line)
 
-Wire the live Alchemy WebSocket (`RYO_WS_RPC`) and confirm `pendingLogs` /
-`newFlashblocks` payload shapes against a real endpoint; use the 24h
-`data/swaps_24h.jsonl` dataset to pick high-activity blocks for fork replay.
-Everything else that can be verified locally already is.
+Decide whether to deploy `RyoCore` to Base mainnet (real gas, owner/operator
+keys, writes `deployments/8453.json`); only then can the watcher scan against
+real mainnet state. Everything that can be verified without that deployment is
+done: live Alchemy events (use `--source pending-logs` or `both`), full scan
+loop on a deployed fork, and the 24h dataset for replay.
