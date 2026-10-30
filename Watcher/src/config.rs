@@ -205,8 +205,8 @@ impl Default for Settings {
             min_net_profit_usd: 0.25,
             max_gas_price_gwei: 0.05,
             per_leg_slippage_bps: 20,
-            min_profit_buffer_bps: 10,
-            amount_grid_points: 6,
+            min_profit_buffer_bps: 50,
+            amount_grid_points: 5,
             max_candidates: 16,
             max_simulations: 8,
             max_hops: 2,
@@ -294,4 +294,20 @@ pub mod base {
     pub const USDC_USD_FEED: Address = address!("7e860098F58bBFC8648a4311b374B1D669a2bc6B");
     pub const BTC_USD_FEED: Address = address!("64c911996D3c6aC71f9b455B1E8E7266BcbD848F");
     pub const EUR_USD_FEED: Address = address!("c91D87E81faB8f93699ECf7Ee9B44D11e1D53F0F");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_documented_cli_values() {
+        let settings = Settings::default();
+        assert_eq!(settings.min_profit_buffer_bps, 50);
+        assert_eq!(settings.amount_grid_points, 5);
+        assert_eq!(settings.per_leg_slippage_bps, 20);
+        assert_eq!(settings.max_candidates, 16);
+        assert_eq!(settings.max_simulations, 8);
+        assert_eq!(settings.probe_amounts_usd, vec![500.0, 2_000.0, 8_000.0]);
+    }
 }

@@ -120,10 +120,16 @@ struct Deduper {
 }
 
 impl Deduper {
-    /// Return `true` when this key was already processed recently.
-    fn is_duplicate(&mut self, key: TriggerKey) -> bool {
+    fn contains(&self, key: &TriggerKey) -> bool {
+        self.seen.contains(key)
+    }
+
+    /// Record a key only after its scan succeeded. Marking it up front would
+    /// let one transient scan failure suppress the later mined duplicate of
+    /// the same log.
+    fn mark(&mut self, key: TriggerKey) {
         if self.seen.contains(&key) {
-            return true;
+            return;
         }
         if self.order.len() >= DEDUPE_CAPACITY
             && let Some(old) = self.order.pop_front()
@@ -132,7 +138,6 @@ impl Deduper {
         }
         self.seen.insert(key.clone());
         self.order.push_back(key);
-        false
     }
 }
 
@@ -153,6 +158,9 @@ pub struct Scanner {
     routes: HashMap<Address, Vec<Route>>,
     gas_cache: Mutex<Option<CachedGas>>,
     deduper: Mutex<Deduper>,
+    /// Highest block observed by an evaluate call, used to notice skipped
+    /// heads (reorg or a dropped WebSocket message) and force one full rescan.
+    last_block: Mutex<Option<u64>>,
 }
 
 impl Scanner {
@@ -203,6 +211,7 @@ impl Scanner {
             routes,
             gas_cache: Mutex::new(None),
             deduper: Mutex::new(Deduper::default()),
+            last_block: Mutex::new(None),
         })
     }
 
@@ -275,20 +284,10 @@ impl Scanner {
             .map(|token| token.decimals)
             .unwrap_or(18);
 
-        let max_gas_price_wei = U256::from((self.settings.max_gas_price_gwei * 1e9) as u128);
-        if gas_snapshot.gas_price > max_gas_price_wei {
-            bail!(
-                "gas price {} wei exceeds watcher ceiling {} wei",
-                gas_snapshot.gas_price,
-                max_gas_price_wei
-            );
-        }
-        if !core.max_gas_price.is_zero() && gas_snapshot.gas_price > core.max_gas_price {
-            bail!(
-                "gas price {} wei exceeds core ceiling {} wei",
-                gas_snapshot.gas_price,
-                core.max_gas_price
-            );
+        if let Some(note) =
+            gas_ceiling_note(&self.settings, core.max_gas_price, gas_snapshot.gas_price)
+        {
+            bail!(note);
         }
 
         let quotes = self
@@ -317,9 +316,10 @@ impl Scanner {
     }
 
     pub async fn scan_trigger(&self, trigger: &Trigger) -> Result<ScanReport> {
-        if let Some(key) = TriggerKey::from_trigger(trigger) {
-            let mut deduper = self.deduper.lock().expect("dedupe mutex poisoned");
-            if deduper.is_duplicate(key) {
+        let key = TriggerKey::from_trigger(trigger);
+        if let Some(key) = &key {
+            let deduper = self.deduper.lock().expect("dedupe mutex poisoned");
+            if deduper.contains(key) {
                 return Ok(ScanReport {
                     notes: vec!["duplicate trigger skipped".to_string()],
                     ..Default::default()
@@ -334,14 +334,22 @@ impl Scanner {
             Trigger::Flashblock { .. } => ScanBlock::Pending,
             _ => ScanBlock::Latest,
         };
+        let mut gap_rescan = false;
         let affected = match trigger {
-            // A new head is a liveness/reorg hint, not an opportunity signal.
-            // Removed logs and reconnects already force a full rescan below.
-            Trigger::Head { .. } => {
-                return Ok(ScanReport {
-                    notes: vec!["head tick (no scan)".to_string()],
-                    ..Default::default()
-                });
+            // A head alone is not an opportunity signal. It is only acted on
+            // when blocks were skipped since the last evaluate (a reorg or a
+            // dropped WebSocket message), in which case one full rescan is due.
+            Trigger::Head { number } => {
+                let last = *self.last_block.lock().expect("last block mutex poisoned");
+                if head_requires_rescan(last, *number) {
+                    gap_rescan = true;
+                    None
+                } else {
+                    return Ok(ScanReport {
+                        notes: vec![format!("head tick {number} (no scan)")],
+                        ..Default::default()
+                    });
+                }
             }
             Trigger::Reconnect => None,
             Trigger::Log { log, .. } => self
@@ -367,7 +375,19 @@ impl Scanner {
                 Some(set.into_iter().collect())
             }
         };
-        self.evaluate(affected, block).await
+        let mut report = self.evaluate(affected, block).await?;
+        if let Some(key) = key {
+            self.deduper
+                .lock()
+                .expect("dedupe mutex poisoned")
+                .mark(key);
+        }
+        if gap_rescan {
+            report
+                .notes
+                .push("head gap detected; forced a full rescan".to_string());
+        }
+        Ok(report)
     }
 
     pub async fn evaluate(
@@ -377,6 +397,10 @@ impl Scanner {
     ) -> Result<ScanReport> {
         let block_id = block.id();
         let block_number = chain::block_number(&self.provider).await?;
+        {
+            let mut last = self.last_block.lock().expect("last block mutex poisoned");
+            *last = Some(block_number);
+        }
         let mut report = ScanReport {
             block: block_number,
             ..Default::default()
@@ -524,6 +548,15 @@ impl Scanner {
             (false, false) => manifest_cap.min(core_cap),
         };
 
+        // Gate before quoting: if gas is already too expensive, none of the
+        // route work below can produce a tradable opportunity.
+        if let Some(note) =
+            gas_ceiling_note(&self.settings, core.max_gas_price, gas_snapshot.gas_price)
+        {
+            report.notes.push(note);
+            return Ok(());
+        }
+
         let price = match gas::asset_usd_price(&self.provider, asset).await {
             Ok(price) if price > 0.0 => price,
             _ => {
@@ -637,23 +670,6 @@ impl Scanner {
                 .max_candidates
                 .min(self.settings.max_simulations.max(1)),
         );
-
-        let gas_price = gas_snapshot.gas_price;
-        let max_gas_price_wei = U256::from((self.settings.max_gas_price_gwei * 1e9) as u128);
-        if gas_price > max_gas_price_wei {
-            report.notes.push(format!(
-                "gas price {} wei exceeds watcher ceiling {} wei",
-                gas_price, max_gas_price_wei
-            ));
-            return Ok(());
-        }
-        if !core.max_gas_price.is_zero() && gas_price > core.max_gas_price {
-            report.notes.push(format!(
-                "gas price {} wei exceeds core ceiling {} wei",
-                gas_price, core.max_gas_price
-            ));
-            return Ok(());
-        }
 
         let futures = stream::iter(finalists.into_iter().map(|(index, _)| {
             let route = all_routes[index].clone();
@@ -966,6 +982,38 @@ fn update_best(
     }
 }
 
+/// Decide whether a head notification means work was skipped.
+///
+/// A forward jump means at least one block was never evaluated (dropped
+/// message or a stall). A lower head means the chain reorganised and the
+/// previous scan is stale. Consecutive heads need no rescan.
+fn head_requires_rescan(last: Option<u64>, head: u64) -> bool {
+    match last {
+        Some(last) => head > last.saturating_add(1) || head < last,
+        None => false,
+    }
+}
+
+/// Return the reason gas is too expensive, or `None` when both ceilings pass.
+fn gas_ceiling_note(
+    settings: &Settings,
+    core_max_gas_price: U256,
+    gas_price: U256,
+) -> Option<String> {
+    let watcher_max = U256::from((settings.max_gas_price_gwei * 1e9) as u128);
+    if gas_price > watcher_max {
+        return Some(format!(
+            "gas price {gas_price} wei exceeds watcher ceiling {watcher_max} wei"
+        ));
+    }
+    if !core_max_gas_price.is_zero() && gas_price > core_max_gas_price {
+        return Some(format!(
+            "gas price {gas_price} wei exceeds core ceiling {core_max_gas_price} wei"
+        ));
+    }
+    None
+}
+
 fn build_floors(quotes: &[U256], slippage_bps: u32) -> Vec<U256> {
     let keep = 10_000u32.saturating_sub(slippage_bps.min(9_999));
     quotes
@@ -1038,6 +1086,46 @@ mod tests {
         let base = U256::from(1_000_000u64);
         assert_eq!(scale_amount(base, 1.0), base);
         assert_eq!(scale_amount(base, 0.5), U256::from(500_000u64));
+    }
+
+    #[test]
+    fn head_gap_logic() {
+        assert!(!head_requires_rescan(None, 100));
+        assert!(!head_requires_rescan(Some(100), 100));
+        assert!(!head_requires_rescan(Some(100), 101));
+        assert!(head_requires_rescan(Some(100), 102));
+        assert!(head_requires_rescan(Some(100), 99));
+    }
+
+    #[test]
+    fn dedupe_marks_only_when_asked() {
+        let mut deduper = Deduper::default();
+        let key = TriggerKey::Log {
+            tx: B256::ZERO,
+            index: 7,
+        };
+        assert!(!deduper.contains(&key));
+        deduper.mark(key.clone());
+        assert!(deduper.contains(&key));
+        deduper.mark(key.clone());
+        assert_eq!(deduper.order.len(), 1);
+    }
+
+    #[test]
+    fn gas_ceiling_gate() {
+        let settings = Settings::default();
+        // 0.05 gwei ceiling: 40M wei passes, 60M wei fails.
+        assert!(gas_ceiling_note(&settings, U256::ZERO, U256::from(40_000_000u64)).is_none());
+        assert!(gas_ceiling_note(&settings, U256::ZERO, U256::from(60_000_000u64)).is_some());
+        // A non-zero core ceiling also applies.
+        assert!(
+            gas_ceiling_note(
+                &settings,
+                U256::from(30_000_000u64),
+                U256::from(40_000_000u64)
+            )
+            .is_some()
+        );
     }
 
     #[test]

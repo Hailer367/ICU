@@ -1,6 +1,6 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-10-30 (post-review session; see §0c)
+Last updated: 2026-10-30 (completion pass; see §0d)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -147,6 +147,57 @@ Findings recorded at review time (some fixed in §0d below):
   if the real endpoint includes logs. Still unverified live.
 - `deployments/8453.json` (the CLI default) does not exist until a mainnet
   deployment writes it.
+
+### 0d. Completion pass (2026-10-30, same session)
+
+Fixes applied after the §0c review:
+
+- `Settings::default()` now matches the CLI and README
+  (`min_profit_buffer_bps: 50`, `amount_grid_points: 5`), so the fork test no
+  longer silently uses different economics from a real run.
+- **Head gap / reorg handling.** `Scanner` records the last evaluated block.
+  A head that jumps more than one block, or goes backwards, forces one full
+  rescan; consecutive heads stay free. This closes the "reorg beyond removed
+  logs" item without reintroducing per-block polling.
+- **Dedupe is two-phase.** An event is recorded only after `evaluate`
+  succeeds. A transient scan failure no longer suppresses the later mined
+  duplicate of the same log. Flashblock hash-only events are still skipped
+  without being recorded.
+- **Gas gate runs before quoting.** The watcher and core gas ceilings are
+  checked at the start of each asset scan and shared with `plan`, instead of
+  after all Multicall3 work.
+- Corrected stale docs: Multicall3 chunk size is 80, target size is 3.8 GB.
+- New unit tests: settings defaults, dedupe semantics, head-gap predicate,
+  gas ceiling gate.
+
+Verification after the changes:
+
+- `cargo test`: **31 lib tests + 1 WebSocket integration test pass**; the
+  fork test remains `#[ignore]`d.
+- `cargo clippy --all-targets`: clean.
+- `cargo fmt --all --check`: clean.
+
+What is still open, and why:
+
+- **Live Alchemy WebSocket** — no endpoint/API key was supplied. The
+  reconnect/ack/queue state machine is covered by `tests/events_ws.rs`, but
+  the `pendingLogs` / `newFlashblockTransactions` / `newFlashblocks` payload
+  shapes remain assumptions. This is the one path that cannot be finished
+  locally.
+- **Mainnet deployment manifest** (`deployments/8453.json`) — requires an
+  actual deployment transaction and owner/operator keys.
+- **Transaction sending** — intentionally out of scope. `--mode live` still
+  logs only.
+- **Core-state batching** — `paused`, `maxGasPrice`, and per-asset caps are
+  read individually. With two assets this is a handful of calls per trigger;
+  batching through Multicall3 is an optional latency optimization, not a
+  correctness gap.
+- **Caching caps** — deliberately not cached; the owner can change them.
+  Token decimals/symbols are registry constants and are not read on-chain.
+- **Adapter/core selector collision** — adapter `ZeroAddress`, `NotContract`,
+  and `ZeroAmount` decode as core errors. Cosmetic only.
+- **Per-stage latency metrics** — total scan time and counters exist; split
+  quote/simulate timings are not instrumented.
 
 ---
 
@@ -351,7 +402,7 @@ only.
 - `encode_quote_call` / `decode_quote_result`.
 - `quote_step` / `quote_route`.
 - `QuoteRequest` + `quote_batch` using Multicall3 `aggregate3`
-  (`allowFailure = true`, chunks of 40).
+  (`allowFailure = true`, chunks of 80, up to three chunks concurrently).
 - UniV2/Aerodrome return `uint256[]`; UniV3/Slipstream return a tuple.
 
 ### `src/simulate.rs`
@@ -692,17 +743,19 @@ Current code only logs. To send transactions later:
 ### G. Performance and robustness
 
 Done: route enumeration cache, gas/ETH cache, quote dedupe + concurrent chunks,
-duplicate-trigger suppression, bounded event queue, metrics line, debug-level
-quote failures.
+two-phase duplicate-trigger suppression, bounded event queue, metrics line,
+debug-level quote failures, head-gap/reorg full rescan, gas gate before
+quoting.
 
 Still open:
 
-- Cache token decimals/symbols/caps; they do not change per block.
-- Consider `eth_call` batching for core state reads.
-- Handle reorgs beyond "removed log forces a rescan": track the last scanned
-  block and re-scan when a head arrives after a gap.
-- Add per-stage latency metrics (quote / simulate / gas) rather than only
-  total scan time.
+- Token decimals/symbols need no cache: the registry holds them as constants
+  and the scanner never reads them on-chain.
+- Caps are deliberately not cached because the owner can change them.
+- `eth_call` batching for core state reads is an optional latency
+  optimization (2 assets = a handful of calls per trigger).
+- Per-stage latency metrics (quote / simulate / gas) are not instrumented;
+  only total scan time and counters exist.
 
 ---
 
