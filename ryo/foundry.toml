@@ -11,7 +11,10 @@ optimizer_runs = 1000000
 via_ir = true
 bytecode_hash = "ipfs"
 cbor_metadata = true
-fs_permissions = [{ access = "read", path = "./" }]
+fs_permissions = [
+    { access = "read", path = "./" },
+    { access = "read-write", path = "../Watcher/deployments" },
+]
 
 [fuzz]
 runs = 512

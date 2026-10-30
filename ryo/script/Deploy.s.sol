@@ -16,6 +16,9 @@ import { IBalancerVault } from "../src/interfaces/IBalancerVault.sol";
 ///      set a size before the contract can trade. If OWNER differs from the deployer, ownership is
 ///      handed off at the end and the new owner must call `acceptOwnership()` afterwards.
 ///
+///      The script also writes a machine-readable manifest for the Rust watcher. Its shape must
+///      stay in sync with `Watcher/src/config.rs::Manifest`.
+///
 ///      Required env:
 ///        PRIVATE_KEY        deployer key (never commit it)
 ///      Optional env:
@@ -28,6 +31,9 @@ import { IBalancerVault } from "../src/interfaces/IBalancerVault.sol";
 ///        MAX_TRADE_CBBTC    per-trade cbBTC cap in 8-decimal units; 0 disables
 ///        MAX_TRADE_EURC     per-trade EURC cap in 6-decimal units; 0 disables
 ///        MAX_TRADE_AERO     per-trade AERO cap in wei (18 decimals); 0 disables
+///        MANIFEST_PATH      where to write the watcher manifest;
+///                           defaults to ../Watcher/deployments/<chainId>.json
+///        SKIP_MANIFEST      set to "true" to skip writing the manifest
 contract Deploy is Script {
     // --- Base mainnet addresses -------------------------------------------------------------
     address public constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
@@ -42,6 +48,28 @@ contract Deploy is Script {
     address public constant EURC = 0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42;
     address public constant AERO = 0x940181a94A35A4569E4529A3CDfB74e38FD98631;
 
+    /// @dev Everything the manifest needs, gathered in one place so the writer and the deploy
+    ///      step cannot drift apart.
+    struct Deployment {
+        address core;
+        address uniV3;
+        address uniV2;
+        address aerodrome;
+        address slipstream;
+        address deployer;
+        address owner;
+        address operator;
+        address recipient;
+        uint256 maxGasPrice;
+        uint256 capWeth;
+        uint256 capUsdc;
+        uint256 capCbbtc;
+        uint256 capEurk;
+        uint256 capAero;
+        uint256 blockNumber;
+        uint256 timestamp;
+    }
+
     function run() external {
         uint256 privateKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(privateKey);
@@ -50,6 +78,12 @@ contract Deploy is Script {
         address operator = vm.envOr("OPERATOR", deployer);
         address recipient = vm.envOr("PROFIT_RECIPIENT", owner);
         uint256 maxGasPrice = vm.envOr("MAX_GAS_PRICE", uint256(0));
+
+        uint256 capWeth = vm.envOr("MAX_TRADE_WETH", uint256(0));
+        uint256 capUsdc = vm.envOr("MAX_TRADE_USDC", uint256(0));
+        uint256 capCbbtc = vm.envOr("MAX_TRADE_CBBTC", uint256(0));
+        uint256 capEurk = vm.envOr("MAX_TRADE_EURC", uint256(0));
+        uint256 capAero = vm.envOr("MAX_TRADE_AERO", uint256(0));
 
         vm.startBroadcast(privateKey);
 
@@ -67,15 +101,36 @@ contract Deploy is Script {
         core.setAdapter(address(slipstream), true);
 
         if (maxGasPrice != 0) core.setMaxGasPrice(maxGasPrice);
-        _setCapIfConfigured(core, WETH, vm.envOr("MAX_TRADE_WETH", uint256(0)));
-        _setCapIfConfigured(core, USDC, vm.envOr("MAX_TRADE_USDC", uint256(0)));
-        _setCapIfConfigured(core, CBBTC, vm.envOr("MAX_TRADE_CBBTC", uint256(0)));
-        _setCapIfConfigured(core, EURC, vm.envOr("MAX_TRADE_EURC", uint256(0)));
-        _setCapIfConfigured(core, AERO, vm.envOr("MAX_TRADE_AERO", uint256(0)));
+        _setCapIfConfigured(core, WETH, capWeth);
+        _setCapIfConfigured(core, USDC, capUsdc);
+        _setCapIfConfigured(core, CBBTC, capCbbtc);
+        _setCapIfConfigured(core, EURC, capEurk);
+        _setCapIfConfigured(core, AERO, capAero);
 
         if (owner != deployer) core.transferOwnership(owner);
 
         vm.stopBroadcast();
+
+        Deployment memory deployment = Deployment({
+            core: address(core),
+            uniV3: address(uniV3),
+            uniV2: address(uniV2),
+            aerodrome: address(aerodrome),
+            slipstream: address(slipstream),
+            deployer: deployer,
+            owner: owner,
+            operator: operator,
+            recipient: recipient,
+            maxGasPrice: maxGasPrice,
+            capWeth: capWeth,
+            capUsdc: capUsdc,
+            capCbbtc: capCbbtc,
+            capEurk: capEurk,
+            capAero: capAero,
+            blockNumber: block.number,
+            timestamp: block.timestamp
+        });
+        _writeManifest(deployment);
 
         console2.log("RyoCore:            ", address(core));
         console2.log("UniV3Adapter:       ", address(uniV3));
@@ -94,5 +149,154 @@ contract Deploy is Script {
 
     function _setCapIfConfigured(RyoCore core, address asset, uint256 cap) private {
         if (cap != 0) core.setMaxTradeSize(asset, cap);
+    }
+
+    /// @dev Write `Watcher/src/config.rs::Manifest`. Every uint256 is a decimal string so JSON
+    ///      consumers cannot lose precision above 2^53.
+    ///      The document is assembled in small pieces because one large `string.concat` runs the
+    ///      compiler out of stack slots.
+    function _writeManifest(Deployment memory d) private {
+        if (vm.envOr("SKIP_MANIFEST", false)) return;
+        string memory path = vm.envOr(
+            "MANIFEST_PATH",
+            string.concat("../Watcher/deployments/", vm.toString(block.chainid), ".json")
+        );
+
+        // `forge script` simulates the whole script before broadcasting, so the script's
+        // `block.number` is the chain head *immediately before* the deployment transactions.
+        // The watcher never reads these two fields; they are metadata.
+        uint256 deployBlock = d.blockNumber;
+        uint256 deployTime = d.timestamp;
+
+        string memory head = string.concat(
+            "{\n",
+            '  "chainId": ',
+            vm.toString(block.chainid),
+            ",\n",
+            '  "deployer": "',
+            vm.toString(d.deployer),
+            '",\n',
+            '  "blockNumber": "',
+            vm.toString(deployBlock),
+            '",\n'
+        );
+        string memory meta = string.concat(
+            '  "timestamp": "',
+            vm.toString(deployTime),
+            '",\n',
+            '  "core": "',
+            vm.toString(d.core),
+            '",\n',
+            '  "vault": "',
+            vm.toString(BALANCER_VAULT),
+            '",\n',
+            '  "owner": "',
+            vm.toString(d.owner),
+            '",\n'
+        );
+        string memory roles = string.concat(
+            '  "operator": "',
+            vm.toString(d.operator),
+            '",\n',
+            '  "profitRecipient": "',
+            vm.toString(d.recipient),
+            '",\n',
+            _adapters(d),
+            _routers(),
+            _tokens(),
+            _caps(d)
+        );
+        string memory tail = string.concat(
+            '  "maxGasPrice": "', vm.toString(d.maxGasPrice), '",\n', '  "version": 1\n', "}\n"
+        );
+
+        vm.writeJson(string.concat(head, meta, roles, tail), path);
+        console2.log("manifest written:   ", path);
+    }
+
+    function _adapters(Deployment memory d) private view returns (string memory) {
+        return string.concat(
+            '  "adapters": {\n',
+            '    "univ3": "',
+            _str(d.uniV3),
+            '",\n',
+            '    "univ2": "',
+            _str(d.uniV2),
+            '",\n',
+            '    "aerodrome": "',
+            _str(d.aerodrome),
+            '",\n',
+            '    "slipstream": "',
+            _str(d.slipstream),
+            '"\n',
+            "  },\n"
+        );
+    }
+
+    function _routers() private view returns (string memory) {
+        return string.concat(
+            '  "routers": {\n',
+            '    "univ3": "',
+            _str(UNIV3_ROUTER),
+            '",\n',
+            '    "univ2": "',
+            _str(UNIV2_ROUTER),
+            '",\n',
+            '    "aerodrome": "',
+            _str(AERO_ROUTER),
+            '",\n',
+            '    "slipstream": "',
+            _str(SLIP_ROUTER),
+            '"\n',
+            "  },\n"
+        );
+    }
+
+    function _tokens() private view returns (string memory) {
+        return string.concat(
+            '  "tokens": {\n',
+            '    "WETH": "',
+            _str(WETH),
+            '",\n',
+            '    "USDC": "',
+            _str(USDC),
+            '",\n',
+            '    "cbBTC": "',
+            _str(CBBTC),
+            '",\n',
+            '    "EURC": "',
+            _str(EURC),
+            '",\n',
+            '    "AERO": "',
+            _str(AERO),
+            '"\n',
+            "  },\n"
+        );
+    }
+
+    function _caps(Deployment memory d) private view returns (string memory) {
+        return string.concat(
+            '  "caps": {\n',
+            '    "WETH": "',
+            vm.toString(d.capWeth),
+            '",\n',
+            '    "USDC": "',
+            vm.toString(d.capUsdc),
+            '",\n',
+            '    "cbBTC": "',
+            vm.toString(d.capCbbtc),
+            '",\n',
+            '    "EURC": "',
+            vm.toString(d.capEurk),
+            '",\n',
+            '    "AERO": "',
+            vm.toString(d.capAero),
+            '"\n',
+            "  },\n"
+        );
+    }
+
+    function _str(address value) private view returns (string memory) {
+        return vm.toString(value);
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { RyoCore } from "../src/RyoCore.sol";
@@ -452,6 +453,44 @@ contract RyoSecurityTest is BaseTest {
 
         assertEq(profit, 0);
         assertEq(tokenA.balanceOf(address(core)), 0);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Ownership
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev Renouncing would brick configuration (pause, adapters, caps, operator rotation).
+    function test_renounce_ownership_reverts() public {
+        vm.expectRevert(RyoCore.OwnershipRenunciationDisabled.selector);
+        core.renounceOwnership();
+    }
+
+    function test_two_step_transfer_still_works_and_cannot_renounce() public {
+        core.transferOwnership(newOwner);
+        assertEq(core.owner(), address(this));
+        assertEq(core.pendingOwner(), newOwner);
+
+        vm.prank(newOwner);
+        core.acceptOwnership();
+        assertEq(core.owner(), newOwner);
+        assertEq(core.pendingOwner(), address(0));
+
+        vm.prank(newOwner);
+        vm.expectRevert(RyoCore.OwnershipRenunciationDisabled.selector);
+        core.renounceOwnership();
+    }
+
+    function test_non_owner_cannot_change_admin_settings() public {
+        vm.startPrank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger)
+        );
+        core.setOperator(newOperator);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger)
+        );
+        core.renounceOwnership();
+        vm.stopPrank();
     }
 }
 

@@ -136,6 +136,7 @@ contract RyoCore is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient 
     error Loss(uint256 balanceAfter, uint256 balanceBefore);
     error MinProfitNotMet(uint256 profit, uint256 minProfit);
     error SimulationFailed();
+    error OwnershipRenunciationDisabled();
 
     /// @notice Simulation result. `simulate` always reverts with this error.
     error SimulationResult(int256 profit);
@@ -374,6 +375,14 @@ contract RyoCore is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient 
         if (!paused) revert ContractNotPaused();
         paused = false;
         emit Unpaused(msg.sender);
+    }
+
+    /// @notice Ownership cannot be renounced.
+    /// @dev A renounced owner would leave the core permanently unconfigurable: no pause, no
+    ///      adapter changes, no cap changes, and no way to rotate a compromised operator or
+    ///      recipient. Use `transferOwnership` / `acceptOwnership` instead.
+    function renounceOwnership() public view override onlyOwner {
+        revert OwnershipRenunciationDisabled();
     }
 
     function setOperator(address newOperator) external onlyOwner {
