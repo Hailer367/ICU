@@ -1,10 +1,69 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-10-29 (session snapshot)
+Last updated: 2026-10-30 (session snapshot)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
 still open, and the exact commands used.
+
+---
+
+## 0. Session update — 2026-10-30
+
+This session continued the Rust watcher (language and event-driven design
+unchanged). It did **not** enable transaction sending.
+
+Implemented and unit-tested:
+
+- Fixed `EventStream` first-connect behaviour: the first successful connection
+  is no longer reported as `Reconnect`.
+- Fixed subscription-ack mapping across reconnects. Request ids keep increasing
+  (`4,5,6, ...`), so the old `id - 1` lookup silently mapped later acks to the
+  wrong subscription kind. Acks are now tracked per connection.
+- Multiple subscription notifications in one WebSocket frame are queued instead
+  of dropping all but the first. The queue is bounded (512); overflow forces one
+  full rescan instead of growing without limit.
+- Removed (`removed: true`) logs now force a full rescan. `newHeads` no longer
+  triggers a full scan on every block (that was effectively polling); it is a
+  liveness hint only.
+- Added `newFlashblocks` alongside `newFlashblockTransactions` for the
+  `flashblocks` source.
+- Added duplicate-trigger suppression (`tx hash + log index`, and flashblock
+  hash sets) so `both` mode does not scan the same event twice.
+- Added a 2-second gas/ETH-USD cache for trigger bursts.
+- Route enumeration is cached per asset at scanner construction.
+- Quote batches now deduplicate identical calls, use chunks of 80, and run up to
+  three chunks concurrently. This targets scan latency.
+- `eth_estimateGas` now estimates from `manifest.operator`. The old zero-address
+  sender made `execute` revert with `NotOperator`, so every opportunity silently
+  used the fallback gas number.
+- `plan` now enforces the watcher gas ceiling and `min_net_profit_usd`, not only
+  the core's on-chain ceiling.
+- New CLI settings: `--max-simulations` (`RYO_MAX_SIMULATIONS`),
+  `--probe-usd` (`RYO_PROBE_USD`), and `watch --show-empty`,
+  `watch --no-scan`, `watch --metrics-every`.
+- `scan --pending` now also applies to a full scan (previously it only applied
+  when `--pools` was passed).
+- Added `Watcher/tests/events_ws.rs`, an in-process mock-WebSocket integration
+  test covering first connect, queued frames, reconnect, and ack-id mapping
+  across reconnects.
+
+Local verification this session:
+
+- `cargo test`: 27 lib tests + 1 WebSocket integration test pass.
+- `cargo clippy --all-targets`: clean (after formatting).
+- Foundry 1.8.7 installed locally; `ryo` dependencies installed and contracts
+  built successfully.
+- Anvil Base fork deployed with the standard `Deploy.s.sol` command.
+- `validate`, `quote`, and `simulate` passed on the fork.
+- A full pre-optimisation `scan` completed end-to-end:
+  `264 routes, 1582 quotes, 0 simulations, 0 opportunities` in ~1m47s against
+  a cold Anvil fork. The quote dedupe/concurrency changes above are intended to
+  cut this; re-measure before drawing conclusions.
+
+Not done in this session: live Alchemy WebSocket test (no key supplied), a
+profitable-route fork scenario after the batching changes, the manifest writer,
+and transaction sending.
 
 ---
 
@@ -60,6 +119,8 @@ Watcher/                        Rust crate (this work)
     scanner.rs                  event-driven affected-pool scanning + simulation
     simulate.rs                 core.simulate call and decode
     venues.rs                   per-venue quote encoding, decoding, Multicall3 batches
+  tests/
+    events_ws.rs                mock-WebSocket reconnect/queue/ack integration test
   target/                       build output (exclude from zip)
 ```
 
@@ -151,21 +212,29 @@ names (`pendingLogs`, `newFlashblockTransactions`) that Alloy’s typed
   - `logs` + filter `{address:[pools]}`
   - `pendingLogs` + same filter
   - `newFlashblockTransactions`
+  - `newFlashblocks` (full payload; logs are extracted if present)
   - `newHeads`
 - Reconnects with 1s..30s exponential backoff; 20s ping.
+- Per-connection subscription-id table; acks are mapped to the request that
+  created them even after `next_id` has advanced across reconnects.
+- Bounded trigger queue (512). Multiple notifications in one frame are kept.
+  Overflow clears the queue and emits `Reconnect`, forcing one fresh scan.
 - Emits `Trigger`:
-  - `Log { log, preconfirmed }`
+  - `Log { log, preconfirmed }`; a `removed` log becomes `Reconnect`
   - `Flashblock { hashes, logs }`
-  - `Head { number }`
+  - `Head { number }` (liveness only; scanner does not scan on head)
   - `Reconnect`
 - `Trigger::addresses()` and `label()`.
 - `redact_url()` hides API keys in logs.
 - Unit tests cover subscription params, log parsing, flashblock hash
   extraction, URL redaction.
+- `tests/events_ws.rs` runs a local mock server and covers first connect,
+  multi-notification frames, reconnect, and post-reconnect ack mapping.
 
-**Unverified:** no live Alchemy WebSocket test yet. `pendingLogs` and
-`newFlashblockTransactions` payload shapes are assumptions; verify with the
-real endpoint.
+**Still unverified:** no live Alchemy WebSocket test yet. `pendingLogs`,
+`newFlashblockTransactions`, and `newFlashblocks` payload shapes are
+assumptions; verify with the real endpoint. `newHeads` is parsed for liveness
+only.
 
 ### `src/gas.rs`
 
@@ -209,17 +278,24 @@ real endpoint.
 ### `src/scanner.rs`
 
 - `Scanner::new(provider, manifest, settings)`.
-- `scan_once()`, `scan_trigger(&Trigger)`, `evaluate(affected, block)`.
-- `plan(route, amount)` for the CLI.
+- `scan_once()`, `scan_once_with(block)`, `scan_trigger(&Trigger)`,
+  `evaluate(affected, block)`.
+- `plan(route, amount)` for the CLI; enforces watcher gas ceiling, core gas
+  ceiling, and `min_net_profit_usd`.
+- Routes are enumerated once per asset at construction.
+- `scan_trigger` drops duplicate `(tx hash, log index)` events and duplicate
+  flashblock hash sets.
 - Reads core `paused`, `maxGasPrice`, `maxTradeSize(asset)`.
 - Resolves caps as `min(manifest cap, core cap)`, skips zero caps.
 - Event filter: only routes containing affected pool indices.
 - If a flashblock has no known pool logs, it skips instead of scanning all.
-- Probe: all candidate routes at `probe_amounts_usd` (default
-  `[500, 2000, 8000]`), batched two legs at a time.
+- Probe: all candidate routes at `probe_amounts_usd` (CLI `--probe-usd`,
+  default `[500, 2000, 8000]`), batched two legs at a time.
 - Refine top `max_candidates` on factors `[0.5, 0.75, 1.0, 1.5, 2.0]`,
   truncated by `amount_grid_points`.
-- Simulate top `min(max_candidates, 8)` concurrently (buffer 4).
+- Simulate top `min(max_candidates, max_simulations)` concurrently (buffer 4).
+- `eth_estimateGas` uses `manifest.operator` as the sender.
+- Gas snapshot + ETH/USD is cached for 2 seconds to smooth event bursts.
 - Builds execution floors with `per_leg_slippage_bps`, `minProfit` with
   `min_profit_buffer_bps`, calldata, route hash, gas estimate.
 - Gates on:
@@ -227,7 +303,6 @@ real endpoint.
   - gas price <= watcher ceiling
   - gas price <= core `maxGasPrice` (if non-zero)
   - positive simulated profit
-  - positive net USD after L2 + L1 gas
   - `net_usd >= min_net_profit_usd`
 - `ScanReport` includes block, affected pools, routes/quotes/simulations,
   notes, and opportunities.
@@ -244,7 +319,7 @@ quote  --asset USDC --amount 1000 --route univ3:500,univ3:100
 simulate --asset USDC --amount 1000 --route univ3:500,univ3:100
 plan   --asset USDC --amount 1000 --route univ3:500,univ3:100
 scan   [--pools 0,1] [--pending] [--json]
-watch  [--max-events N] [--json]
+watch  [--max-events N] [--json] [--show-empty] [--no-scan] [--metrics-every N]
 decode 0x...
 ```
 
@@ -262,6 +337,8 @@ Global options and env vars:
 --min-profit-buffer-bps RYO_PROFIT_BUFFER_BPS
 --grid-points    RYO_GRID_POINTS
 --max-candidates RYO_MAX_CANDIDATES
+--max-simulations RYO_MAX_SIMULATIONS
+--probe-usd      RYO_PROBE_USD
 --max-hops       RYO_MAX_HOPS
 --assets         RYO_ASSETS
 --fallback-gas   RYO_FALLBACK_GAS
@@ -281,8 +358,9 @@ cd Watcher
 cargo test
 ```
 
-Result: **27 passed, 0 failed** (lib unit tests). No integration tests yet.
-`cargo clippy --all-targets` is clean after fixes.
+Result: **27 lib tests + 1 WebSocket integration test passed, 0 failed**
+(2026-10-30). `cargo clippy --all-targets` is clean after fixes.
+`tests/events_ws.rs` uses an in-process mock server and needs no network.
 
 Coverage of unit tests:
 
@@ -374,11 +452,19 @@ cargo run -- --http-rpc http://127.0.0.1:8545 \
 
 `decode` was tested with a `MinProfitNotMet` payload and printed correctly.
 
-### Interrupted test
+### Full scan on the fork
 
-A full `scan` on the Anvil fork was started, but the tool execution was
-interrupted by the user request for this state file. **`scan` has not been
-verified end-to-end yet.** This is the first thing to run next.
+A full `scan` on the Anvil fork completed end-to-end on 2026-10-30:
+
+```
+block 53295017 | routes 264 | quotes 1582 | simulations 0 | opportunities 0
+real 1m47
+```
+
+That was against a cold Anvil fork (every quote fetches missing Base state).
+The batching/dedupe changes made afterwards are intended to reduce this. The
+scan did not error, but it found no route above break-even, which is expected
+for a quiet market. A profitable-route scenario still has to be manufactured.
 
 ---
 
@@ -386,20 +472,15 @@ verified end-to-end yet.** This is the first thing to run next.
 
 ### A. Finish scanner validation (highest priority)
 
-1. Run `scan` on the Anvil fork to completion:
-   ```
-   RUST_LOG=info cargo run -- --http-rpc http://127.0.0.1:8545 \
-     --manifest deployments/8453.anvil.json scan
-   ```
-   Check for:
-   - Multicall batch size / gas limits (chunks of 40).
+1. Re-run `scan` after the quote dedupe/concurrency change and record the new
+   runtime. Check for:
+   - Multicall batch size / gas limits (now chunks of 80, up to 3 concurrent).
    - Whether `eth_call` with `BlockId::pending()` works on Alchemy.
-   - Quote counts and runtime. Full scan is ~132 routes × 3 probes × 2 legs
-     plus refinement. If too slow, reduce probes or cache per-block quotes.
    - Any `simulation unexpectedly succeeded` or ABI mismatches.
-2. Manufacture a profitable route on the fork, e.g. swap a large amount in one
-   pool to skew its price, then run `scan --pools <index>`. Confirm the scanner
-   finds it, `plan` builds calldata, and `eth_estimateGas` succeeds.
+2. Manufacture a profitable route on the fork, e.g. impersonate the Balancer
+   vault or a large holder, swap a large amount in one pool to skew its price,
+   then run `scan --pools <index>`. Confirm the scanner finds it, `plan` builds
+   calldata, and `eth_estimateGas` succeeds from the operator.
 3. Add a fork integration test that:
    - deploys `RyoCore` + adapters,
    - sets caps,
@@ -590,11 +671,12 @@ those two.
 ## 9. Exact resume commands
 
 ```bash
-cd /tmp/opencode/ICU/Watcher
+cd /home/runner/ICU/Watcher   # or your clone path
 
-# Unit tests + lints
+# Unit tests + mock WebSocket integration test + lints
 cargo test
 cargo clippy --all-targets
+cargo fmt --all --check
 
 # Public Base read-only tests
 cargo run -- gas
@@ -650,6 +732,6 @@ Redeploy with the forge command in section 5 and regenerate
 
 ## 11. Next move (one line)
 
-Run the full `scan` on the Anvil fork to completion, fix any batching/state
-issues it exposes, then manufacture a profitable route and add a fork
-integration test before wiring the live Alchemy WebSocket.
+Re-run the full `scan` with the new batching, then manufacture a profitable
+route on the fork and add the ignored fork integration test before wiring the
+live Alchemy WebSocket.

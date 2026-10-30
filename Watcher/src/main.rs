@@ -15,7 +15,7 @@ use ryo_watch::routes::{Registry, enumerate_cycles, parse_route};
 use ryo_watch::scanner::{Opportunity, ScanBlock, ScanReport, Scanner};
 use ryo_watch::simulate;
 use ryo_watch::venues;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -94,6 +94,18 @@ struct Cli {
     #[arg(long, env = "RYO_MAX_CANDIDATES", default_value_t = 16, global = true)]
     max_candidates: usize,
 
+    #[arg(long, env = "RYO_MAX_SIMULATIONS", default_value_t = 8, global = true)]
+    max_simulations: usize,
+
+    #[arg(
+        long,
+        env = "RYO_PROBE_USD",
+        value_delimiter = ',',
+        default_value = "500,2000,8000",
+        global = true
+    )]
+    probe_usd: Vec<f64>,
+
     #[arg(long, env = "RYO_MAX_HOPS", default_value_t = 2, global = true)]
     max_hops: usize,
 
@@ -171,6 +183,15 @@ enum Command {
         max_events: Option<usize>,
         #[arg(long)]
         json: bool,
+        /// Print a report even when the trigger produced no opportunity.
+        #[arg(long)]
+        show_empty: bool,
+        /// Only verify the WebSocket trigger stream; do not quote or simulate.
+        #[arg(long)]
+        no_scan: bool,
+        /// Log an accumulated metrics line every N events (0 disables).
+        #[arg(long, env = "RYO_METRICS_EVERY", default_value_t = 0)]
+        metrics_every: usize,
     },
     /// Decode revert data from a selector and payload.
     Decode {
@@ -225,8 +246,23 @@ async fn run() -> Result<()> {
             pending,
             json,
         } => scan_command(&settings, &pools, pending, json).await,
-        Command::Watch { max_events, json } => {
-            watch_command(&settings, cli.source, max_events, json).await
+        Command::Watch {
+            max_events,
+            json,
+            show_empty,
+            no_scan,
+            metrics_every,
+        } => {
+            watch_command(
+                &settings,
+                cli.source,
+                max_events,
+                json,
+                show_empty,
+                no_scan,
+                metrics_every,
+            )
+            .await
         }
         Command::Decode { data } => decode_command(&data),
     }
@@ -245,10 +281,11 @@ fn settings_from_cli(cli: &Cli) -> Settings {
         min_profit_buffer_bps: cli.min_profit_buffer_bps,
         amount_grid_points: cli.amount_grid_points,
         max_candidates: cli.max_candidates,
+        max_simulations: cli.max_simulations,
         max_hops: cli.max_hops,
         assets: cli.assets.clone(),
         fallback_gas: cli.fallback_gas,
-        probe_amounts_usd: vec![500.0, 2_000.0, 8_000.0],
+        probe_amounts_usd: cli.probe_usd.clone(),
     }
 }
 
@@ -613,19 +650,25 @@ async fn scan_command(
     let manifest = load_manifest(settings)?;
     let provider = chain::connect_http(&settings.http_rpc).await?;
     let scanner = Scanner::new(provider, manifest, settings.clone())?;
-    let report = if pools.is_empty() {
-        scanner.scan_once().await?
+    let block = if pending {
+        ScanBlock::Pending
     } else {
-        scanner
-            .evaluate(
-                Some(pools.to_vec()),
-                if pending {
-                    ScanBlock::Pending
-                } else {
-                    ScanBlock::Latest
-                },
-            )
-            .await?
+        ScanBlock::Latest
+    };
+    if !pools.is_empty() {
+        for index in pools {
+            if *index >= scanner.registry().pools.len() {
+                bail!(
+                    "pool index {index} is out of range (0..{})",
+                    scanner.registry().pools.len()
+                );
+            }
+        }
+    }
+    let report = if pools.is_empty() {
+        scanner.scan_once_with(block).await?
+    } else {
+        scanner.evaluate(Some(pools.to_vec()), block).await?
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
@@ -635,11 +678,56 @@ async fn scan_command(
     Ok(())
 }
 
+#[derive(Default)]
+struct WatchMetrics {
+    events: usize,
+    scans: usize,
+    failed_scans: usize,
+    routes: usize,
+    quotes: usize,
+    simulations: usize,
+    opportunities: usize,
+    scan_millis: u128,
+}
+
+impl WatchMetrics {
+    fn record(&mut self, report: &ScanReport, millis: u128) {
+        self.scans += 1;
+        self.scan_millis += millis;
+        self.routes += report.routes_considered;
+        self.quotes += report.quotes;
+        self.simulations += report.simulations;
+        self.opportunities += report.opportunities.len();
+    }
+
+    fn summary(&self) -> String {
+        let avg = if self.scans == 0 {
+            0
+        } else {
+            self.scan_millis / self.scans as u128
+        };
+        format!(
+            "events={} scans={} failed={} routes={} quotes={} simulations={} opportunities={} avg_scan_ms={avg}",
+            self.events,
+            self.scans,
+            self.failed_scans,
+            self.routes,
+            self.quotes,
+            self.simulations,
+            self.opportunities
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn watch_command(
     settings: &Settings,
     source: EventSource,
     max_events: Option<usize>,
     json: bool,
+    show_empty: bool,
+    no_scan: bool,
+    metrics_every: usize,
 ) -> Result<()> {
     if source == EventSource::Once {
         bail!("watch requires an event source other than `once`");
@@ -663,36 +751,64 @@ async fn watch_command(
         url = %redact_url(ws),
         source = ?source,
         pools = pools.len(),
+        no_scan,
         "watching"
     );
 
     let mut events = 0usize;
+    let mut metrics = WatchMetrics::default();
     loop {
         let trigger = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                info!("shutting down");
+                info!(metrics = %metrics.summary(), "shutting down");
                 return Ok(());
             }
             trigger = stream.next() => trigger?,
         };
         events += 1;
+        metrics.events = events;
         info!(event = %trigger.label(), "trigger");
+        if no_scan {
+            if let Some(max) = max_events
+                && events >= max
+            {
+                info!(events, metrics = %metrics.summary(), "max events reached");
+                return Ok(());
+            }
+            continue;
+        }
+        let started = std::time::Instant::now();
         let report = match scanner.scan_trigger(&trigger).await {
             Ok(report) => report,
             Err(err) => {
+                metrics.failed_scans += 1;
                 warn!(error = %err, "scan failed");
                 continue;
             }
         };
+        let millis = started.elapsed().as_millis();
+        metrics.record(&report, millis);
         if json {
             println!("{}", serde_json::to_string(&report_json(&report))?);
-        } else {
+        } else if show_empty || !report.opportunities.is_empty() {
             print_report(&report);
+        } else {
+            debug!(
+                block = report.block,
+                routes = report.routes_considered,
+                quotes = report.quotes,
+                simulations = report.simulations,
+                millis,
+                "scan complete (no opportunity)"
+            );
+        }
+        if metrics_every > 0 && events.is_multiple_of(metrics_every) {
+            info!(metrics = %metrics.summary(), "watch metrics");
         }
         if let Some(max) = max_events
             && events >= max
         {
-            info!(events, "max events reached");
+            info!(events, metrics = %metrics.summary(), "max events reached");
             return Ok(());
         }
     }

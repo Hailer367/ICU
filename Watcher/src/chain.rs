@@ -109,8 +109,23 @@ pub async fn eth_call_u8(
 }
 
 /// Estimate gas for a call. The node must be able to execute it.
+///
+/// `from` matters for permissioned functions: `RyoCore.execute` only accepts
+/// the operator or owner, so estimating from the zero address always reverts.
 pub async fn estimate_gas(provider: &ChainProvider, to: Address, data: Bytes) -> Result<u64> {
-    let request = TransactionRequest::default().with_to(to).with_input(data);
+    estimate_gas_from(provider, to, data, None).await
+}
+
+pub async fn estimate_gas_from(
+    provider: &ChainProvider,
+    to: Address,
+    data: Bytes,
+    from: Option<Address>,
+) -> Result<u64> {
+    let mut request = TransactionRequest::default().with_to(to).with_input(data);
+    if let Some(from) = from {
+        request = request.with_from(from);
+    }
     provider
         .estimate_gas(request)
         .await

@@ -4,7 +4,9 @@
 //! (a pool log, a flashblock, a new head, or a reconnect) and it quotes only
 //! the routes that touch the affected pools.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, Bytes, I256, U256};
@@ -21,6 +23,13 @@ use crate::gas::{self, GasSnapshot, TradeCost};
 use crate::routes::{Registry, Route, enumerate_cycles};
 use crate::simulate::{self, SimulateError};
 use crate::venues::{self, QuoteRequest};
+
+/// Reuse a gas snapshot and ETH/USD price for this long. Bursts of pool logs
+/// otherwise re-read the same chain state several times in a row.
+const GAS_CACHE_TTL: Duration = Duration::from_secs(2);
+/// Remember this many recent triggers so `logs` + `pendingLogs` duplicates do
+/// not cause two identical scans.
+const DEDUPE_CAPACITY: usize = 2_048;
 
 #[derive(Debug, Clone)]
 pub struct Opportunity {
@@ -82,6 +91,57 @@ struct CoreState {
     caps: HashMap<Address, U256>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TriggerKey {
+    Log { tx: B256, index: u64 },
+    Flashblock { hashes: Vec<B256> },
+}
+
+impl TriggerKey {
+    fn from_trigger(trigger: &Trigger) -> Option<Self> {
+        match trigger {
+            Trigger::Log { log, .. } => {
+                let tx = log.transaction_hash?;
+                let index = log.log_index?;
+                Some(Self::Log { tx, index })
+            }
+            Trigger::Flashblock { hashes, .. } if !hashes.is_empty() => Some(Self::Flashblock {
+                hashes: hashes.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Deduper {
+    order: VecDeque<TriggerKey>,
+    seen: HashSet<TriggerKey>,
+}
+
+impl Deduper {
+    /// Return `true` when this key was already processed recently.
+    fn is_duplicate(&mut self, key: TriggerKey) -> bool {
+        if self.seen.contains(&key) {
+            return true;
+        }
+        if self.order.len() >= DEDUPE_CAPACITY
+            && let Some(old) = self.order.pop_front()
+        {
+            self.seen.remove(&old);
+        }
+        self.seen.insert(key.clone());
+        self.order.push_back(key);
+        false
+    }
+}
+
+struct CachedGas {
+    at: Instant,
+    snapshot: GasSnapshot,
+    eth_usd: f64,
+}
+
 pub struct Scanner {
     provider: ChainProvider,
     manifest: Manifest,
@@ -89,6 +149,10 @@ pub struct Scanner {
     settings: Settings,
     pool_index: HashMap<Address, usize>,
     assets: Vec<Address>,
+    /// Cycles are static for a given registry and hop limit, so enumerate once.
+    routes: HashMap<Address, Vec<Route>>,
+    gas_cache: Mutex<Option<CachedGas>>,
+    deduper: Mutex<Deduper>,
 }
 
 impl Scanner {
@@ -119,6 +183,16 @@ impl Scanner {
             bail!("no scannable assets configured");
         }
 
+        let routes = assets
+            .iter()
+            .map(|asset| {
+                (
+                    *asset,
+                    enumerate_cycles(&registry, *asset, settings.max_hops),
+                )
+            })
+            .collect();
+
         Ok(Self {
             provider,
             manifest,
@@ -126,7 +200,34 @@ impl Scanner {
             settings,
             pool_index,
             assets,
+            routes,
+            gas_cache: Mutex::new(None),
+            deduper: Mutex::new(Deduper::default()),
         })
+    }
+
+    /// Read a gas snapshot and ETH/USD price, reusing a recent pair when the
+    /// watcher is processing a burst of triggers.
+    async fn gas_context(&self) -> Result<(GasSnapshot, f64)> {
+        {
+            let cache = self.gas_cache.lock().expect("gas cache mutex poisoned");
+            if let Some(cached) = cache.as_ref()
+                && cached.at.elapsed() < GAS_CACHE_TTL
+            {
+                return Ok((cached.snapshot.clone(), cached.eth_usd));
+            }
+        }
+        let snapshot = gas::snapshot(&self.provider, 2_000).await?;
+        let eth_usd = gas::eth_usd_price(&self.provider).await.unwrap_or(0.0);
+        if eth_usd > 0.0 {
+            let mut cache = self.gas_cache.lock().expect("gas cache mutex poisoned");
+            *cache = Some(CachedGas {
+                at: Instant::now(),
+                snapshot: snapshot.clone(),
+                eth_usd,
+            });
+        }
+        Ok((snapshot, eth_usd))
     }
 
     pub fn manifest(&self) -> &Manifest {
@@ -145,6 +246,10 @@ impl Scanner {
         self.evaluate(None, ScanBlock::Latest).await
     }
 
+    pub async fn scan_once_with(&self, block: ScanBlock) -> Result<ScanReport> {
+        self.evaluate(None, block).await
+    }
+
     /// Quote and simulate one explicit route. Used by the CLI `plan` command.
     pub async fn plan(&self, route: &Route, amount: U256) -> Result<Option<Opportunity>> {
         let block_id = BlockId::latest();
@@ -152,8 +257,7 @@ impl Scanner {
         if core.paused {
             bail!("core is paused");
         }
-        let gas_snapshot = gas::snapshot(&self.provider, 2_000).await?;
-        let eth_usd = gas::eth_usd_price(&self.provider).await?;
+        let (gas_snapshot, eth_usd) = self.gas_context().await?;
         let asset_usd = gas::asset_usd_price(&self.provider, route.asset).await?;
         let symbol = self
             .manifest
@@ -171,6 +275,14 @@ impl Scanner {
             .map(|token| token.decimals)
             .unwrap_or(18);
 
+        let max_gas_price_wei = U256::from((self.settings.max_gas_price_gwei * 1e9) as u128);
+        if gas_snapshot.gas_price > max_gas_price_wei {
+            bail!(
+                "gas price {} wei exceeds watcher ceiling {} wei",
+                gas_snapshot.gas_price,
+                max_gas_price_wei
+            );
+        }
         if !core.max_gas_price.is_zero() && gas_snapshot.gas_price > core.max_gas_price {
             bail!(
                 "gas price {} wei exceeds core ceiling {} wei",
@@ -205,6 +317,16 @@ impl Scanner {
     }
 
     pub async fn scan_trigger(&self, trigger: &Trigger) -> Result<ScanReport> {
+        if let Some(key) = TriggerKey::from_trigger(trigger) {
+            let mut deduper = self.deduper.lock().expect("dedupe mutex poisoned");
+            if deduper.is_duplicate(key) {
+                return Ok(ScanReport {
+                    notes: vec!["duplicate trigger skipped".to_string()],
+                    ..Default::default()
+                });
+            }
+        }
+
         let block = match trigger {
             Trigger::Log {
                 preconfirmed: true, ..
@@ -213,7 +335,15 @@ impl Scanner {
             _ => ScanBlock::Latest,
         };
         let affected = match trigger {
-            Trigger::Head { .. } | Trigger::Reconnect => None,
+            // A new head is a liveness/reorg hint, not an opportunity signal.
+            // Removed logs and reconnects already force a full rescan below.
+            Trigger::Head { .. } => {
+                return Ok(ScanReport {
+                    notes: vec!["head tick (no scan)".to_string()],
+                    ..Default::default()
+                });
+            }
+            Trigger::Reconnect => None,
             Trigger::Log { log, .. } => self
                 .pool_index
                 .get(&log.address())
@@ -258,8 +388,7 @@ impl Scanner {
             return Ok(report);
         }
 
-        let gas_snapshot = gas::snapshot(&self.provider, 2_000).await?;
-        let eth_usd = gas::eth_usd_price(&self.provider).await.unwrap_or(0.0);
+        let (gas_snapshot, eth_usd) = self.gas_context().await?;
         if eth_usd <= 0.0 {
             report
                 .notes
@@ -405,7 +534,10 @@ impl Scanner {
             }
         };
 
-        let mut all_routes = enumerate_cycles(&self.registry, asset, self.settings.max_hops);
+        let mut all_routes = self.routes.get(&asset).cloned().unwrap_or_default();
+        if all_routes.is_empty() {
+            all_routes = enumerate_cycles(&self.registry, asset, self.settings.max_hops);
+        }
         if let Some(indices) = affected {
             all_routes.retain(|route| {
                 route
@@ -451,7 +583,7 @@ impl Scanner {
             .filter_map(|(index, (_, _, ratio))| (*ratio > 1.0).then_some((*index, *ratio)))
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(self.settings.max_candidates);
+        ranked.truncate(self.settings.max_candidates.max(1));
         if ranked.is_empty() {
             debug!(asset = %symbol, "no route quoted above break-even");
             return Ok(());
@@ -498,7 +630,11 @@ impl Scanner {
             .filter_map(|(index, _)| best.get(index).map(|(_, _, ratio)| (*index, *ratio)))
             .collect();
         finalists.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        finalists.truncate(self.settings.max_candidates.min(8));
+        finalists.truncate(
+            self.settings
+                .max_candidates
+                .min(self.settings.max_simulations.max(1)),
+        );
 
         let gas_price = gas_snapshot.gas_price;
         let max_gas_price_wei = U256::from((self.settings.max_gas_price_gwei * 1e9) as u128);
@@ -554,17 +690,15 @@ impl Scanner {
         let results: Vec<Option<Opportunity>> = futures.buffer_unordered(4).collect().await;
         report.simulations += results.len();
         for opportunity in results.into_iter().flatten() {
-            if opportunity.net_usd >= self.settings.min_net_profit_usd {
-                info!(
-                    asset = %opportunity.asset_symbol,
-                    net_usd = opportunity.net_usd,
-                    profit_usd = opportunity.profit_usd,
-                    gas_usd = opportunity.cost.total_fee_usd,
-                    venues = ?opportunity.venues(),
-                    "opportunity"
-                );
-                report.opportunities.push(opportunity);
-            }
+            info!(
+                asset = %opportunity.asset_symbol,
+                net_usd = opportunity.net_usd,
+                profit_usd = opportunity.profit_usd,
+                gas_usd = opportunity.cost.total_fee_usd,
+                venues = ?opportunity.venues(),
+                "opportunity"
+            );
+            report.opportunities.push(opportunity);
         }
         Ok(())
     }
@@ -594,7 +728,9 @@ impl Scanner {
             .max()
             .unwrap_or(0);
         for leg in 0..max_legs {
-            let mut requests = Vec::new();
+            let mut requests: Vec<QuoteRequest> = Vec::new();
+            let mut unique: HashMap<(Address, Bytes), usize> = HashMap::new();
+            let mut request_for_route: Vec<Option<usize>> = vec![None; routes.len()];
             let mut route_indices = Vec::new();
             for (index, route) in routes.iter().enumerate() {
                 let Some(Some(current)) = quotes.get(index) else {
@@ -608,7 +744,16 @@ impl Scanner {
                 };
                 match QuoteRequest::new(&self.manifest, step, input) {
                     Ok(request) => {
-                        requests.push(request);
+                        let key = (request.target, request.data.clone());
+                        let request_index = if let Some(existing) = unique.get(&key) {
+                            *existing
+                        } else {
+                            let new_index = requests.len();
+                            requests.push(request);
+                            unique.insert(key, new_index);
+                            new_index
+                        };
+                        request_for_route[index] = Some(request_index);
                         route_indices.push(index);
                     }
                     Err(err) => {
@@ -621,11 +766,18 @@ impl Scanner {
                 break;
             }
             let results = venues::quote_batch(&self.provider, &requests, block).await;
-            for (route_index, result) in route_indices.into_iter().zip(results) {
+            for route_index in route_indices {
+                let Some(request_index) = request_for_route[route_index] else {
+                    continue;
+                };
+                let Some(result) = results.get(request_index) else {
+                    quotes[route_index] = None;
+                    continue;
+                };
                 match result {
                     Ok(amount_out) => {
                         if let Some(Some(current)) = quotes.get_mut(route_index) {
-                            current.push(amount_out);
+                            current.push(*amount_out);
                         }
                     }
                     Err(err) => {
@@ -712,7 +864,14 @@ async fn simulate_route(
     let calldata = Bytes::from(call.abi_encode());
     let route_hash = route.route_hash(manifest, &floors).ok()?;
 
-    let gas_used = match chain::estimate_gas(provider, manifest.core, calldata.clone()).await {
+    let gas_used = match chain::estimate_gas_from(
+        provider,
+        manifest.core,
+        calldata.clone(),
+        Some(manifest.operator),
+    )
+    .await
+    {
         Ok(gas) => gas,
         Err(err) => {
             debug!(error = %err, "gas estimate failed; using fallback");
@@ -728,7 +887,7 @@ async fn simulate_route(
     );
     let profit_usd = gas::profit_usd(profit_raw, decimals, asset_usd);
     let net_usd = profit_usd - cost.total_fee_usd;
-    if net_usd <= 0.0 {
+    if net_usd < settings.min_net_profit_usd {
         return None;
     }
 

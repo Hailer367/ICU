@@ -6,7 +6,7 @@
 //! subscription names (`pendingLogs`, `newFlashblockTransactions`) can be used
 //! without waiting for a typed client to add support for them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
@@ -21,6 +21,11 @@ use tracing::{debug, info, warn};
 use crate::config::EventSource;
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Bound the trigger queue so a slow scan cannot make the watcher fall
+/// arbitrarily far behind the chain. On overflow the queue is flushed and the
+/// stream emits a `Reconnect` trigger, which forces one fresh full scan.
+const MAX_QUEUED_TRIGGERS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubKind {
@@ -59,6 +64,11 @@ fn specs(source: EventSource, pools: &[Address]) -> Vec<Spec> {
                 method: "newFlashblockTransactions",
                 params: json!(["newFlashblockTransactions"]),
                 kind: SubKind::FlashblockTxs,
+            },
+            Spec {
+                method: "newFlashblocks",
+                params: json!(["newFlashblocks"]),
+                kind: SubKind::Flashblocks,
             },
             Spec {
                 method: "newHeads",
@@ -122,6 +132,9 @@ impl Trigger {
 struct Conn {
     ws: Ws,
     subscriptions: HashMap<String, SubKind>,
+    /// Subscription request id -> kind. Kept per-connection so reconnects do
+    /// not need to guess from the (ever-increasing) global request id.
+    pending: HashMap<u64, SubKind>,
 }
 
 /// Reconnecting WebSocket event source.
@@ -135,6 +148,8 @@ pub struct EventStream {
     ping_every: Duration,
     last_ping: Instant,
     connected_once: bool,
+    queue: VecDeque<Trigger>,
+    overflowed: bool,
 }
 
 impl EventStream {
@@ -149,6 +164,8 @@ impl EventStream {
             ping_every: Duration::from_secs(20),
             last_ping: Instant::now(),
             connected_once: false,
+            queue: VecDeque::new(),
+            overflowed: false,
         }
     }
 
@@ -159,6 +176,19 @@ impl EventStream {
             .collect()
     }
 
+    fn push(&mut self, trigger: Trigger) {
+        if self.queue.len() >= MAX_QUEUED_TRIGGERS {
+            self.queue.clear();
+            self.overflowed = true;
+            warn!(
+                capacity = MAX_QUEUED_TRIGGERS,
+                "event queue overflowed; will force a full rescan"
+            );
+            return;
+        }
+        self.queue.push_back(trigger);
+    }
+
     async fn connect(&mut self) -> anyhow::Result<()> {
         info!(url = %redact_url(&self.url), "connecting WebSocket");
         let (ws, _response) = timeout(Duration::from_secs(20), connect_async(&self.url))
@@ -167,11 +197,13 @@ impl EventStream {
         let mut conn = Conn {
             ws,
             subscriptions: HashMap::new(),
+            pending: HashMap::new(),
         };
 
         for spec in &self.specs {
             let id = self.next_id;
             self.next_id += 1;
+            conn.pending.insert(id, spec.kind);
             let request = json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -189,18 +221,20 @@ impl EventStream {
         self.backoff = Duration::from_secs(1);
         self.last_ping = Instant::now();
         self.reconnect_at = None;
-        if self.connected_once {
-            info!("WebSocket reconnected");
-        } else {
-            info!("WebSocket connected");
-            self.connected_once = true;
-        }
+        info!("WebSocket connected");
         Ok(())
     }
 
     /// Return the next trigger, reconnecting transparently.
     pub async fn next(&mut self) -> anyhow::Result<Trigger> {
         loop {
+            if let Some(trigger) = self.queue.pop_front() {
+                return Ok(trigger);
+            }
+            if self.overflowed {
+                self.overflowed = false;
+                return Ok(Trigger::Reconnect);
+            }
             if self.conn.is_none() {
                 if let Some(at) = self.reconnect_at {
                     let now = Instant::now();
@@ -208,11 +242,14 @@ impl EventStream {
                         tokio::time::sleep(at - now).await;
                     }
                 }
+                let reconnecting = self.connected_once;
                 match self.connect().await {
                     Ok(()) => {
-                        if self.connected_once {
+                        if reconnecting {
+                            info!("WebSocket reconnected");
                             return Ok(Trigger::Reconnect);
                         }
+                        self.connected_once = true;
                     }
                     Err(err) => {
                         warn!(error = %err, backoff_secs = self.backoff.as_secs(), "WebSocket connect failed");
@@ -259,15 +296,11 @@ impl EventStream {
 
             match message {
                 Message::Text(text) => {
-                    if let Some(trigger) = self.handle_text(text.as_str()) {
-                        return Ok(trigger);
-                    }
+                    self.ingest_text(text.as_str());
                 }
                 Message::Binary(bytes) => {
-                    if let Ok(text) = std::str::from_utf8(&bytes)
-                        && let Some(trigger) = self.handle_text(text)
-                    {
-                        return Ok(trigger);
+                    if let Ok(text) = std::str::from_utf8(&bytes) {
+                        self.ingest_text(text);
                     }
                 }
                 Message::Ping(payload) => {
@@ -285,39 +318,45 @@ impl EventStream {
         }
     }
 
-    fn handle_text(&mut self, text: &str) -> Option<Trigger> {
+    fn ingest_text(&mut self, text: &str) {
         let value: Value = match serde_json::from_str(text) {
             Ok(value) => value,
             Err(err) => {
                 debug!(error = %err, "ignoring non-JSON WebSocket message");
-                return None;
+                return;
             }
         };
 
-        if value.is_array() {
-            for item in value.as_array().into_iter().flatten() {
+        if let Some(items) = value.as_array() {
+            for item in items {
                 if let Some(trigger) = self.handle_value(item) {
-                    return Some(trigger);
+                    self.push(trigger);
                 }
             }
-            return None;
+        } else if let Some(trigger) = self.handle_value(&value) {
+            self.push(trigger);
         }
-        self.handle_value(&value)
     }
 
     fn handle_value(&mut self, value: &Value) -> Option<Trigger> {
         // Subscription response: {"id":1,"result":"0x..."}
         if let Some(id) = value.get("id").and_then(Value::as_u64) {
             if let Some(result) = value.get("result").and_then(Value::as_str) {
-                let index = (id as usize).saturating_sub(1);
-                if let Some(spec) = self.specs.get(index)
-                    && let Some(conn) = self.conn.as_mut()
-                {
-                    conn.subscriptions.insert(result.to_string(), spec.kind);
-                    info!(method = spec.method, subscription = result, "subscribed");
+                if let Some(conn) = self.conn.as_mut() {
+                    let kind = conn.pending.remove(&id).or_else(|| {
+                        self.specs
+                            .get((id as usize).saturating_sub(1))
+                            .map(|s| s.kind)
+                    });
+                    conn.subscriptions
+                        .insert(result.to_string(), kind.unwrap_or(SubKind::Logs));
+                    info!(id, subscription = result, kind = ?kind, "subscribed");
                 }
             } else if let Some(error) = value.get("error") {
-                warn!(%error, "subscription request failed");
+                if let Some(conn) = self.conn.as_mut() {
+                    conn.pending.remove(&id);
+                }
+                warn!(%error, id, "subscription request failed");
             }
             return None;
         }
@@ -336,9 +375,15 @@ impl EventStream {
         let result = params.get("result")?;
 
         match kind {
-            SubKind::Logs => parse_log(result).map(|log| Trigger::Log {
-                log,
-                preconfirmed: false,
+            SubKind::Logs => parse_log(result).map(|log| {
+                if log.removed {
+                    Trigger::Reconnect
+                } else {
+                    Trigger::Log {
+                        log,
+                        preconfirmed: false,
+                    }
+                }
             }),
             SubKind::PendingLogs => parse_log(result).map(|log| Trigger::Log {
                 log,

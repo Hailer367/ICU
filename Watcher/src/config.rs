@@ -183,6 +183,8 @@ pub struct Settings {
     pub min_profit_buffer_bps: u32,
     pub amount_grid_points: usize,
     pub max_candidates: usize,
+    /// Maximum number of finalists simulated per asset per trigger.
+    pub max_simulations: usize,
     pub max_hops: usize,
     /// Asset symbols to arbitrage, in the order they should be scanned.
     pub assets: Vec<String>,
@@ -206,6 +208,7 @@ impl Default for Settings {
             min_profit_buffer_bps: 10,
             amount_grid_points: 6,
             max_candidates: 16,
+            max_simulations: 8,
             max_hops: 2,
             assets: vec!["USDC".to_string(), "WETH".to_string()],
             fallback_gas: 450_000,
@@ -230,6 +233,28 @@ impl Settings {
         }
         if self.amount_grid_points < 2 {
             bail!("amount_grid_points must be at least 2");
+        }
+        if self.max_candidates == 0 {
+            bail!("max_candidates must be at least 1");
+        }
+        if self.max_simulations == 0 {
+            bail!("max_simulations must be at least 1");
+        }
+        if self.probe_amounts_usd.is_empty() {
+            bail!("at least one probe amount is required");
+        }
+        if self
+            .probe_amounts_usd
+            .iter()
+            .any(|usd| !usd.is_finite() || *usd <= 0.0)
+        {
+            bail!("probe amounts must be positive finite numbers");
+        }
+        if !self.min_net_profit_usd.is_finite() || self.min_net_profit_usd < 0.0 {
+            bail!("min_net_profit_usd must be a non-negative number");
+        }
+        if !self.max_gas_price_gwei.is_finite() || self.max_gas_price_gwei <= 0.0 {
+            bail!("max_gas_price_gwei must be a positive number");
         }
         if self.max_hops < 2 || self.max_hops > 8 {
             bail!("max_hops must be between 2 and 8");

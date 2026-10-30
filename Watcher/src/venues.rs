@@ -2,6 +2,7 @@ use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::SolCall;
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 
 use crate::abi::{aerodrome_router, multicall3, slipstream_quoter, univ2_router, univ3_quoter};
 use crate::chain::{self, ChainProvider};
@@ -155,78 +156,99 @@ impl QuoteRequest {
 ///
 /// Uses Multicall3 `aggregate3` with `allowFailure = true`, so one bad pool
 /// does not discard the rest of the batch. Results are returned in input order.
+///
+/// Chunks are executed concurrently. A 2-hop probe round has up to 132 calls,
+/// and serialising four RPC round-trips was a measurable part of scan latency.
 pub async fn quote_batch(
     provider: &ChainProvider,
     requests: &[QuoteRequest],
     block: BlockId,
 ) -> Vec<std::result::Result<U256, String>> {
-    const CHUNK: usize = 40;
-    let mut results: Vec<std::result::Result<U256, String>> = Vec::with_capacity(requests.len());
-    for chunk in requests.chunks(CHUNK) {
-        let calls: Vec<multicall3::Call3> = chunk
-            .iter()
-            .map(|request| multicall3::Call3 {
-                target: request.target,
-                allowFailure: true,
-                callData: request.data.clone(),
+    const CHUNK: usize = 80;
+    const CONCURRENCY: usize = 3;
+
+    let chunks: Vec<&[QuoteRequest]> = requests.chunks(CHUNK).collect();
+    let mut by_chunk: Vec<(usize, Vec<std::result::Result<U256, String>>)> =
+        futures_util::stream::iter(chunks.into_iter().enumerate())
+            .map(|(index, chunk)| async move {
+                let results = quote_chunk(provider, chunk, block).await;
+                (index, results)
             })
-            .collect();
-        let call = multicall3::aggregate3Call { calls };
-        let bytes = match chain::eth_call(
-            provider,
-            base::MULTICALL3,
-            call.abi_encode().into(),
-            block,
-        )
-        .await
-        {
+            .buffer_unordered(CONCURRENCY)
+            .collect()
+            .await;
+    by_chunk.sort_by_key(|(index, _)| *index);
+
+    let mut results = Vec::with_capacity(requests.len());
+    for (_, mut chunk_results) in by_chunk {
+        results.append(&mut chunk_results);
+    }
+    results
+}
+
+async fn quote_chunk(
+    provider: &ChainProvider,
+    chunk: &[QuoteRequest],
+    block: BlockId,
+) -> Vec<std::result::Result<U256, String>> {
+    let mut results: Vec<std::result::Result<U256, String>> = Vec::with_capacity(chunk.len());
+    let calls: Vec<multicall3::Call3> = chunk
+        .iter()
+        .map(|request| multicall3::Call3 {
+            target: request.target,
+            allowFailure: true,
+            callData: request.data.clone(),
+        })
+        .collect();
+    let call = multicall3::aggregate3Call { calls };
+    let bytes =
+        match chain::eth_call(provider, base::MULTICALL3, call.abi_encode().into(), block).await {
             Ok(bytes) => bytes,
             Err(err) => {
                 let message = format!("multicall failed: {err}");
                 results.extend(chunk.iter().map(|_| Err(message.clone())));
-                continue;
+                return results;
             }
         };
 
-        let decoded = match multicall3::aggregate3Call::abi_decode_returns(&bytes) {
-            Ok(decoded) => decoded,
-            Err(err) => {
-                let message = format!("failed to decode multicall result: {err}");
-                results.extend(chunk.iter().map(|_| Err(message.clone())));
-                continue;
-            }
-        };
-
-        if decoded.len() != chunk.len() {
-            let message = format!(
-                "multicall returned {} results for {} calls",
-                decoded.len(),
-                chunk.len()
-            );
+    let decoded = match multicall3::aggregate3Call::abi_decode_returns(&bytes) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            let message = format!("failed to decode multicall result: {err}");
             results.extend(chunk.iter().map(|_| Err(message.clone())));
+            return results;
+        }
+    };
+
+    if decoded.len() != chunk.len() {
+        let message = format!(
+            "multicall returned {} results for {} calls",
+            decoded.len(),
+            chunk.len()
+        );
+        results.extend(chunk.iter().map(|_| Err(message.clone())));
+        return results;
+    }
+
+    for (request, result) in chunk.iter().zip(decoded.iter()) {
+        if !result.success {
+            let decoded_err = crate::errors::decode(&result.returnData);
+            results.push(Err(format!(
+                "{} quote reverted: {decoded_err}",
+                request.venue.label()
+            )));
             continue;
         }
-
-        for (request, result) in chunk.iter().zip(decoded.iter()) {
-            if !result.success {
-                let decoded_err = crate::errors::decode(&result.returnData);
-                results.push(Err(format!(
-                    "{} quote reverted: {decoded_err}",
-                    request.venue.label()
-                )));
-                continue;
-            }
-            match decode_quote_result(request.venue, &result.returnData) {
-                Ok(amount) if amount > U256::ZERO => results.push(Ok(amount)),
-                Ok(_) => results.push(Err(format!(
-                    "{} quote returned zero",
-                    request.venue.label()
-                ))),
-                Err(err) => results.push(Err(format!(
-                    "{} quote decode failed: {err}",
-                    request.venue.label()
-                ))),
-            }
+        match decode_quote_result(request.venue, &result.returnData) {
+            Ok(amount) if amount > U256::ZERO => results.push(Ok(amount)),
+            Ok(_) => results.push(Err(format!(
+                "{} quote returned zero",
+                request.venue.label()
+            ))),
+            Err(err) => results.push(Err(format!(
+                "{} quote decode failed: {err}",
+                request.venue.label()
+            ))),
         }
     }
     results
