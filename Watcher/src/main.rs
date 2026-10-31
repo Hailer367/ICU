@@ -721,6 +721,11 @@ struct WatchMetrics {
     simulations: usize,
     opportunities: usize,
     scan_millis: u128,
+    core_millis: u64,
+    gas_millis: u64,
+    probe_millis: u64,
+    refine_millis: u64,
+    simulate_millis: u64,
 }
 
 impl WatchMetrics {
@@ -731,23 +736,31 @@ impl WatchMetrics {
         self.quotes += report.quotes;
         self.simulations += report.simulations;
         self.opportunities += report.opportunities.len();
+        self.core_millis += report.core_ms;
+        self.gas_millis += report.gas_ms;
+        self.probe_millis += report.probe_ms;
+        self.refine_millis += report.refine_ms;
+        self.simulate_millis += report.simulate_ms;
     }
 
     fn summary(&self) -> String {
-        let avg = if self.scans == 0 {
-            0
-        } else {
-            self.scan_millis / self.scans as u128
-        };
+        let scans = self.scans.max(1) as u128;
+        let avg = |total: u128| (total / scans) as u64;
         format!(
-            "events={} scans={} failed={} routes={} quotes={} simulations={} opportunities={} avg_scan_ms={avg}",
+            "events={} scans={} failed={} routes={} quotes={} simulations={} opportunities={} avg_scan_ms={} avg_core_ms={} avg_gas_ms={} avg_probe_ms={} avg_refine_ms={} avg_simulate_ms={}",
             self.events,
             self.scans,
             self.failed_scans,
             self.routes,
             self.quotes,
             self.simulations,
-            self.opportunities
+            self.opportunities,
+            avg(self.scan_millis),
+            avg(self.core_millis as u128),
+            avg(self.gas_millis as u128),
+            avg(self.probe_millis as u128),
+            avg(self.refine_millis as u128),
+            avg(self.simulate_millis as u128),
         )
     }
 }
@@ -909,6 +922,10 @@ fn print_report(report: &ScanReport) {
         report.simulations,
         report.opportunities.len()
     );
+    println!(
+        "  ms: core {} gas {} probe {} refine {} simulate {}",
+        report.core_ms, report.gas_ms, report.probe_ms, report.refine_ms, report.simulate_ms
+    );
     for note in &report.notes {
         println!("  note: {note}");
     }
@@ -967,6 +984,13 @@ fn report_json(report: &ScanReport) -> serde_json::Value {
         "quotes": report.quotes,
         "simulations": report.simulations,
         "notes": report.notes,
+        "timingsMs": {
+            "core": report.core_ms,
+            "gas": report.gas_ms,
+            "probe": report.probe_ms,
+            "refine": report.refine_ms,
+            "simulate": report.simulate_ms,
+        },
         "opportunities": report.opportunities.iter().map(opportunity_json).collect::<Vec<_>>(),
     })
 }

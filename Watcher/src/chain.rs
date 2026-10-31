@@ -204,3 +204,68 @@ pub async fn erc20_symbol(provider: &ChainProvider, token: Address) -> Result<St
         .context("failed to decode symbol")?;
     Ok(result)
 }
+
+/// Run `(target, calldata)` pairs as one Multicall3 `aggregate3` with
+/// `allowFailure = true`, returning one entry per call in input order.
+///
+/// A whole-batch failure (transport, decode, short result) marks *every* entry
+/// as `Err` so callers can distinguish "no data" from "this one call reverted".
+/// Individual reverts are labelled with the decoded revert reason.
+pub async fn multicall_raw(
+    provider: &ChainProvider,
+    calls: &[(Address, Bytes)],
+    block: BlockId,
+) -> Vec<std::result::Result<Bytes, String>> {
+    use crate::abi::multicall3;
+    use alloy::sol_types::SolCall;
+
+    let all_failed = |reason: String| -> Vec<std::result::Result<Bytes, String>> {
+        calls.iter().map(|_| Err(reason.clone())).collect()
+    };
+
+    let aggregate = multicall3::aggregate3Call {
+        calls: calls
+            .iter()
+            .map(|(target, data)| multicall3::Call3 {
+                target: *target,
+                allowFailure: true,
+                callData: data.clone(),
+            })
+            .collect(),
+    };
+    let bytes = match eth_call(
+        provider,
+        crate::config::base::MULTICALL3,
+        aggregate.abi_encode().into(),
+        block,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => return all_failed(format!("multicall failed: {err}")),
+    };
+    let decoded = match multicall3::aggregate3Call::abi_decode_returns(&bytes) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            return all_failed(format!("failed to decode multicall result: {err}"));
+        }
+    };
+    if decoded.len() != calls.len() {
+        return all_failed(format!(
+            "multicall returned {} results for {} calls",
+            decoded.len(),
+            calls.len()
+        ));
+    }
+    decoded
+        .into_iter()
+        .zip(calls.iter())
+        .map(|(result, (target, _))| {
+            if result.success {
+                return Ok(result.returnData);
+            }
+            let decoded_err = errors::decode(&result.returnData);
+            Err(format!("call to {target} reverted: {decoded_err}"))
+        })
+        .collect()
+}

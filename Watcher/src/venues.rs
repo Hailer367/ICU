@@ -3,6 +3,7 @@ use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::SolCall;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use tracing::warn;
 
 use crate::abi::{aerodrome_router, multicall3, slipstream_quoter, univ2_router, univ3_quoter};
 use crate::chain::{self, ChainProvider};
@@ -157,15 +158,20 @@ impl QuoteRequest {
 /// Uses Multicall3 `aggregate3` with `allowFailure = true`, so one bad pool
 /// does not discard the rest of the batch. Results are returned in input order.
 ///
-/// Chunks are executed concurrently. A 2-hop probe round has up to 132 calls,
-/// and serialising four RPC round-trips was a measurable part of scan latency.
+/// Chunks are executed concurrently. Merged probe/refine rounds can carry
+/// hundreds of independent legs (routes x amounts, deduped), so the old
+/// serialisation of even four RPC round-trips was a measurable part of scan
+/// latency.
 pub async fn quote_batch(
     provider: &ChainProvider,
     requests: &[QuoteRequest],
     block: BlockId,
 ) -> Vec<std::result::Result<U256, String>> {
     const CHUNK: usize = 80;
-    const CONCURRENCY: usize = 3;
+    // Merged probe/refine batches are ~3-5x larger than the old per-amount
+    // rounds, so one more in-flight chunk helps; raise further only if the
+    // target RPC tolerates it (watch for the whole-chunk warning below).
+    const CONCURRENCY: usize = 4;
 
     let chunks: Vec<&[QuoteRequest]> = requests.chunks(CHUNK).collect();
     let mut by_chunk: Vec<(usize, Vec<std::result::Result<U256, String>>)> =
@@ -205,6 +211,9 @@ async fn quote_chunk(
         match chain::eth_call(provider, base::MULTICALL3, call.abi_encode().into(), block).await {
             Ok(bytes) => bytes,
             Err(err) => {
+                // A whole chunk lost to transport/limit failure must not look
+                // like "no opportunity": every quote in it reports failure.
+                warn!(error = %err, requests = chunk.len(), "multicall chunk failed");
                 let message = format!("multicall failed: {err}");
                 results.extend(chunk.iter().map(|_| Err(message.clone())));
                 return results;

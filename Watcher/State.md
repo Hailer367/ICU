@@ -1,7 +1,6 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-10-30 (completion pass, historical dataset, swap-size
-filter, and live Alchemy test; see §0d–§0g)
+Last updated: 2026-10-31 (scan-path speed overhaul; see §0h)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -372,6 +371,81 @@ Anvil reports a synthetic ~1 gwei gas price, so the default 0.05 gwei watcher
 ceiling blocks every scan on a fork; use `--max-gas-price-gwei 2` for local
 runs. Real Base gas is ~0.005 gwei, which passes the default.
 
+### 0h. Scan-path speed overhaul (2026-10-31)
+
+This session made the event-triggered scan path faster without touching any
+correctness gate (profit/gas/dust gates, two-phase dedupe, watch single-flight,
+`--pending`, and the economics are unchanged). The trigger never polls; each
+step only removes sequential RPC round-trips from the work the trigger already
+requires. Machine: Rust 1.99.1, Foundry 1.8.x installed locally this session.
+
+Changes, in order:
+
+- **Per-phase timing (new).** `ScanReport` carries `core_ms`, `gas_ms`,
+  `probe_ms`, `refine_ms`, `simulate_ms`; `watch` logs running averages
+  (`avg_core_ms` … `avg_simulate_ms`) alongside `avg_scan_ms`, and `--json`
+  emits a `timingsMs` object. Closes the §6G "per-stage latency metrics" item.
+  Note: with the per-asset parallelism below, `probe/refine/simulate_ms` are
+  per-asset wall time and the two assets overlap, so they can exceed the scan
+  wall time; `avg_scan_ms` is the honest end-to-end number.
+- **Multi-amount quote batching (biggest win).** `quote_routes_at_amounts`
+  became `quote_jobs(routes, jobs)`, where `jobs` is a list of
+  `(route_index, amount_in)`. The probe now quotes every route at every amount
+  in **one** leg-walking pass (one multicall per leg across all amounts), and
+  refine flattens all factor rounds the same way. Previously the three probe
+  amounts and five refine factors each issued their own sequential batch.
+  Identical `(target, calldata)` pairs across amounts collapse to one call.
+  `update_best_from_jobs` is the ranking fold; iterating the flattened job list
+  reproduces the old per-amount / per-factor result exactly (verified by tests).
+- **Batched core-state read.** `load_core_state` reads `paused`, `maxGasPrice`,
+  and every asset cap in **one** Multicall3 `aggregate3` instead of `2 + N`
+  serial `eth_call`s. `paused`/`maxGasPrice` fail closed (bail the scan if
+  unreadable); caps stay fail-open (a failed cap reads as zero, disabling that
+  asset) — same semantics as before, and all reads now pin a single block.
+- **Batched USD feeds.** New `gas::feed_prices` reads every configured asset's
+  Chainlink `latestRoundData` in one multicall, with per-feed staleness and
+  non-positive bails preserved. The scanner caches each feed's immutable
+  `decimals()` once (new `chain::multicall_raw` + `Scanner::feed_decimals`)
+  instead of re-reading it per scan, and reuses the ETH/USD price already
+  fetched for gas for WETH.
+- **Gas snapshot 7 → concurrent.** `gas::snapshot` now runs the latest block,
+  `eth_gasPrice`, `eth_maxPriorityFeePerGas`, and the three GasPriceOracle reads
+  (as one multicall) concurrently via `tokio::join!` instead of seven sequential
+  awaits. `eth_gasPrice` is kept as its own RPC — it is **not** derived as
+  base+priority, so the gas ceiling gate and `trade_cost` are unchanged.
+- **Parallel asset scans.** USDC and WETH are scanned concurrently
+  (`buffered(assets.len().min(4))` — ordered, so report note order is
+  deterministic) after the shared gas/core context is resolved.
+- **Batch plumbing.** `quote_batch` concurrency 3 → 4 chunks (probe rounds are
+  now larger). A whole multicall chunk lost to transport/rate-limit is logged at
+  `warn`, so a dropped chunk can no longer look like "no opportunity".
+
+Verification (local Anvil Base fork, core+adapters deployed via
+`script/Deploy.s.sol`, manifest `deployments/8453.anvil.json`):
+
+- `cargo test`: **54 lib tests + 1 WebSocket integration test pass** (was 44;
+  added: timings, `update_best_from_jobs` absolute-profit/no-cross-contamination/
+  skip semantics, merged-vs-sequential quote-count equality, feed map/decode/
+  decimals tests). Clippy clean, fmt clean.
+- `tests/fork_opportunity.rs` with `RYO_FORK_EXECUTE=1` passes unchanged after
+  every step: `routes=44 quotes=412 simulations=6 opportunities=4`, and the
+  executed payout equals the simulated profit exactly (6014960213482186 WETH
+  wei). This is the end-to-end proof that merging amounts did not corrupt
+  per-(route, amount) integrity.
+- Warm full-scan latency, local fork (network latency ≈ 0): **~0.90 s → ~0.54 s**
+  (`core 1 ms, gas 3–6 ms, probe ~510–545 ms` overlapping across the two assets,
+  refine 0, simulate 0). On a cold fork the run is still dominated by Anvil's
+  upstream state fetch (~90 s), unchanged. On live high-latency RPC the ~20
+  sequential round-trips removed per scan (probe/refine batching, single
+  core-state call, batched feeds/decimals, concurrent gas) save far more than
+  the local fork shows, because there each round-trip costs milliseconds instead
+  of sub-millisecond loopback.
+
+Not done (deferred, unchanged from §0d–§0g): mainnet manifest
+(`deployments/8453.json`), transaction sending (still logs only; `--mode live`
+warns), live pending `eth_call` against Alchemy HTTP, watch-loop pipelining
+(deliberately not added — single-flight with the bounded queue is intended).
+
 ---
 
 ## 1. Goal and hard constraints
@@ -516,6 +590,10 @@ Important Alloy mapping details:
 - `eth_call_u256/u8/bool`, `erc20_balance/decimals/symbol`,
   `block_number`, `chain_id`, `gas_price`, `code_at`, `balance_of`,
   `estimate_gas`.
+- `multicall_raw(provider, calls, block)` (§0h): one `aggregate3` over
+  heterogeneous `(target, calldata)` reads, returning raw bytes per call with
+  whole-batch vs per-call failure distinguished. Used by the batched core-state
+  read, feed reads, and gas-snapshot oracle reads.
 
 ### `src/events.rs`
 
@@ -557,10 +635,14 @@ against the live endpoint was not exercised (the mock test covers it).
 
 ### `src/gas.rs`
 
-- `snapshot(provider, tx_size)`: block number, block timestamp, base fee,
-  priority fee, gas price, L1 base/blob fee, `getL1FeeUpperBound`.
+- `snapshot(provider, tx_size)`: block number/timestamp/base fee (one latest
+  block), `eth_gasPrice`, `eth_maxPriorityFeePerGas`, and the three L1 oracle
+  reads (as one multicall) — fetched concurrently via `tokio::join!` (§0h).
 - `chainlink_price(provider, feed, max_age_secs, now_secs)`;
   `latest_timestamp(provider)`; `is_stale(updated_at, now, max_age)`.
+- §0h: `usd_feed_for_asset(asset) -> Option<(feed, max_age)>`,
+  `feed_price_from_round(...)` (pure decode + staleness/sign bails), and
+  `feed_prices(provider, requests, now, decimals)` (batched `latestRoundData`).
 - Staleness is measured against the latest **block timestamp**, not the local
   clock, so a historical fork judges feeds as of its fork point.
 - `asset_usd_price(provider, asset, now_secs)`: USDC/EURC 24h staleness,
@@ -587,7 +669,7 @@ against the live endpoint was not exercised (the mock test covers it).
 - `encode_quote_call` / `decode_quote_result`.
 - `quote_step` / `quote_route`.
 - `QuoteRequest` + `quote_batch` using Multicall3 `aggregate3`
-  (`allowFailure = true`, chunks of 80, up to three chunks concurrently).
+  (`allowFailure = true`, chunks of 80, up to four chunks concurrently; §0h).
 - UniV2/Aerodrome return `uint256[]`; UniV3/Slipstream return a tuple.
 
 ### `src/simulate.rs`
@@ -626,12 +708,21 @@ against the live endpoint was not exercised (the mock test covers it).
   quoting; non-swap logs are not size-filtered.
 - Every `newHeads` tick advances the last-seen block marker; only a forward
   jump or a backwards head forces a full rescan.
-- Reads core `paused`, `maxGasPrice`, `maxTradeSize(asset)`.
+- Reads core `paused`, `maxGasPrice`, `maxTradeSize(asset)` — all in **one**
+  Multicall3 batch (§0h); `paused`/`maxGasPrice` unreadable fail closed, a
+  failed cap decodes to zero (that asset disabled).
 - Resolves caps as `min(manifest cap, core cap)`, skips zero caps.
 - Event filter: only routes containing affected pool indices.
 - If a flashblock has no known pool logs, it skips instead of scanning all.
-- Probe: all candidate routes at `probe_amounts_usd` (CLI `--probe-usd`,
-  default `[500, 2000, 8000]`), batched two legs at a time.
+- Asset USD prices are fetched once per scan via `gas::feed_prices` (§0h),
+  reusing the ETH/USD price already read for gas; feed `decimals()` are cached
+  per scanner.
+- Assets are scanned concurrently after the shared context (`buffered` in
+  `assets` order, so note order stays deterministic; §0h).
+- Probe: every candidate route at every `probe_amounts_usd` (CLI `--probe-usd`,
+  default `[500, 2000, 8000]`) quoted in **one** leg-walking batch, then refine
+  on factors flattened the same way (§0h; was one sequential batch per amount /
+  per factor).
 - Ranking uses **absolute profit** (`output - amount` in asset units), not
   output/input ratio. Ratio favoured 1 wei trades and pushed the most
   profitable size out of the simulator's top list.
@@ -649,7 +740,9 @@ against the live endpoint was not exercised (the mock test covers it).
   - positive simulated profit
   - `net_usd >= min_net_profit_usd`
 - `ScanReport` includes block, affected pools, routes/quotes/simulations,
-  notes, and opportunities.
+  notes, and opportunities, plus §0h per-phase milliseconds (`core_ms`,
+  `gas_ms`, `probe_ms`, `refine_ms`, `simulate_ms`); `watch --json` emits them
+  under `timingsMs` and the metrics line logs running averages.
 
 ### `src/main.rs` (CLI)
 
@@ -704,10 +797,11 @@ cd Watcher
 cargo test
 ```
 
-Result: **44 lib tests + 1 WebSocket integration test passed, 0 failed**
-(2026-10-30; 27 before the completion pass, 31 after it, 36 after the history
+Result: **54 lib tests + 1 WebSocket integration test passed, 0 failed**
+(2026-10-31 §0h; 27 before the completion pass, 31 after it, 36 after the history
 module, 37 after the replay staleness fix, 39 after the swap-size filter,
-44 after adding notional decoding tests). `cargo clippy --all-targets` is
+44 after adding notional decoding tests, 54 after the speed-overhaul batch
+integrity/decoding tests). `cargo clippy --all-targets` is
 clean after fixes.
 `tests/events_ws.rs` uses an in-process mock server and needs no network.
 `tests/fork_opportunity.rs` is `#[ignore]`d and needs a local Anvil fork; it is
@@ -729,6 +823,10 @@ Coverage of unit tests:
 - Chainlink staleness against chain time (historical fork replay)
 - swap-size filter floor, USDC-leg notional decoding (V3 and Solidly), and
   non-swap event rejection
+- (§0h) merged quote batching: `update_best_from_jobs` absolute-profit ranking,
+  per-(route, amount) no-cross-contamination, zero/failed-job skips, merged vs
+  sequential quote-count equality; Chainlink feed mapping, round decoding,
+  staleness/sign bails, and decimal scaling
 
 ### Live Base HTTP checks
 
@@ -960,17 +1058,23 @@ Current code only logs. To send transactions later:
 Done: route enumeration cache, gas/ETH cache, quote dedupe + concurrent chunks,
 two-phase duplicate-trigger suppression, bounded event queue, metrics line,
 debug-level quote failures, head-gap/reorg full rescan, gas gate before
-quoting.
+quoting, and (§0h) multi-amount quote batching, single-call core-state read,
+batched Chainlink feeds with cached decimals, concurrent gas snapshot, and
+parallel per-asset scans.
 
 Still open:
 
 - Token decimals/symbols need no cache: the registry holds them as constants
   and the scanner never reads them on-chain.
-- Caps are deliberately not cached because the owner can change them.
-- `eth_call` batching for core state reads is an optional latency
-  optimization (2 assets = a handful of calls per trigger).
-- Per-stage latency metrics (quote / simulate / gas) are not instrumented;
-  only total scan time and counters exist.
+- Caps are deliberately not cached because the owner can change them (§0h
+  batches the reads into the single core-state multicall; it does not cache
+  them, so the owner can still change them live).
+- Per-stage latency metrics are now instrumented (§0h: `probe/refine/simulate/
+  core/gas_ms` in `ScanReport` and `watch` averages). Only total-scan and
+  per-asset overlap remain a reading caveat, not a gap.
+- Watch-loop pipelining (process the next trigger while a scan runs) is still
+  intentionally not done: single-flight + the bounded queue is the designed
+  behaviour. A short-window trigger coalesce is a possible future option.
 
 ---
 

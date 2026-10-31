@@ -65,6 +65,21 @@ impl Opportunity {
     }
 }
 
+/// Everything one asset scan produced. Assets are scanned concurrently and
+/// merged into a `ScanReport` in `assets` order, so notes and counters stay
+/// deterministic.
+#[derive(Debug, Clone, Default)]
+struct AssetReport {
+    notes: Vec<String>,
+    routes_considered: usize,
+    quotes: usize,
+    simulations: usize,
+    opportunities: Vec<Opportunity>,
+    probe_ms: u64,
+    refine_ms: u64,
+    simulate_ms: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScanReport {
     pub block: u64,
@@ -74,6 +89,13 @@ pub struct ScanReport {
     pub simulations: usize,
     pub opportunities: Vec<Opportunity>,
     pub notes: Vec<String>,
+    /// Per-phase wall time in milliseconds, summed across assets. `core_ms`
+    /// covers the head block number plus the core state reads.
+    pub core_ms: u64,
+    pub gas_ms: u64,
+    pub probe_ms: u64,
+    pub refine_ms: u64,
+    pub simulate_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +185,9 @@ pub struct Scanner {
     /// Cycles are static for a given registry and hop limit, so enumerate once.
     routes: HashMap<Address, Vec<Route>>,
     gas_cache: Mutex<Option<CachedGas>>,
+    /// Chainlink feed decimals are immutable, so each feed is read once and
+    /// remembered for the life of the scanner.
+    feed_decimals: Mutex<HashMap<Address, u8>>,
     deduper: Mutex<Deduper>,
     /// Highest block observed by an evaluate call, used to notice skipped
     /// heads (reorg or a dropped WebSocket message) and force one full rescan.
@@ -216,6 +241,7 @@ impl Scanner {
             assets,
             routes,
             gas_cache: Mutex::new(None),
+            feed_decimals: Mutex::new(HashMap::new()),
             deduper: Mutex::new(Deduper::default()),
             last_block: Mutex::new(None),
         })
@@ -245,6 +271,105 @@ impl Scanner {
             });
         }
         Ok((snapshot, eth_usd))
+    }
+
+    /// Read and cache the decimals for every configured asset's USD feed.
+    /// These are immutable, so one batched read per scanner replaces a
+    /// per-scan round-trip inside the price fetch.
+    async fn ensure_feed_decimals(&self, feeds: &[Address]) {
+        use crate::abi::chainlink;
+        use alloy::sol_types::SolCall;
+
+        let missing: Vec<Address> = {
+            let cache = self
+                .feed_decimals
+                .lock()
+                .expect("feed decimals mutex poisoned");
+            feeds
+                .iter()
+                .filter(|feed| !cache.contains_key(*feed))
+                .copied()
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+        let calls: Vec<(Address, alloy::primitives::Bytes)> = missing
+            .iter()
+            .map(|feed| (*feed, chainlink::decimalsCall {}.abi_encode().into()))
+            .collect();
+        let results = chain::multicall_raw(&self.provider, &calls, BlockId::latest()).await;
+        let mut cache = self
+            .feed_decimals
+            .lock()
+            .expect("feed decimals mutex poisoned");
+        for (feed, result) in missing.iter().zip(results) {
+            match result {
+                Ok(data) => match chainlink::decimalsCall::abi_decode_returns(&data) {
+                    Ok(decimals) => {
+                        cache.insert(*feed, decimals);
+                    }
+                    Err(err) => {
+                        warn!(feed = %feed, error = %err, "failed to decode feed decimals");
+                    }
+                },
+                Err(err) => {
+                    warn!(feed = %feed, error = %err, "failed to read feed decimals");
+                }
+            }
+        }
+    }
+
+    /// Resolve USD prices for all assets in one batched feed read, keyed by
+    /// asset. Assets without a usable feed are simply absent; the scan path
+    /// treats a missing price as "no usable USD feed", matching the old
+    /// per-asset bail semantics.
+    async fn asset_usd_prices(
+        &self,
+        eth_usd: f64,
+        snapshot: &GasSnapshot,
+    ) -> HashMap<Address, f64> {
+        let mut prices = HashMap::new();
+        let mut requests: Vec<(Address, u64)> = Vec::new();
+        for asset in &self.assets {
+            if let Some((feed, max_age)) = gas::usd_feed_for_asset(*asset) {
+                // Reuse the ETH/USD price the gas snapshot already fetched.
+                if feed == base::ETH_USD_FEED {
+                    if eth_usd > 0.0 {
+                        prices.insert(*asset, eth_usd);
+                    }
+                    continue;
+                }
+                if !requests.iter().any(|(existing, _)| *existing == feed) {
+                    requests.push((feed, max_age));
+                }
+            }
+        }
+        if requests.is_empty() {
+            return prices;
+        }
+        let feeds: Vec<Address> = requests.iter().map(|(feed, _)| *feed).collect();
+        self.ensure_feed_decimals(&feeds).await;
+        let decimals = self
+            .feed_decimals
+            .lock()
+            .expect("feed decimals mutex poisoned")
+            .clone();
+        let resolved =
+            gas::feed_prices(&self.provider, &requests, snapshot.timestamp, &decimals).await;
+        for (feed, result) in resolved {
+            if let Ok(price) = result
+                && price > 0.0
+            {
+                // Map every asset that uses this feed to the price.
+                for asset in &self.assets {
+                    if gas::usd_feed_for_asset(*asset).map(|(f, _)| f) == Some(feed) {
+                        prices.insert(*asset, price);
+                    }
+                }
+            }
+        }
+        prices
     }
 
     pub fn manifest(&self) -> &Manifest {
@@ -319,7 +444,7 @@ impl Scanner {
         }
 
         let quotes = self
-            .quote_routes_at_amounts(std::slice::from_ref(route), &[amount], block_id)
+            .quote_jobs(std::slice::from_ref(route), &[(0usize, amount)], block_id)
             .await;
         let Some(Some(quotes)) = quotes.into_iter().next() else {
             bail!("could not quote route");
@@ -449,23 +574,28 @@ impl Scanner {
         block: ScanBlock,
     ) -> Result<ScanReport> {
         let block_id = block.id();
+        let head_started = Instant::now();
         let block_number = chain::block_number(&self.provider).await?;
         {
             let mut last = self.last_block.lock().expect("last block mutex poisoned");
             *last = Some(block_number);
         }
-        let mut report = ScanReport {
-            block: block_number,
-            ..Default::default()
-        };
 
         let core = self.load_core_state().await?;
+        let mut report = ScanReport {
+            block: block_number,
+            core_ms: elapsed_millis(head_started),
+            ..Default::default()
+        };
         if core.paused {
             report.notes.push("core is paused".to_string());
             return Ok(report);
         }
 
+        let gas_started = Instant::now();
         let (gas_snapshot, eth_usd) = self.gas_context().await?;
+        let asset_prices = self.asset_usd_prices(eth_usd, &gas_snapshot).await;
+        report.gas_ms += elapsed_millis(gas_started);
         if eth_usd <= 0.0 {
             report
                 .notes
@@ -486,21 +616,48 @@ impl Scanner {
             }
         }
 
-        for asset in &self.assets {
-            match self
-                .scan_asset(
-                    *asset,
-                    &core,
-                    &gas_snapshot,
-                    eth_usd,
-                    &affected_set,
-                    block,
-                    block_id,
-                    &mut report,
-                )
-                .await
-            {
-                Ok(()) => {}
+        // Assets are independent after the shared context is resolved, so
+        // scan them concurrently. `buffered` (not `buffer_unordered`) keeps
+        // completion order equal to `self.assets` order, so note ordering in
+        // reports stays deterministic. The context is shared by reference;
+        // each future copies the `&` (which is `Copy`) rather than moving the
+        // owned value once and reusing it across assets.
+        let core_ref = &core;
+        let gas_ref = &gas_snapshot;
+        let prices_ref = &asset_prices;
+        let affected_ref = &affected_set;
+        let asset_reports =
+            stream::iter(self.assets.iter().copied().map(move |asset| async move {
+                let result = self
+                    .scan_asset(
+                        asset,
+                        core_ref,
+                        gas_ref,
+                        eth_usd,
+                        prices_ref,
+                        affected_ref,
+                        block,
+                        block_id,
+                    )
+                    .await;
+                (asset, result)
+            }))
+            .buffered(self.assets.len().min(4))
+            .collect::<Vec<_>>()
+            .await;
+
+        for (asset, result) in asset_reports {
+            match result {
+                Ok(asset_report) => {
+                    report.notes.extend(asset_report.notes);
+                    report.routes_considered += asset_report.routes_considered;
+                    report.quotes += asset_report.quotes;
+                    report.simulations += asset_report.simulations;
+                    report.probe_ms += asset_report.probe_ms;
+                    report.refine_ms += asset_report.refine_ms;
+                    report.simulate_ms += asset_report.simulate_ms;
+                    report.opportunities.extend(asset_report.opportunities);
+                }
                 Err(err) => {
                     warn!(asset = %asset, error = %err, "asset scan failed");
                     report
@@ -518,37 +675,50 @@ impl Scanner {
         Ok(report)
     }
 
+    /// Read `paused`, `maxGasPrice`, and every asset cap in one Multicall3
+    /// round-trip.
+    ///
+    /// The old code issued `2 + N` serial `eth_call`s. `paused` and
+    /// `maxGasPrice` gate the whole scan, so if either cannot be read the scan
+    /// bails rather than trading blind. Caps are fail-open exactly as before:
+    /// a cap that reverts or is missing decodes to zero, which disables that
+    /// asset. All reads share one block, so the state is consistent.
     async fn load_core_state(&self) -> Result<CoreState> {
         use alloy::sol_types::SolCall;
 
         let core = self.manifest.core;
-        let paused = chain::eth_call_bool(
-            &self.provider,
-            core,
-            ryo::pausedCall {}.abi_encode().into(),
-            BlockId::latest(),
-        )
-        .await
-        .context("failed to read core.paused")?;
-        let max_gas_price = chain::eth_call_u256(
-            &self.provider,
-            core,
-            ryo::maxGasPriceCall {}.abi_encode().into(),
-            BlockId::latest(),
-        )
-        .await
-        .context("failed to read core.maxGasPrice")?;
-
-        let mut caps = HashMap::new();
+        let mut calls: Vec<(Address, alloy::primitives::Bytes)> =
+            Vec::with_capacity(2 + self.assets.len());
+        calls.push((core, ryo::pausedCall {}.abi_encode().into()));
+        calls.push((core, ryo::maxGasPriceCall {}.abi_encode().into()));
         for asset in &self.assets {
-            let cap = chain::eth_call_u256(
-                &self.provider,
+            calls.push((
                 core,
                 ryo::maxTradeSizeCall { asset: *asset }.abi_encode().into(),
-                BlockId::latest(),
-            )
-            .await
-            .unwrap_or(U256::ZERO);
+            ));
+        }
+        let results = chain::multicall_raw(&self.provider, &calls, BlockId::latest()).await;
+
+        let paused = match results.first() {
+            Some(Ok(data)) => {
+                ryo::pausedCall::abi_decode_returns(data).context("failed to decode core.paused")?
+            }
+            Some(Err(reason)) => bail!("failed to read core.paused: {reason}"),
+            None => bail!("core.paused result missing"),
+        };
+        let max_gas_price = match results.get(1) {
+            Some(Ok(data)) => ryo::maxGasPriceCall::abi_decode_returns(data)
+                .context("failed to decode core.maxGasPrice")?,
+            Some(Err(reason)) => bail!("failed to read core.maxGasPrice: {reason}"),
+            None => bail!("core.maxGasPrice result missing"),
+        };
+
+        let mut caps = HashMap::new();
+        for (asset, result) in self.assets.iter().zip(results.iter().skip(2)) {
+            let cap = match result {
+                Ok(data) => ryo::maxTradeSizeCall::abi_decode_returns(data).unwrap_or(U256::ZERO),
+                Err(_) => U256::ZERO,
+            };
             caps.insert(*asset, cap);
         }
 
@@ -566,11 +736,12 @@ impl Scanner {
         core: &CoreState,
         gas_snapshot: &GasSnapshot,
         eth_usd: f64,
+        asset_prices: &HashMap<Address, f64>,
         affected: &Option<HashSet<usize>>,
         block: ScanBlock,
         block_id: BlockId,
-        report: &mut ScanReport,
-    ) -> Result<()> {
+    ) -> Result<AssetReport> {
+        let mut report = AssetReport::default();
         let symbol = self
             .manifest
             .token_symbol(asset)
@@ -594,7 +765,7 @@ impl Scanner {
                 report
                     .notes
                     .push(format!("{symbol} cap is zero; asset is not tradable"));
-                return Ok(());
+                return Ok(report);
             }
             (true, false) => core_cap,
             (false, true) => manifest_cap,
@@ -607,17 +778,16 @@ impl Scanner {
             gas_ceiling_note(&self.settings, core.max_gas_price, gas_snapshot.gas_price)
         {
             report.notes.push(note);
-            return Ok(());
+            return Ok(report);
         }
 
-        let price = match gas::asset_usd_price(&self.provider, asset, gas_snapshot.timestamp).await
-        {
-            Ok(price) if price > 0.0 => price,
+        let price = match asset_prices.get(&asset).copied() {
+            Some(price) if price > 0.0 => price,
             _ => {
                 report
                     .notes
                     .push(format!("{symbol} has no usable USD feed"));
-                return Ok(());
+                return Ok(report);
             }
         };
 
@@ -635,7 +805,7 @@ impl Scanner {
         }
         report.routes_considered += all_routes.len();
         if all_routes.is_empty() {
-            return Ok(());
+            return Ok(report);
         }
 
         // Coarse probe: quote every candidate at a few dollar amounts.
@@ -651,18 +821,28 @@ impl Scanner {
             report
                 .notes
                 .push(format!("{symbol} probe amount is zero after cap"));
-            return Ok(());
+            return Ok(report);
         }
 
         let mut best: HashMap<usize, (U256, Vec<U256>, U256)> = HashMap::new();
+        let probe_started = Instant::now();
+        // Probe every route at every amount in one leg-walking pass. The
+        // amounts are independent, so the old per-amount batches were pure
+        // latency: three sequential round-trip rounds became one.
+        let mut jobs = Vec::with_capacity(all_routes.len() * probe_amounts.len());
+        let mut best_keys = Vec::with_capacity(all_routes.len() * probe_amounts.len());
+        let mut amounts = Vec::with_capacity(all_routes.len() * probe_amounts.len());
         for amount in &probe_amounts {
-            let amounts = vec![*amount; all_routes.len()];
-            let quotes = self
-                .quote_routes_at_amounts(&all_routes, &amounts, block_id)
-                .await;
-            report.quotes += count_quotes(&quotes);
-            update_best(&mut best, &amounts, quotes);
+            for index in 0..all_routes.len() {
+                jobs.push((index, *amount));
+                best_keys.push(index);
+                amounts.push(*amount);
+            }
         }
+        let results = self.quote_jobs(&all_routes, &jobs, block_id).await;
+        report.quotes += count_quotes(&results);
+        update_best_from_jobs(&mut best, &best_keys, &amounts, &results);
+        report.probe_ms += elapsed_millis(probe_started);
 
         // Refine the best routes on a local amount grid. Rank by absolute
         // profit, not by output/input ratio: ratio favours tiny trades and
@@ -675,7 +855,7 @@ impl Scanner {
         ranked.truncate(self.settings.max_candidates.max(1));
         if ranked.is_empty() {
             debug!(asset = %symbol, "no route quoted above break-even");
-            return Ok(());
+            return Ok(report);
         }
 
         let refined_routes: Vec<Route> = ranked
@@ -686,31 +866,35 @@ impl Scanner {
 
         let mut factors = vec![0.5, 0.75, 1.0, 1.5, 2.0];
         factors.truncate(self.settings.amount_grid_points.max(1));
+        let refine_started = Instant::now();
+        // Build one flattened job list across all factor rounds. A factor
+        // whose grid point scales any candidate to zero is skipped *whole*,
+        // exactly as the old per-factor loop did.
+        let mut refine_jobs: Vec<(usize, U256)> = Vec::new();
+        let mut refine_keys: Vec<usize> = Vec::new();
+        let mut refine_amounts: Vec<U256> = Vec::new();
         for factor in factors {
-            let amounts: Vec<U256> = base_amounts
+            let factor_amounts: Vec<U256> = base_amounts
                 .iter()
                 .map(|amount| scale_amount(*amount, factor).min(cap))
                 .collect();
-            if amounts.iter().any(|amount| amount.is_zero()) {
+            if factor_amounts.iter().any(|amount| amount.is_zero()) {
                 continue;
             }
-            let quotes = self
-                .quote_routes_at_amounts(&refined_routes, &amounts, block_id)
-                .await;
-            report.quotes += count_quotes(&quotes);
-            let mut local_best = HashMap::new();
-            update_best(&mut local_best, &amounts, quotes);
-            for (local_index, (amount, quotes, profit)) in local_best {
-                let route_index = ranked[local_index].0;
-                let replace = best
-                    .get(&route_index)
-                    .map(|(_, _, old_profit)| profit > *old_profit)
-                    .unwrap_or(true);
-                if replace {
-                    best.insert(route_index, (amount, quotes, profit));
-                }
+            for (local_index, amount) in factor_amounts.into_iter().enumerate() {
+                refine_jobs.push((local_index, amount));
+                refine_keys.push(ranked[local_index].0);
+                refine_amounts.push(amount);
             }
         }
+        if !refine_jobs.is_empty() {
+            let quotes = self
+                .quote_jobs(&refined_routes, &refine_jobs, block_id)
+                .await;
+            report.quotes += count_quotes(&quotes);
+            update_best_from_jobs(&mut best, &refine_keys, &refine_amounts, &quotes);
+        }
+        report.refine_ms += elapsed_millis(refine_started);
 
         // Simulate the most promising routes. Quote profitability is only a
         // ranking signal; `simulate` is the source of truth.
@@ -759,7 +943,9 @@ impl Scanner {
             }
         }));
 
+        let simulate_started = Instant::now();
         let results: Vec<Option<Opportunity>> = futures.buffer_unordered(4).collect().await;
+        report.simulate_ms += elapsed_millis(simulate_started);
         report.simulations += results.len();
         for opportunity in results.into_iter().flatten() {
             info!(
@@ -772,20 +958,31 @@ impl Scanner {
             );
             report.opportunities.push(opportunity);
         }
-        Ok(())
+        Ok(report)
     }
 
-    async fn quote_routes_at_amounts(
+    /// Quote many independent (route, starting amount) jobs in a single
+    /// leg-walking pass.
+    ///
+    /// Each job is `(route_index, amount_in)` where `route_index` addresses
+    /// `routes`. Legs are walked one multicall round at a time across *all*
+    /// jobs simultaneously: previously one round was issued per probe amount
+    /// and per refine factor, serialising three-to-five independent batches.
+    /// Identical `(target, calldata)` pairs collapse to one on-chain call.
+    ///
+    /// Returns one entry per job, parallel to `jobs`: `Some([in, out_leg1, ...])`
+    /// on a fully quoted route, `None` if any leg failed or the route did not
+    /// complete every step.
+    async fn quote_jobs(
         &self,
         routes: &[Route],
-        amounts: &[U256],
+        jobs: &[(usize, U256)],
         block: BlockId,
     ) -> Vec<Option<Vec<U256>>> {
-        assert_eq!(routes.len(), amounts.len());
-        let mut quotes: Vec<Option<Vec<U256>>> = routes
+        let mut quotes: Vec<Option<Vec<U256>>> = jobs
             .iter()
-            .zip(amounts.iter())
-            .map(|(route, amount)| {
+            .map(|(route_index, amount)| {
+                let route = &routes[*route_index];
                 if amount.is_zero() || route.steps.is_empty() {
                     None
                 } else {
@@ -794,24 +991,24 @@ impl Scanner {
             })
             .collect();
 
-        let max_legs = routes
+        let max_legs = jobs
             .iter()
-            .map(|route| route.steps.len())
+            .map(|(route_index, _)| routes[*route_index].steps.len())
             .max()
             .unwrap_or(0);
         for leg in 0..max_legs {
             let mut requests: Vec<QuoteRequest> = Vec::new();
             let mut unique: HashMap<(Address, Bytes), usize> = HashMap::new();
-            let mut request_for_route: Vec<Option<usize>> = vec![None; routes.len()];
-            let mut route_indices = Vec::new();
-            for (index, route) in routes.iter().enumerate() {
-                let Some(Some(current)) = quotes.get(index) else {
+            let mut request_for_job: Vec<Option<usize>> = vec![None; jobs.len()];
+            let mut job_indices = Vec::new();
+            for (job_index, (route_index, _)) in jobs.iter().enumerate() {
+                let Some(Some(current)) = quotes.get(job_index) else {
                     continue;
                 };
                 let Some(input) = current.last().copied() else {
                     continue;
                 };
-                let Some(step) = route.steps.get(leg) else {
+                let Some(step) = routes[*route_index].steps.get(leg) else {
                     continue;
                 };
                 match QuoteRequest::new(&self.manifest, step, input) {
@@ -825,12 +1022,12 @@ impl Scanner {
                             unique.insert(key, new_index);
                             new_index
                         };
-                        request_for_route[index] = Some(request_index);
-                        route_indices.push(index);
+                        request_for_job[job_index] = Some(request_index);
+                        job_indices.push(job_index);
                     }
                     Err(err) => {
                         debug!(error = %err, "failed to encode quote request");
-                        quotes[index] = None;
+                        quotes[job_index] = None;
                     }
                 }
             }
@@ -838,23 +1035,23 @@ impl Scanner {
                 break;
             }
             let results = venues::quote_batch(&self.provider, &requests, block).await;
-            for route_index in route_indices {
-                let Some(request_index) = request_for_route[route_index] else {
+            for job_index in job_indices {
+                let Some(request_index) = request_for_job[job_index] else {
                     continue;
                 };
                 let Some(result) = results.get(request_index) else {
-                    quotes[route_index] = None;
+                    quotes[job_index] = None;
                     continue;
                 };
                 match result {
                     Ok(amount_out) => {
-                        if let Some(Some(current)) = quotes.get_mut(route_index) {
+                        if let Some(Some(current)) = quotes.get_mut(job_index) {
                             current.push(*amount_out);
                         }
                     }
                     Err(err) => {
                         debug!(error = %err, "quote failed");
-                        quotes[route_index] = None;
+                        quotes[job_index] = None;
                     }
                 }
             }
@@ -862,8 +1059,11 @@ impl Scanner {
 
         quotes
             .into_iter()
-            .zip(routes.iter())
-            .map(|(quote, route)| quote.filter(|values| values.len() == route.steps.len() + 1))
+            .zip(jobs.iter())
+            .map(|(quote, (route_index, _))| {
+                let route = &routes[*route_index];
+                quote.filter(|values| values.len() == route.steps.len() + 1)
+            })
             .collect()
     }
 }
@@ -1004,17 +1204,23 @@ fn count_quotes(quotes: &[Option<Vec<U256>>]) -> usize {
         .sum()
 }
 
-fn update_best(
+/// Fold a batch of quoted jobs into `best`, keyed by `best_keys`.
+///
+/// `jobs` are parallel to the batcher's job list: `best_keys[i]` is the entry
+/// in `best` for job `i`, `amounts[i]` is that job's input, and `results[i]`
+/// is the `[in, out1, ...]` path (or `None`). Ranking uses absolute profit
+/// (`output - amount`) and only replaces on a strict improvement, so iterating
+/// the flattened job list reproduces the previous per-amount / per-factor order
+/// exactly.
+fn update_best_from_jobs(
     best: &mut HashMap<usize, (U256, Vec<U256>, U256)>,
+    best_keys: &[usize],
     amounts: &[U256],
-    quotes: Vec<Option<Vec<U256>>>,
+    results: &[Option<Vec<U256>>],
 ) {
-    for (index, quote) in quotes.into_iter().enumerate() {
-        let Some(values) = quote else { continue };
+    for ((key, amount), result) in best_keys.iter().zip(amounts.iter()).zip(results) {
+        let Some(values) = result else { continue };
         let Some(output) = values.last().copied() else {
-            continue;
-        };
-        let Some(amount) = amounts.get(index).copied() else {
             continue;
         };
         if amount.is_zero() {
@@ -1022,16 +1228,16 @@ fn update_best(
         }
         // `asset -> ... -> asset`, so output and input share units. Absolute
         // profit is the right ranking signal; ratio would prefer 1 wei trades.
-        let profit = output.saturating_sub(amount);
+        let profit = output.saturating_sub(*amount);
         if profit.is_zero() {
             continue;
         }
         let replace = best
-            .get(&index)
+            .get(key)
             .map(|(_, _, old_profit)| profit > *old_profit)
             .unwrap_or(true);
         if replace {
-            best.insert(index, (amount, values, profit));
+            best.insert(*key, (*amount, values.clone(), profit));
         }
     }
 }
@@ -1050,6 +1256,10 @@ fn head_requires_rescan(last: Option<u64>, head: u64) -> bool {
 
 fn effective_min_swap_usd(configured: f64) -> f64 {
     configured.max(ABSOLUTE_MIN_SWAP_USD)
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis() as u64
 }
 
 fn swap_notional_usd(log: &Log, pool: &crate::routes::Pool, usdc_decimals: u8) -> Option<f64> {
@@ -1360,5 +1570,100 @@ mod tests {
             })
             .collect();
         assert_eq!(filtered.len(), 22);
+    }
+
+    #[test]
+    fn scan_report_starts_with_zero_timings() {
+        let report = ScanReport::default();
+        assert_eq!(report.core_ms, 0);
+        assert_eq!(report.gas_ms, 0);
+        assert_eq!(report.probe_ms, 0);
+        assert_eq!(report.refine_ms, 0);
+        assert_eq!(report.simulate_ms, 0);
+    }
+
+    #[test]
+    fn elapsed_millis_measures_the_sleep() {
+        let started = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let first = elapsed_millis(started);
+        assert!(first >= 15, "elapsed {first} should include the sleep");
+    }
+
+    fn w(v: u32) -> U256 {
+        U256::from(v)
+    }
+
+    #[test]
+    fn update_best_from_jobs_keeps_absolute_profit_winner() {
+        // One route (key 7) probed at three amounts; the middle amount is the
+        // most profitable in absolute terms. Ranking must follow absolute
+        // profit, not output/input ratio (which would prefer the smallest).
+        let keys = [7usize, 7, 7];
+        let amounts = [w(100), w(1_000), w(5_000)];
+        let results = [
+            Some(vec![w(100), w(140)]),     // profit 40, ratio 1.4
+            Some(vec![w(1_000), w(1_120)]), // profit 120, ratio 1.12
+            Some(vec![w(5_000), w(5_050)]), // profit 50
+        ];
+        let mut best = HashMap::new();
+        update_best_from_jobs(&mut best, &keys, &amounts, &results);
+        let (amount, _quotes, profit) = best.get(&7).expect("key 7 present");
+        assert_eq!(*amount, w(1_000), "most profitable size must win");
+        assert_eq!(*profit, w(120));
+    }
+
+    #[test]
+    fn update_best_from_jobs_does_not_cross_contaminate_jobs() {
+        // Distinct (key, amount) so a mis-zip of amounts against results is
+        // detectable: key 0 wins at 200, key 1 wins at 300.
+        let keys = [0usize, 1, 0, 1];
+        let amounts = [w(100), w(100), w(200), w(300)];
+        let results = [
+            Some(vec![w(100), w(150)]), // key0 a100 profit 50
+            Some(vec![w(100), w(180)]), // key1 a100 profit 80
+            Some(vec![w(200), w(400)]), // key0 a200 profit 200  <- best for key0
+            Some(vec![w(300), w(650)]), // key1 a300 profit 350  <- best for key1
+        ];
+        let mut best = HashMap::new();
+        update_best_from_jobs(&mut best, &keys, &amounts, &results);
+        assert_eq!(best[&0].0, w(200), "key0 best amount from its own row");
+        assert_eq!(best[&0].2, w(200));
+        assert_eq!(best[&1].0, w(300), "key1 best amount from its own row");
+        assert_eq!(best[&1].2, w(350));
+    }
+
+    #[test]
+    fn update_best_from_jobs_skips_zero_and_none() {
+        let keys = [0usize, 1, 2];
+        let amounts = [w(0), w(100), w(100)];
+        let results = [Some(vec![w(0), w(50)]), None, Some(vec![w(100), w(100)])];
+        let mut best = HashMap::new();
+        update_best_from_jobs(&mut best, &keys, &amounts, &results);
+        assert!(
+            best.is_empty(),
+            "zero amount, failed quote, and zero profit drop"
+        );
+    }
+
+    #[test]
+    fn merged_probe_counts_equal_sequential_counts() {
+        // The flattened job list must produce the same total quote count as the
+        // old per-amount loop: two routes x two amounts, each a 2-hop path
+        // (2 leg outputs per successful job).
+        let per_amount_results: Vec<Vec<Option<Vec<U256>>>> = vec![
+            vec![Some(vec![w(100), w(101), w(102)]), None],
+            vec![
+                Some(vec![w(200), w(201), w(202)]),
+                Some(vec![w(200), w(190), w(180)]),
+            ],
+        ];
+        let sequential: usize = per_amount_results
+            .iter()
+            .map(|round| count_quotes(round))
+            .sum();
+        let flattened: Vec<Option<Vec<U256>>> = per_amount_results.into_iter().flatten().collect();
+        assert_eq!(sequential, count_quotes(&flattened));
+        assert_eq!(sequential, 3 * 2, "three completed 2-hop paths");
     }
 }
