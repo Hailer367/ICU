@@ -27,6 +27,74 @@ pub async fn connect_http(url: &str) -> Result<ChainProvider> {
     Ok(provider.erased())
 }
 
+/// Alchemy (and most providers) hand out one endpoint per connection type;
+/// an `http(s)://` URL used as a WebSocket target is upgraded to `ws(s)://`.
+/// Anything else passes through unchanged.
+pub fn normalize_ws_url(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
+/// The `host[:port]` authority of a URL, lowercased, without credentials or
+/// path. Returns `None` when the URL has no recognizable `scheme://authority`.
+fn authority(url: &str) -> Option<String> {
+    let scheme_end = url.find("://").map(|i| i + 3)?;
+    let rest = &url[scheme_end..];
+    let host = match rest.find('/') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    // Credentials must never take part in endpoint comparison.
+    let host = match host.rfind('@') {
+        Some(i) => &host[i + 1..],
+        None => host,
+    };
+    if host.is_empty() {
+        return None;
+    }
+    // An explicit default port (`host:443`) names the same server as `host`.
+    let host = match host.rsplit_once(':') {
+        Some((name, "443")) | Some((name, "80")) => name,
+        _ => host,
+    };
+    Some(host.to_ascii_lowercase())
+}
+
+/// True when an HTTP endpoint and a WebSocket endpoint address the same RPC
+/// server. Only then may the scan reuse the WebSocket connection: a different
+/// host means different state (e.g. live events vs a local fork), where calls
+/// must stay on the HTTP endpoint.
+pub fn same_endpoint(http: &str, ws: &str) -> bool {
+    match (authority(http), authority(ws)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Provider for quotes, simulations, and gas estimates.
+///
+/// When a WebSocket endpoint is configured for the *same* server as HTTP,
+/// every call rides the one persistent connection (no TCP+TLS setup per
+/// request). Otherwise HTTP is used, unchanged from before.
+pub async fn connect_auto(http: &str, ws: Option<&str>) -> Result<ChainProvider> {
+    if let Some(ws) = ws {
+        let ws = normalize_ws_url(ws);
+        if same_endpoint(http, &ws) {
+            let provider = connect(&ws)
+                .await
+                .context("failed to open the WebSocket call provider")?;
+            tracing::info!("scanning over the WebSocket endpoint (persistent connection)");
+            return Ok(provider);
+        }
+    }
+    connect_http(http).await
+}
+
 #[derive(Debug)]
 pub enum CallError {
     /// The node executed the call and the EVM reverted with this payload.
@@ -268,4 +336,64 @@ pub async fn multicall_raw(
             Err(format!("call to {target} reverted: {decoded_err}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_endpoints_to_websocket_schemes() {
+        assert_eq!(
+            normalize_ws_url("https://base-mainnet.g.alchemy.com/v2/KEY"),
+            "wss://base-mainnet.g.alchemy.com/v2/KEY"
+        );
+        assert_eq!(
+            normalize_ws_url("http://127.0.0.1:8545"),
+            "ws://127.0.0.1:8545"
+        );
+        // Already WebSocket URLs pass through untouched.
+        assert_eq!(normalize_ws_url("wss://x.example/ws"), "wss://x.example/ws");
+        assert_eq!(normalize_ws_url("ws://x.example"), "ws://x.example");
+    }
+
+    #[test]
+    fn detects_same_and_different_endpoints() {
+        assert!(same_endpoint(
+            "https://base-mainnet.g.alchemy.com/v2/KEY1",
+            "wss://base-mainnet.g.alchemy.com/v2/KEY2"
+        ));
+        assert!(same_endpoint(
+            "http://127.0.0.1:8545",
+            "ws://127.0.0.1:8545"
+        ));
+        assert!(same_endpoint(
+            "https://Host.Example/path",
+            "wss://host.example:443/other"
+        ));
+        assert!(!same_endpoint(
+            "https://mainnet.base.org",
+            "wss://base-mainnet.g.alchemy.com/v2/KEY"
+        ));
+        assert!(!same_endpoint(
+            "http://127.0.0.1:8545",
+            "ws://127.0.0.1:9999"
+        ));
+        assert!(!same_endpoint("not a url", "ws://x.example"));
+        assert!(!same_endpoint("", "ws://x.example"));
+    }
+
+    #[test]
+    fn authority_ignores_credentials_and_case_but_keeps_port() {
+        assert_eq!(
+            authority("https://user:pass@Host.Example/v2/key").as_deref(),
+            Some("host.example")
+        );
+        assert_eq!(
+            authority("wss://x.example:9999/path").as_deref(),
+            Some("x.example:9999")
+        );
+        assert_eq!(authority("https:///path"), None);
+        assert_eq!(authority("plain text"), None);
+    }
 }

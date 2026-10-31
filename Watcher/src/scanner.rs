@@ -29,6 +29,14 @@ use crate::venues::{self, QuoteRequest};
 /// Reuse a gas snapshot and ETH/USD price for this long. Bursts of pool logs
 /// otherwise re-read the same chain state several times in a row.
 const GAS_CACHE_TTL: Duration = Duration::from_secs(2);
+/// Identity of a simulation candidate: asset, input amount, and the pools
+/// forming the route. Its market state changes only when one of those pools
+/// trades.
+type FailedSimKey = (Address, U256, Vec<usize>);
+
+/// Losing simulations are remembered at most this many before a reset; the
+/// cache is an optimization, and dropping it is always safe.
+const FAILED_SIM_CACHE_CAP: usize = 8_192;
 /// Remember this many recent triggers so `logs` + `pendingLogs` duplicates do
 /// not cause two identical scans.
 const DEDUPE_CAPACITY: usize = 2_048;
@@ -74,6 +82,7 @@ struct AssetReport {
     routes_considered: usize,
     quotes: usize,
     simulations: usize,
+    sims_cached: usize,
     opportunities: Vec<Opportunity>,
     probe_ms: u64,
     refine_ms: u64,
@@ -87,6 +96,9 @@ pub struct ScanReport {
     pub routes_considered: usize,
     pub quotes: usize,
     pub simulations: usize,
+    /// Finalists skipped because their last simulation was a definitive loss
+    /// at an unchanged market state.
+    pub sims_cached: usize,
     pub opportunities: Vec<Opportunity>,
     pub notes: Vec<String>,
     /// Per-phase wall time in milliseconds, summed across assets. `core_ms`
@@ -175,6 +187,48 @@ struct CachedGas {
     eth_usd: f64,
 }
 
+/// Skipping re-simulations of losing candidates while their market inputs are
+/// unchanged.
+///
+/// A candidate is `(asset, amount, route's pool indices)`. What a simulation
+/// and the USD gates read is the route's quotes plus the gas and USD prices;
+/// a definitive loss is stored together with exactly those inputs. A later
+/// scan may skip the candidate only when every one of them is bit-identical:
+/// equal quotes mean the route's pools produce equal outputs, so the on-chain
+/// result could not have changed and skipping can never hide an opportunity.
+/// This holds even when the pools traded in between (small trades that leave
+/// the quoted outputs untouched) and across full scans.
+#[derive(Default, Debug)]
+struct FailedSimCache {
+    losses: HashMap<FailedSimKey, SimInputs>,
+}
+
+/// The inputs a simulation outcome is pinned to.
+#[derive(Debug, Clone, PartialEq)]
+struct SimInputs {
+    /// Refined quotes `[amount_in, out_leg1, out_leg2, ...]`.
+    quotes: Vec<U256>,
+    gas_price: U256,
+    /// USD prices behind the profit gate. Scanned values are always positive
+    /// (feeds with no usable price bail before candidates exist), so bitwise
+    /// float equality is safe here.
+    asset_usd: f64,
+    eth_usd: f64,
+}
+
+impl FailedSimCache {
+    fn is_unchanged_loss(&self, key: &FailedSimKey, inputs: &SimInputs) -> bool {
+        self.losses.get(key) == Some(inputs)
+    }
+
+    fn remember_loss(&mut self, key: FailedSimKey, inputs: SimInputs) {
+        if self.losses.len() >= FAILED_SIM_CACHE_CAP {
+            self.losses.clear();
+        }
+        self.losses.insert(key, inputs);
+    }
+}
+
 pub struct Scanner {
     provider: ChainProvider,
     manifest: Manifest,
@@ -189,6 +243,7 @@ pub struct Scanner {
     /// remembered for the life of the scanner.
     feed_decimals: Mutex<HashMap<Address, u8>>,
     deduper: Mutex<Deduper>,
+    sim_cache: Mutex<FailedSimCache>,
     /// Highest block observed by an evaluate call, used to notice skipped
     /// heads (reorg or a dropped WebSocket message) and force one full rescan.
     last_block: Mutex<Option<u64>>,
@@ -243,6 +298,7 @@ impl Scanner {
             gas_cache: Mutex::new(None),
             feed_decimals: Mutex::new(HashMap::new()),
             deduper: Mutex::new(Deduper::default()),
+            sim_cache: Mutex::new(FailedSimCache::default()),
             last_block: Mutex::new(None),
         })
     }
@@ -465,102 +521,60 @@ impl Scanner {
             block_id,
             false,
         )
-        .await)
+        .await
+        .0)
     }
 
     pub async fn scan_trigger(&self, trigger: &Trigger) -> Result<ScanReport> {
-        let key = TriggerKey::from_trigger(trigger);
-        if let Some(key) = &key {
-            let deduper = self.deduper.lock().expect("dedupe mutex poisoned");
-            if deduper.contains(key) {
-                return Ok(ScanReport {
-                    notes: vec!["duplicate trigger skipped".to_string()],
-                    ..Default::default()
-                });
-            }
-        }
+        self.scan_triggers(std::slice::from_ref(trigger)).await
+    }
 
-        let block = match trigger {
-            Trigger::Log {
-                preconfirmed: true, ..
-            } => ScanBlock::Pending,
-            Trigger::Flashblock { .. } => ScanBlock::Pending,
-            _ => ScanBlock::Latest,
-        };
-        let mut gap_rescan = false;
-        let affected = match trigger {
-            // A head alone is not an opportunity signal. It is only acted on
-            // when blocks were skipped since the last evaluate (a reorg or a
-            // dropped WebSocket message), in which case one full rescan is due.
-            Trigger::Head { number } => {
-                let mut last = self.last_block.lock().expect("last block mutex poisoned");
-                let previous = *last;
-                // Heads are liveness markers. Advance the marker on every head
-                // so idle stretches do not look like gaps; only a real jump or
-                // a backwards head triggers the full rescan.
-                *last = Some(*number);
-                drop(last);
-                if head_requires_rescan(previous, *number) {
-                    gap_rescan = true;
-                    None
-                } else {
-                    return Ok(ScanReport {
-                        notes: vec![format!("head tick {number} (no scan)")],
-                        ..Default::default()
-                    });
-                }
-            }
-            Trigger::Reconnect => None,
-            Trigger::Log { log, .. } => {
-                if let Some(notional) = self.swap_notional_usd(log) {
-                    let floor = self.min_swap_usd();
-                    if notional < floor {
-                        return Ok(ScanReport {
-                            notes: vec![format!(
-                                "swap ~${notional:.0} below the ${floor:.0} minimum; skipped"
-                            )],
-                            ..Default::default()
-                        });
-                    }
-                }
-                self.pool_index
-                    .get(&log.address())
-                    .map(|index| vec![*index])
-            }
-            Trigger::Flashblock { logs, .. } => {
-                let floor = self.min_swap_usd();
-                let mut set = HashSet::new();
-                for log in logs {
-                    let Some(index) = self.pool_index.get(&log.address()).copied() else {
-                        continue;
-                    };
-                    if let Some(notional) = self.swap_notional_usd(log)
-                        && notional < floor
-                    {
-                        continue;
-                    }
-                    set.insert(index);
-                }
-                if set.is_empty() {
-                    // A flashblock transaction list without logs does not tell
-                    // us which pools changed. Skip rather than scan everything
-                    // on every flashblock.
-                    return Ok(ScanReport {
-                        notes: vec!["flashblock contained no qualifying pool logs".to_string()],
-                        ..Default::default()
-                    });
-                }
-                Some(set.into_iter().collect())
-            }
-        };
-        let mut report = self.evaluate(affected, block).await?;
-        if let Some(key) = key {
+    /// Process a batch of triggers as **at most one** scan.
+    ///
+    /// Single-trigger semantics are preserved exactly for a one-element batch.
+    /// For larger batches: duplicates drop out, dust swaps drop out, head ticks
+    /// only update the gap marker, and every surviving trigger contributes its
+    /// pools to one union (`Reconnect` or an unknown pool forces the full
+    /// scan). Pending-state triggers make the whole batch scan `Pending`.
+    /// Trigger keys are recorded only after the shared scan succeeds, keeping
+    /// the two-phase dedupe guarantee: a transient failure never suppresses
+    /// the later mined duplicate of the same log.
+    pub async fn scan_triggers(&self, triggers: &[Trigger]) -> Result<ScanReport> {
+        let notional_of = |log: &Log| self.swap_notional_usd(log);
+        let is_seen = |key: &TriggerKey| {
             self.deduper
                 .lock()
                 .expect("dedupe mutex poisoned")
-                .mark(key);
+                .contains(key)
+        };
+        // Scoped so the guard is dropped long before the evaluate await.
+        let plan = {
+            let mut last_block = self.last_block.lock().expect("last block mutex poisoned");
+            plan_batch(
+                triggers,
+                &mut last_block,
+                &self.pool_index,
+                self.min_swap_usd(),
+                &notional_of,
+                &is_seen,
+            )
+        };
+
+        let mut report = if plan.scan {
+            let report = self.evaluate(plan.affected, plan.block).await?;
+            // Two-phase dedupe: mark only now, after the scan succeeded.
+            let mut deduper = self.deduper.lock().expect("dedupe mutex poisoned");
+            for key in plan.keys {
+                deduper.mark(key);
+            }
+            report
+        } else {
+            ScanReport::default()
+        };
+        for note in plan.notes {
+            report.notes.push(note);
         }
-        if gap_rescan {
+        if plan.gap_rescan {
             report
                 .notes
                 .push("head gap detected; forced a full rescan".to_string());
@@ -653,6 +667,7 @@ impl Scanner {
                     report.routes_considered += asset_report.routes_considered;
                     report.quotes += asset_report.quotes;
                     report.simulations += asset_report.simulations;
+                    report.sims_cached += asset_report.sims_cached;
                     report.probe_ms += asset_report.probe_ms;
                     report.refine_ms += asset_report.refine_ms;
                     report.simulate_ms += asset_report.simulate_ms;
@@ -898,21 +913,64 @@ impl Scanner {
 
         // Simulate the most promising routes. Quote profitability is only a
         // ranking signal; `simulate` is the source of truth.
-        let mut finalists: Vec<(usize, U256)> = ranked
+        let mut ranked_finalists: Vec<(usize, U256)> = ranked
             .iter()
             .filter_map(|(index, _)| best.get(index).map(|(_, _, profit)| (*index, *profit)))
             .collect();
-        finalists.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-        finalists.truncate(
+        ranked_finalists.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        ranked_finalists.truncate(
             self.settings
                 .max_candidates
                 .min(self.settings.max_simulations.max(1)),
         );
 
-        let futures = stream::iter(finalists.into_iter().map(|(index, _)| {
-            let route = all_routes[index].clone();
+        // Drop candidates whose previous simulation was a definitive loss with
+        // bit-identical inputs (quotes, gas price, USD prices): the on-chain
+        // outcome is a function of exactly those, so it cannot have changed.
+        // Candidates without usable quotes stay `None` and are never cached.
+        let mut to_simulate: Vec<(usize, FailedSimKey, Option<SimInputs>)> = Vec::new();
+        for (index, _) in &ranked_finalists {
+            let route = &all_routes[*index];
+            let pools: Vec<usize> = route.steps.iter().map(|step| step.pool_index).collect();
             let (amount, quotes, _) =
-                best.get(&index)
+                best.get(index)
+                    .cloned()
+                    .unwrap_or((U256::ZERO, Vec::new(), U256::ZERO));
+            let key = (asset, amount, pools);
+            let inputs = if amount.is_zero() || quotes.len() != route.steps.len() + 1 {
+                None
+            } else {
+                Some(SimInputs {
+                    quotes,
+                    gas_price: gas_snapshot.gas_price,
+                    asset_usd: price,
+                    eth_usd,
+                })
+            };
+            if let Some(inputs) = &inputs
+                && self
+                    .sim_cache
+                    .lock()
+                    .expect("sim cache mutex poisoned")
+                    .is_unchanged_loss(&key, inputs)
+            {
+                report.sims_cached += 1;
+                continue;
+            }
+            to_simulate.push((*index, key, inputs));
+        }
+        if report.sims_cached > 0 {
+            debug!(
+                asset = %symbol,
+                cached = report.sims_cached,
+                "losing candidates unchanged since their last simulation were skipped"
+            );
+        }
+
+        let futures = stream::iter(to_simulate.iter().map(|(index, _, _)| {
+            let route = all_routes[*index].clone();
+            let (amount, quotes, _) =
+                best.get(index)
                     .cloned()
                     .unwrap_or((U256::ZERO, Vec::new(), U256::ZERO));
             let provider = self.provider.clone();
@@ -921,7 +979,7 @@ impl Scanner {
             let symbol = symbol.clone();
             async move {
                 if amount.is_zero() || quotes.len() != route.steps.len() + 1 {
-                    return None;
+                    return (None, false);
                 }
                 simulate_route(
                     &provider,
@@ -944,19 +1002,34 @@ impl Scanner {
         }));
 
         let simulate_started = Instant::now();
-        let results: Vec<Option<Opportunity>> = futures.buffer_unordered(4).collect().await;
+        // `buffered` (not `buffer_unordered`) keeps input order so results
+        // still pair with their cache keys after collection.
+        let results: Vec<(Option<Opportunity>, bool)> = futures.buffered(4).collect().await;
         report.simulate_ms += elapsed_millis(simulate_started);
         report.simulations += results.len();
-        for opportunity in results.into_iter().flatten() {
-            info!(
-                asset = %opportunity.asset_symbol,
-                net_usd = opportunity.net_usd,
-                profit_usd = opportunity.profit_usd,
-                gas_usd = opportunity.cost.total_fee_usd,
-                venues = ?opportunity.venues(),
-                "opportunity"
-            );
-            report.opportunities.push(opportunity);
+        for ((_index, key, inputs), (opportunity, definitive_loss)) in
+            to_simulate.into_iter().zip(results)
+        {
+            if opportunity.is_none()
+                && definitive_loss
+                && let Some(inputs) = inputs
+            {
+                self.sim_cache
+                    .lock()
+                    .expect("sim cache mutex poisoned")
+                    .remember_loss(key, inputs);
+            }
+            if let Some(opportunity) = opportunity {
+                info!(
+                    asset = %opportunity.asset_symbol,
+                    net_usd = opportunity.net_usd,
+                    profit_usd = opportunity.profit_usd,
+                    gas_usd = opportunity.cost.total_fee_usd,
+                    venues = ?opportunity.venues(),
+                    "opportunity"
+                );
+                report.opportunities.push(opportunity);
+            }
         }
         Ok(report)
     }
@@ -1068,6 +1141,10 @@ impl Scanner {
     }
 }
 
+/// Quote-and-simulate one candidate. The flag reports whether the chain gave
+/// a **definitive** answer (the route cannot pay at this market state), which
+/// is the only kind of loss the failed-simulation cache may remember; network
+/// or encoding trouble is inconclusive and must never suppress a retry.
 #[allow(clippy::too_many_arguments)]
 async fn simulate_route(
     provider: &ChainProvider,
@@ -1084,12 +1161,12 @@ async fn simulate_route(
     asset_usd: f64,
     block: BlockId,
     preconfirmed: bool,
-) -> Option<Opportunity> {
+) -> (Option<Opportunity>, bool) {
     let discovery_steps = match simulate::discovery_steps(route, manifest) {
         Ok(steps) => steps,
         Err(err) => {
             debug!(error = %err, "failed to build discovery steps");
-            return None;
+            return (None, false);
         }
     };
 
@@ -1106,25 +1183,30 @@ async fn simulate_route(
         Ok(simulation) => simulation,
         Err(SimulateError::Revert { decoded, .. }) => {
             debug!(route = ?route.venues(), %decoded, "simulation reverted");
-            return None;
+            return (None, true);
         }
         Err(SimulateError::Transport(message)) => {
             warn!(error = %message, "simulation transport failure");
-            return None;
+            return (None, false);
         }
         Err(SimulateError::UnexpectedSuccess(_)) => {
             warn!("simulate unexpectedly succeeded; check the ABI");
-            return None;
+            return (None, false);
         }
     };
 
     if simulation.profit <= I256::ZERO {
-        return None;
+        return (None, true);
     }
-    let profit_raw: U256 = simulation.profit.try_into().ok()?;
+    let profit_raw: U256 = match simulation.profit.try_into() {
+        Ok(value) => value,
+        Err(_) => return (None, false),
+    };
 
     let floors = build_floors(quotes, settings.per_leg_slippage_bps);
-    let steps = route.to_steps(manifest, &floors).ok()?;
+    let Ok(steps) = route.to_steps(manifest, &floors) else {
+        return (None, false);
+    };
     let buffer = U256::from(settings.min_profit_buffer_bps.min(9_999));
     let min_profit = profit_raw.saturating_mul(U256::from(10_000) - buffer) / U256::from(10_000);
     let call = ryo::executeCall {
@@ -1134,7 +1216,9 @@ async fn simulate_route(
         minProfit: min_profit,
     };
     let calldata = Bytes::from(call.abi_encode());
-    let route_hash = route.route_hash(manifest, &floors).ok()?;
+    let Ok(route_hash) = route.route_hash(manifest, &floors) else {
+        return (None, false);
+    };
 
     let gas_used = match chain::estimate_gas_from(
         provider,
@@ -1172,28 +1256,31 @@ async fn simulate_route(
         "simulation economics"
     );
     if net_usd < settings.min_net_profit_usd {
-        return None;
+        return (None, true);
     }
 
-    Some(Opportunity {
-        asset,
-        asset_symbol: symbol.to_string(),
-        amount,
-        route: route.clone(),
-        quotes: quotes.to_vec(),
-        simulated_profit: simulation.profit,
-        floors,
-        min_profit,
-        route_hash,
-        calldata,
-        gas_used,
-        gas_price: gas_snapshot.gas_price,
-        cost,
-        profit_usd,
-        net_usd,
-        block: gas_snapshot.block_number,
-        preconfirmed,
-    })
+    (
+        Some(Opportunity {
+            asset,
+            asset_symbol: symbol.to_string(),
+            amount,
+            route: route.clone(),
+            quotes: quotes.to_vec(),
+            simulated_profit: simulation.profit,
+            floors,
+            min_profit,
+            route_hash,
+            calldata,
+            gas_used,
+            gas_price: gas_snapshot.gas_price,
+            cost,
+            profit_usd,
+            net_usd,
+            block: gas_snapshot.block_number,
+            preconfirmed,
+        }),
+        false,
+    )
 }
 
 fn count_quotes(quotes: &[Option<Vec<U256>>]) -> usize {
@@ -1256,6 +1343,228 @@ fn head_requires_rescan(last: Option<u64>, head: u64) -> bool {
 
 fn effective_min_swap_usd(configured: f64) -> f64 {
     configured.max(ABSOLUTE_MIN_SWAP_USD)
+}
+
+/// Everything a trigger batch decides, with no I/O: whether a scan is due,
+/// which pools the batch collectively affects, which block state to quote,
+/// which trigger keys may be marked seen after a successful scan, and the
+/// disposition notes. Kept pure so coalescing semantics are unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BatchPlan {
+    keys: Vec<TriggerKey>,
+    affected: Option<Vec<usize>>,
+    block: ScanBlock,
+    scan: bool,
+    gap_rescan: bool,
+    notes: Vec<String>,
+}
+
+/// Classify a batch of triggers into at most one scan. Single-trigger
+/// semantics are preserved exactly for one-element batches.
+fn plan_batch(
+    triggers: &[Trigger],
+    last_block: &mut Option<u64>,
+    pool_index: &HashMap<Address, usize>,
+    min_swap_usd: f64,
+    notional_of: &dyn Fn(&Log) -> Option<f64>,
+    is_seen: &dyn Fn(&TriggerKey) -> bool,
+) -> BatchPlan {
+    let mut notes = NotesBuilder::new(triggers.len());
+    let mut keys: Vec<TriggerKey> = Vec::new();
+    let mut batch_keys: HashSet<TriggerKey> = HashSet::new();
+    let mut pools: HashSet<usize> = HashSet::new();
+    let mut full_scan = false;
+    let mut block = ScanBlock::Latest;
+    let mut gap_rescan = false;
+
+    for trigger in triggers {
+        let key = TriggerKey::from_trigger(trigger);
+        if let Some(candidate) = &key
+            && (is_seen(candidate) || !batch_keys.insert(candidate.clone()))
+        {
+            notes.duplicate();
+            continue;
+        }
+
+        match trigger {
+            Trigger::Head { number } => {
+                let previous = *last_block;
+                // Heads are liveness markers. Advance the marker on every
+                // head so idle stretches do not look like gaps; only a real
+                // jump or a backwards head triggers the full rescan.
+                *last_block = Some(*number);
+                if head_requires_rescan(previous, *number) {
+                    gap_rescan = true;
+                    full_scan = true;
+                } else {
+                    notes.head_tick(*number);
+                }
+            }
+            Trigger::Reconnect => full_scan = true,
+            Trigger::Log { log, preconfirmed } => {
+                if let Some(notional) = notional_of(log)
+                    && notional < min_swap_usd
+                {
+                    notes.dust(notional, min_swap_usd);
+                    // Never marked as seen: the later mined duplicate of the
+                    // same log must still be evaluated.
+                    if let Some(candidate) = &key {
+                        batch_keys.remove(candidate);
+                    }
+                    continue;
+                }
+                if *preconfirmed {
+                    block = ScanBlock::Pending;
+                }
+                match pool_index.get(&log.address()).copied() {
+                    Some(index) => {
+                        pools.insert(index);
+                        if let Some(candidate) = key {
+                            keys.push(candidate);
+                        }
+                    }
+                    // An unknown pool tells us nothing about which routes
+                    // moved; scan everything rather than guess.
+                    None => {
+                        full_scan = true;
+                        if let Some(candidate) = key {
+                            keys.push(candidate);
+                        }
+                    }
+                }
+            }
+            Trigger::Flashblock { logs, .. } => {
+                let mut contributed = false;
+                for log in logs {
+                    let Some(index) = pool_index.get(&log.address()).copied() else {
+                        continue;
+                    };
+                    if let Some(notional) = notional_of(log)
+                        && notional < min_swap_usd
+                    {
+                        continue;
+                    }
+                    pools.insert(index);
+                    contributed = true;
+                }
+                if contributed {
+                    block = ScanBlock::Pending;
+                    if let Some(candidate) = key {
+                        keys.push(candidate);
+                    }
+                } else {
+                    // A flashblock transaction list without logs does not
+                    // tell us which pools changed. Skip rather than scan
+                    // everything on every flashblock.
+                    notes.flashblock_empty();
+                    if let Some(candidate) = &key {
+                        batch_keys.remove(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    let scan = full_scan || !pools.is_empty();
+    let affected = if scan && !full_scan {
+        let mut indices: Vec<usize> = pools.into_iter().collect();
+        indices.sort_unstable();
+        Some(indices)
+    } else {
+        None
+    };
+    let mut out = Vec::new();
+    notes.finish_into(&mut out);
+    BatchPlan {
+        keys,
+        affected,
+        block,
+        scan,
+        gap_rescan,
+        notes: out,
+    }
+}
+
+/// Collects batch-disposition notes. A one-element batch must report exactly
+/// what the old single-trigger path reported, so single mode keeps the
+/// historical strings and larger batches get aggregate counts.
+struct NotesBuilder {
+    total: usize,
+    duplicates: usize,
+    head_ticks: Vec<u64>,
+    first_dust: Option<String>,
+    dust_count: usize,
+    flashblocks_empty: usize,
+}
+
+impl NotesBuilder {
+    fn new(total: usize) -> Self {
+        Self {
+            total,
+            duplicates: 0,
+            head_ticks: Vec::new(),
+            first_dust: None,
+            dust_count: 0,
+            flashblocks_empty: 0,
+        }
+    }
+
+    fn duplicate(&mut self) {
+        self.duplicates += 1;
+    }
+
+    fn head_tick(&mut self, number: u64) {
+        self.head_ticks.push(number);
+    }
+
+    fn dust(&mut self, notional: f64, floor: f64) {
+        if self.first_dust.is_none() {
+            self.first_dust = Some(format!(
+                "swap ~${notional:.0} below the ${floor:.0} minimum; skipped"
+            ));
+        }
+        self.dust_count += 1;
+    }
+
+    fn flashblock_empty(&mut self) {
+        self.flashblocks_empty += 1;
+    }
+
+    fn finish_into(self, notes: &mut Vec<String>) {
+        if self.total == 1 {
+            if self.duplicates == 1 {
+                notes.push("duplicate trigger skipped".to_string());
+            }
+            for number in &self.head_ticks {
+                notes.push(format!("head tick {number} (no scan)"));
+            }
+            if let Some(note) = &self.first_dust {
+                notes.push(note.clone());
+            }
+            if self.flashblocks_empty == 1 {
+                notes.push("flashblock contained no qualifying pool logs".to_string());
+            }
+            return;
+        }
+        if self.duplicates > 0 {
+            notes.push(format!("{} duplicate triggers skipped", self.duplicates));
+        }
+        if !self.head_ticks.is_empty() {
+            notes.push(format!("{} head ticks (no scan)", self.head_ticks.len()));
+        }
+        if self.dust_count > 0 {
+            notes.push(format!(
+                "{} swaps skipped below the size minimum",
+                self.dust_count
+            ));
+        }
+        if self.flashblocks_empty > 0 {
+            notes.push(format!(
+                "{} flashblocks contained no qualifying pool logs",
+                self.flashblocks_empty
+            ));
+        }
+    }
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -1580,6 +1889,92 @@ mod tests {
         assert_eq!(report.probe_ms, 0);
         assert_eq!(report.refine_ms, 0);
         assert_eq!(report.simulate_ms, 0);
+        assert_eq!(report.sims_cached, 0);
+    }
+
+    fn sim_inputs(quotes: &[u64], gas_price: u64, asset_usd: f64, eth_usd: f64) -> SimInputs {
+        SimInputs {
+            quotes: quotes.iter().map(|q| U256::from(*q)).collect(),
+            gas_price: U256::from(gas_price),
+            asset_usd,
+            eth_usd,
+        }
+    }
+
+    #[test]
+    fn failed_sim_cache_skips_only_unchanged_losses() {
+        let asset = Address::repeat_byte(0x11);
+        let key = |amount: u64, pools: &[usize]| (asset, U256::from(amount), pools.to_vec());
+        let mut cache = FailedSimCache::default();
+        let base = sim_inputs(&[1000, 900, 990], 20, 0.5, 3000.0);
+        cache.remember_loss(key(1000, &[1, 3]), base.clone());
+
+        // Bit-identical inputs ⇒ provably identical simulation outcome.
+        assert!(
+            cache.is_unchanged_loss(&key(1000, &[1, 3]), &base),
+            "same inputs must skip"
+        );
+        // A later trigger on another pool changes nothing about this check.
+        assert!(cache.is_unchanged_loss(&key(1000, &[1, 3]), &base.clone()));
+
+        // Any input the sim or the USD gates read moving invalidates the loss.
+        assert!(!cache.is_unchanged_loss(
+            &key(1000, &[1, 3]),
+            &sim_inputs(&[1000, 899, 990], 20, 0.5, 3000.0)
+        ));
+        assert!(!cache.is_unchanged_loss(
+            &key(1000, &[1, 3]),
+            &sim_inputs(&[1000, 900, 990], 21, 0.5, 3000.0)
+        ));
+        assert!(!cache.is_unchanged_loss(
+            &key(1000, &[1, 3]),
+            &sim_inputs(&[1000, 900, 990], 20, 0.6, 3000.0)
+        ));
+        assert!(!cache.is_unchanged_loss(
+            &key(1000, &[1, 3]),
+            &sim_inputs(&[1000, 900, 990], 20, 0.5, 3100.0)
+        ));
+
+        // Amount is part of the identity: another size was never tested.
+        assert!(!cache.is_unchanged_loss(&key(2000, &[1, 3]), &base));
+        // Route identity too: the same amount over other pools is new work.
+        assert!(!cache.is_unchanged_loss(&key(1000, &[1, 4]), &base));
+    }
+
+    #[test]
+    fn failed_sim_cache_survives_full_scans_when_inputs_match() {
+        // The pin is the simulation's inputs, not which scans ran in between:
+        // a full scan no longer has to know "what moved" — different quotes
+        // simply stop matching, while an unchanged market keeps skipping even
+        // across reconnect-triggered full scans.
+        let asset = Address::repeat_byte(0x11);
+        let key = (asset, U256::from(1000u64), vec![0usize, 1]);
+        let mut cache = FailedSimCache::default();
+        let base = sim_inputs(&[1000, 900, 990], 20, 0.5, 3000.0);
+        cache.remember_loss(key.clone(), base.clone());
+        assert!(cache.is_unchanged_loss(&key, &base));
+        // Same candidate quoted after more market activity: inputs moved, so
+        // the candidate is re-simulated.
+        let refreshed = sim_inputs(&[1000, 910, 992], 20, 0.5, 3000.0);
+        assert!(!cache.is_unchanged_loss(&key, &refreshed));
+        cache.remember_loss(key.clone(), refreshed.clone());
+        assert!(cache.is_unchanged_loss(&key, &refreshed));
+    }
+
+    #[test]
+    fn failed_sim_cache_is_bounded() {
+        let asset = Address::repeat_byte(0x11);
+        let mut cache = FailedSimCache::default();
+        for amount in 0..(FAILED_SIM_CACHE_CAP as u64 + 1) {
+            cache.remember_loss(
+                (asset, U256::from(amount), vec![0]),
+                sim_inputs(&[amount], 20, 0.5, 3000.0),
+            );
+        }
+        assert!(
+            cache.losses.len() <= FAILED_SIM_CACHE_CAP,
+            "cache must clear itself instead of growing forever"
+        );
     }
 
     #[test]
@@ -1665,5 +2060,251 @@ mod tests {
         let flattened: Vec<Option<Vec<U256>>> = per_amount_results.into_iter().flatten().collect();
         assert_eq!(sequential, count_quotes(&flattened));
         assert_eq!(sequential, 3 * 2, "three completed 2-hop paths");
+    }
+
+    // ---- trigger-batch planning (coalescing) ----
+
+    fn indexed_log(pool: Address, tx_byte: u8, index: u64) -> Log {
+        log_from_json(json!({
+            "address": pool.to_string(),
+            "topics": ["0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"],
+            "data": "0x",
+            "blockNumber": "0x1",
+            "transactionHash": format!("{:#x}", B256::repeat_byte(tx_byte)),
+            "logIndex": format!("0x{index:x}"),
+            "transactionIndex": "0x0",
+            "removed": false,
+        }))
+    }
+
+    fn test_pools() -> (Address, Address) {
+        (Address::repeat_byte(0xa1), Address::repeat_byte(0xa2))
+    }
+
+    fn test_pool_index() -> HashMap<Address, usize> {
+        let (a, b) = test_pools();
+        HashMap::from([(a, 1usize), (b, 0usize)])
+    }
+
+    fn not_a_swap(_: &Log) -> Option<f64> {
+        None
+    }
+
+    fn never_seen(_: &TriggerKey) -> bool {
+        false
+    }
+
+    fn plan_of(triggers: &[Trigger]) -> BatchPlan {
+        plan_batch(
+            triggers,
+            &mut None,
+            &test_pool_index(),
+            500.0,
+            &not_a_swap,
+            &never_seen,
+        )
+    }
+
+    fn log_trigger(pool: Address, tx: u8, index: u64, preconfirmed: bool) -> Trigger {
+        Trigger::Log {
+            log: indexed_log(pool, tx, index),
+            preconfirmed,
+        }
+    }
+
+    #[test]
+    fn batch_unions_affected_pools_sorted() {
+        let (a, b) = test_pools();
+        let plan = plan_of(&[
+            log_trigger(a, 1, 0, false),
+            log_trigger(b, 2, 0, false),
+            log_trigger(a, 3, 0, false),
+        ]);
+        assert!(plan.scan);
+        assert_eq!(plan.affected.as_deref(), Some(&[0usize, 1][..]));
+        assert_eq!(plan.keys.len(), 3);
+        assert_eq!(plan.block, ScanBlock::Latest);
+        assert!(plan.notes.is_empty());
+    }
+
+    #[test]
+    fn one_preconfirmed_trigger_makes_the_batch_pending() {
+        let (a, b) = test_pools();
+        let plan = plan_of(&[log_trigger(a, 1, 0, false), log_trigger(b, 2, 0, true)]);
+        assert_eq!(plan.block, ScanBlock::Pending);
+    }
+
+    #[test]
+    fn in_batch_duplicates_are_dropped_once() {
+        let (a, _b) = test_pools();
+        let same = log_trigger(a, 7, 4, false);
+        let plan = plan_of(&[same.clone(), same]);
+        assert!(plan.scan);
+        assert_eq!(plan.keys.len(), 1, "one key to mark, once");
+        assert_eq!(plan.notes, vec!["1 duplicate triggers skipped".to_string()]);
+    }
+
+    #[test]
+    fn already_seen_batches_do_not_scan() {
+        let (a, _b) = test_pools();
+        let triggers = vec![log_trigger(a, 1, 0, false)];
+        let mut last = None;
+        let plan = plan_batch(
+            &triggers,
+            &mut last,
+            &test_pool_index(),
+            500.0,
+            &not_a_swap,
+            &|_| true,
+        );
+        assert!(!plan.scan);
+        assert!(plan.keys.is_empty());
+        // Single-trigger batches keep the historical note wording.
+        assert_eq!(plan.notes, vec!["duplicate trigger skipped".to_string()]);
+    }
+
+    #[test]
+    fn unknown_pool_forces_a_full_scan() {
+        let stranger = Address::repeat_byte(0xff);
+        let plan = plan_of(&[log_trigger(stranger, 1, 0, false)]);
+        assert!(plan.scan);
+        assert_eq!(plan.affected, None, "unknown pool means scan all");
+        assert_eq!(plan.keys.len(), 1);
+    }
+
+    #[test]
+    fn reconnect_forces_a_full_scan_beside_pool_logs() {
+        let (a, _b) = test_pools();
+        let plan = plan_of(&[Trigger::Reconnect, log_trigger(a, 1, 0, false)]);
+        assert!(plan.scan);
+        assert_eq!(plan.affected, None);
+    }
+
+    #[test]
+    fn dust_logs_are_skipped_and_never_marked() {
+        let (a, _b) = test_pools();
+        let triggers = vec![log_trigger(a, 1, 0, false)];
+        let mut last = None;
+        let plan = plan_batch(
+            &triggers,
+            &mut last,
+            &test_pool_index(),
+            500.0,
+            &|_| Some(100.0), // every log reads as a $100 swap
+            &never_seen,
+        );
+        assert!(!plan.scan, "a batch of only dust does not scan");
+        assert!(plan.keys.is_empty(), "dust must not enter the dedupe set");
+        assert_eq!(
+            plan.notes,
+            vec!["swap ~$100 below the $500 minimum; skipped".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_dust_log_does_not_mask_its_later_full_size_twin() {
+        // The same key appears twice in one batch: the first pass is dust
+        // (below floor), the second is a normal (non-swap, unfiltered) log.
+        // The dust must not swallow the twin: it still has to scan.
+        let (a, _b) = test_pools();
+        let twin = log_trigger(a, 9, 1, false);
+        let triggers = vec![twin.clone(), twin];
+        let seen = std::cell::Cell::new(0usize);
+        let mut last = None;
+        let plan = plan_batch(
+            &triggers,
+            &mut last,
+            &test_pool_index(),
+            500.0,
+            &|_| {
+                let n = seen.replace(seen.get() + 1);
+                if n == 0 { Some(100.0) } else { None }
+            },
+            &never_seen,
+        );
+        assert!(plan.scan, "the qualifying duplicate still scans");
+        assert_eq!(plan.keys.len(), 1);
+        assert_eq!(plan.affected.as_deref(), Some(&[1usize][..]));
+    }
+
+    #[test]
+    fn consecutive_heads_do_not_scan_and_move_the_marker() {
+        let triggers = vec![Trigger::Head { number: 11 }, Trigger::Head { number: 12 }];
+        let mut last = Some(10);
+        let plan = plan_batch(
+            &triggers,
+            &mut last,
+            &test_pool_index(),
+            500.0,
+            &not_a_swap,
+            &never_seen,
+        );
+        assert!(!plan.scan);
+        assert_eq!(last, Some(12));
+        assert_eq!(plan.notes, vec!["2 head ticks (no scan)".to_string()]);
+    }
+
+    #[test]
+    fn head_gap_in_a_batch_forces_one_full_rescan() {
+        let triggers = vec![Trigger::Head { number: 20 }];
+        let mut last = Some(12); // 8 blocks skipped
+        let plan = plan_batch(
+            &triggers,
+            &mut last,
+            &test_pool_index(),
+            500.0,
+            &not_a_swap,
+            &never_seen,
+        );
+        assert!(plan.scan);
+        assert!(plan.gap_rescan);
+        assert_eq!(plan.affected, None);
+    }
+
+    #[test]
+    fn flashblocks_follow_the_pool_and_skip_rules() {
+        let (a, b) = test_pools();
+        let stranger = Address::repeat_byte(0xff);
+        let with_logs = Trigger::Flashblock {
+            hashes: vec![B256::repeat_byte(1)],
+            logs: vec![indexed_log(a, 1, 0), indexed_log(stranger, 2, 0)],
+        };
+        let plan = plan_of(&[with_logs, log_trigger(b, 3, 0, false)]);
+        assert!(plan.scan);
+        assert_eq!(plan.block, ScanBlock::Pending);
+        assert_eq!(plan.affected.as_deref(), Some(&[0usize, 1][..]));
+        assert_eq!(plan.keys.len(), 2);
+
+        let hash_only = Trigger::Flashblock {
+            hashes: vec![B256::repeat_byte(2)],
+            logs: vec![indexed_log(stranger, 5, 0)],
+        };
+        let plan = plan_of(&[hash_only]);
+        assert!(!plan.scan);
+        assert!(
+            plan.keys.is_empty(),
+            "an uninformative flashblock is not marked"
+        );
+        assert_eq!(
+            plan.notes,
+            vec!["flashblock contained no qualifying pool logs".to_string()]
+        );
+    }
+
+    #[test]
+    fn mixed_batches_prefer_full_and_pending() {
+        let (a, _b) = test_pools();
+        let stranger = Address::repeat_byte(0xff);
+        let plan = plan_of(&[
+            log_trigger(a, 1, 0, false),
+            log_trigger(stranger, 2, 0, true),
+            Trigger::Head { number: 5 },
+        ]);
+        assert!(plan.scan);
+        assert_eq!(
+            plan.affected, None,
+            "unknown pool upgrades the batch to a full scan"
+        );
+        assert_eq!(plan.block, ScanBlock::Pending, "the pending log dominates");
     }
 }

@@ -154,8 +154,11 @@ pub struct EventStream {
 
 impl EventStream {
     pub fn new(url: impl Into<String>, source: EventSource, pools: &[Address]) -> Self {
+        // Providers hand out the same endpoint as https://; subscriptions
+        // need the ws(s):// form.
+        let url = crate::chain::normalize_ws_url(&url.into());
         Self {
-            url: url.into(),
+            url,
             specs: specs(source, pools),
             conn: None,
             next_id: 1,

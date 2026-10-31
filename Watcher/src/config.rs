@@ -229,11 +229,15 @@ impl Settings {
         if !self.http_rpc.starts_with("http://") && !self.http_rpc.starts_with("https://") {
             bail!("HTTP RPC URL must start with http:// or https://");
         }
-        if let Some(ws) = &self.ws_rpc
-            && !ws.starts_with("ws://")
-            && !ws.starts_with("wss://")
-        {
-            bail!("WebSocket RPC URL must start with ws:// or wss://");
+        if let Some(ws) = &self.ws_rpc {
+            // Alchemy hands out one endpoint per scheme; an https form of the
+            // WebSocket URL is accepted and upgraded wherever it is used.
+            let ok = ["ws://", "wss://", "http://", "https://"]
+                .iter()
+                .any(|scheme| ws.starts_with(scheme));
+            if !ok {
+                bail!("WebSocket RPC URL must start with ws://, wss://, http://, or https://");
+            }
         }
         if self.amount_grid_points < 2 {
             bail!("amount_grid_points must be at least 2");

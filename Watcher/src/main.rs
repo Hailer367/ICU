@@ -196,6 +196,12 @@ enum Command {
         /// Log an accumulated metrics line every N events (0 disables).
         #[arg(long, env = "RYO_METRICS_EVERY", default_value_t = 0)]
         metrics_every: usize,
+        /// Also wait up to this many milliseconds for further triggers and
+        /// scan them together. Triggers that piled up during the previous
+        /// scan are always bundled for free; this flag adds deliberate
+        /// bundling (0 = never wait).
+        #[arg(long, env = "RYO_COALESCE_MS", default_value_t = 0)]
+        coalesce_ms: u64,
     },
     /// Download historical swap logs for the registry pools as JSONL.
     History {
@@ -274,6 +280,7 @@ async fn run() -> Result<()> {
             show_empty,
             no_scan,
             metrics_every,
+            coalesce_ms,
         } => {
             watch_command(
                 &settings,
@@ -283,6 +290,7 @@ async fn run() -> Result<()> {
                 show_empty,
                 no_scan,
                 metrics_every,
+                coalesce_ms,
             )
             .await
         }
@@ -325,7 +333,7 @@ fn load_manifest(settings: &Settings) -> Result<Manifest> {
 
 async fn validate(settings: &Settings) -> Result<()> {
     let manifest = load_manifest(settings)?;
-    let provider = chain::connect_http(&settings.http_rpc).await?;
+    let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let chain_id = chain::chain_id(&provider).await?;
     if chain_id != 8453 {
         bail!("RPC chain id is {chain_id}, expected 8453 (Base mainnet)");
@@ -488,7 +496,7 @@ async fn read_address(provider: &ChainProvider, to: Address, data: Vec<u8>) -> R
 }
 
 async fn print_gas(settings: &Settings) -> Result<()> {
-    let provider = chain::connect_http(&settings.http_rpc).await?;
+    let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let snapshot = gas::snapshot(&provider, 2_000).await?;
     let eth_usd = gas::eth_usd_price(&provider, snapshot.timestamp).await?;
     println!("block:          {}", snapshot.block_number);
@@ -554,7 +562,7 @@ async fn quote_command(
         .unwrap_or(18);
     let amount = parse_amount(amount, decimals)?;
     let route = parse_route(&registry, asset, route_spec)?;
-    let provider = chain::connect_http(&settings.http_rpc).await?;
+    let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let quotes =
         venues::quote_route(&provider, &manifest, &route, amount, BlockId::latest()).await?;
     println!("route: {}", route.venues().join(" > "));
@@ -605,7 +613,7 @@ async fn simulate_command(
         .unwrap_or(18);
     let amount = parse_amount(amount, decimals)?;
     let route = parse_route(&registry, asset, route_spec)?;
-    let provider = chain::connect_http(&settings.http_rpc).await?;
+    let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let steps = simulate::discovery_steps(&route, &manifest)?;
     let now_secs = gas::latest_timestamp(&provider).await?;
     println!("core:  {}", manifest.core);
@@ -665,7 +673,7 @@ async fn plan_command(
         .unwrap_or(18);
     let amount = parse_amount(amount, decimals)?;
     let route = parse_route(&registry, asset, route_spec)?;
-    let provider = chain::connect_http(&settings.http_rpc).await?;
+    let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let scanner = Scanner::new(provider, manifest, settings.clone())?;
     match scanner.plan(&route, amount).await? {
         Some(opportunity) => print_opportunity(&opportunity),
@@ -681,7 +689,7 @@ async fn scan_command(
     json: bool,
 ) -> Result<()> {
     let manifest = load_manifest(settings)?;
-    let provider = chain::connect_http(&settings.http_rpc).await?;
+    let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let scanner = Scanner::new(provider, manifest, settings.clone())?;
     let block = if pending {
         ScanBlock::Pending
@@ -719,6 +727,7 @@ struct WatchMetrics {
     routes: usize,
     quotes: usize,
     simulations: usize,
+    sims_cached: usize,
     opportunities: usize,
     scan_millis: u128,
     core_millis: u64,
@@ -735,6 +744,7 @@ impl WatchMetrics {
         self.routes += report.routes_considered;
         self.quotes += report.quotes;
         self.simulations += report.simulations;
+        self.sims_cached += report.sims_cached;
         self.opportunities += report.opportunities.len();
         self.core_millis += report.core_ms;
         self.gas_millis += report.gas_ms;
@@ -747,13 +757,14 @@ impl WatchMetrics {
         let scans = self.scans.max(1) as u128;
         let avg = |total: u128| (total / scans) as u64;
         format!(
-            "events={} scans={} failed={} routes={} quotes={} simulations={} opportunities={} avg_scan_ms={} avg_core_ms={} avg_gas_ms={} avg_probe_ms={} avg_refine_ms={} avg_simulate_ms={}",
+            "events={} scans={} failed={} routes={} quotes={} simulations={} sims_cached={} opportunities={} avg_scan_ms={} avg_core_ms={} avg_gas_ms={} avg_probe_ms={} avg_refine_ms={} avg_simulate_ms={}",
             self.events,
             self.scans,
             self.failed_scans,
             self.routes,
             self.quotes,
             self.simulations,
+            self.sims_cached,
             self.opportunities,
             avg(self.scan_millis),
             avg(self.core_millis as u128),
@@ -774,6 +785,7 @@ async fn watch_command(
     show_empty: bool,
     no_scan: bool,
     metrics_every: usize,
+    coalesce_ms: u64,
 ) -> Result<()> {
     if source == EventSource::Once {
         bail!("watch requires an event source other than `once`");
@@ -783,7 +795,7 @@ async fn watch_command(
         .as_ref()
         .context("watch requires RYO_WS_RPC (wss://...Alchemy...)")?;
     let manifest = load_manifest(settings)?;
-    let provider = chain::connect_http(&settings.http_rpc).await?;
+    let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let scanner = Scanner::new(provider, manifest, settings.clone())?;
     let pools = scanner.registry().all_pool_addresses();
     let mut stream = EventStream::new(ws, source, &pools);
@@ -803,6 +815,7 @@ async fn watch_command(
 
     let mut events = 0usize;
     let mut metrics = WatchMetrics::default();
+    const MAX_BATCH: usize = 32;
     loop {
         let trigger = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -823,8 +836,52 @@ async fn watch_command(
             }
             continue;
         }
+
+        // Coalescing. Bundle every trigger the socket can hand over right
+        // now: each additional fetch gets a 2 ms budget, so a real backlog
+        // (frames buffered while the last scan ran) drains for free, while an
+        // idle socket costs one tiny timeout. `--coalesce-ms` additionally
+        // waits for events that have not arrived yet; without it, calm
+        // markets never pay latency.
+        let mut batch = vec![trigger];
+        while batch.len() < MAX_BATCH {
+            match tokio::time::timeout(std::time::Duration::from_millis(2), stream.next()).await {
+                Ok(Ok(trigger)) => {
+                    events += 1;
+                    metrics.events = events;
+                    info!(event = %trigger.label(), "trigger (bundled)");
+                    batch.push(trigger);
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_elapsed) => break,
+            }
+        }
+        if coalesce_ms > 0 && batch.len() < MAX_BATCH {
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(coalesce_ms);
+            while batch.len() < MAX_BATCH {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, stream.next()).await {
+                    Ok(trigger) => {
+                        let trigger = trigger?;
+                        events += 1;
+                        metrics.events = events;
+                        info!(event = %trigger.label(), "trigger (coalescing)");
+                        batch.push(trigger);
+                    }
+                    Err(_elapsed) => break,
+                }
+            }
+            if batch.len() > 1 {
+                info!(size = batch.len(), "coalesced batch");
+            }
+        }
+
         let started = std::time::Instant::now();
-        let report = match scanner.scan_trigger(&trigger).await {
+        let report = match scanner.scan_triggers(&batch).await {
             Ok(report) => report,
             Err(err) => {
                 metrics.failed_scans += 1;
@@ -868,7 +925,7 @@ async fn history_command(
     out: &Path,
     chunk: u64,
 ) -> Result<()> {
-    let provider = chain::connect_http(&settings.http_rpc).await?;
+    let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let registry = Registry::base_usdc_weth()?;
     let to_block = match to_block {
         Some(block) => block,
@@ -915,11 +972,12 @@ fn decode_command(data: &str) -> Result<()> {
 
 fn print_report(report: &ScanReport) {
     println!(
-        "block {} | routes {} | quotes {} | simulations {} | opportunities {}",
+        "block {} | routes {} | quotes {} | simulations {} | sims cached {} | opportunities {}",
         report.block,
         report.routes_considered,
         report.quotes,
         report.simulations,
+        report.sims_cached,
         report.opportunities.len()
     );
     println!(
@@ -983,6 +1041,7 @@ fn report_json(report: &ScanReport) -> serde_json::Value {
         "routesConsidered": report.routes_considered,
         "quotes": report.quotes,
         "simulations": report.simulations,
+        "simsCached": report.sims_cached,
         "notes": report.notes,
         "timingsMs": {
             "core": report.core_ms,

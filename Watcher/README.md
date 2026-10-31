@@ -73,7 +73,7 @@ The script writes the manifest in the exact shape this crate expects
 | `simulate ...` | Runs one route through `RyoCore.simulate` |
 | `plan ...` | `simulate` plus calldata, floors, route hash, gas estimate |
 | `scan [--pools 0,1] [--pending] [--json]` | One scan (all pools, or only affected ones) |
-| `watch [--show-empty] [--no-scan] [--metrics-every N] [--json]` | Event loop |
+| `watch [--show-empty] [--no-scan] [--metrics-every N] [--coalesce-ms N] [--json]` | Event loop |
 | `history [--blocks 43200] [--chunk 500] [--out data/swaps.jsonl]` | Downloads historical swap logs for the 12 pools as JSONL |
 | `decode 0x...` | Decodes revert data |
 
@@ -99,7 +99,7 @@ default `mainnet.base.org` endpoint rejects `eth_getLogs` with
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--http-rpc` | `RYO_HTTP_RPC` | `https://mainnet.base.org` | HTTP RPC for quotes/simulation |
-| `--ws-rpc` | `RYO_WS_RPC` | – | WebSocket RPC, required by `watch` |
+| `--ws-rpc` | `RYO_WS_RPC` | – | WebSocket RPC, required by `watch`; an `http(s)://` value is auto-upgraded, and when it is the same endpoint as `--http-rpc` all calls run over this one persistent connection |
 | `--manifest` | `RYO_MANIFEST` | `deployments/8453.json` | Deployment manifest |
 | `--mode` | `RYO_MODE` | `dry-run` | `dry-run` / `paper` / `live` (live still logs only) |
 | `--source` | `RYO_SOURCE` | `pending-logs` | `logs`, `pending-logs`, `flashblocks`, `both`, `once` |
@@ -115,6 +115,7 @@ default `mainnet.base.org` endpoint rejects `eth_getLogs` with
 | `--max-hops` | `RYO_MAX_HOPS` | `2` | Route length (2 = one pool out, one back) |
 | `--assets` | `RYO_ASSETS` | `USDC,WETH` | Assets scanned, in order |
 | `--fallback-gas` | `RYO_FALLBACK_GAS` | `450000` | Gas estimate used if `eth_estimateGas` fails |
+| `--coalesce-ms` | `RYO_COALESCE_MS` | `0` | `watch` only: also wait up to N ms for more triggers before scanning |
 
 Opportunities must pass **all** gates: core not paused, watcher gas ceiling,
 core `maxGasPrice`, positive simulated profit, and net USD ≥
@@ -125,6 +126,13 @@ In `watch`, a swap in one of the 12 pools is the trigger. Swaps below
 drops ~78 % of events while keeping ~99 % of the swaps that can open a
 $0.25 opportunity. Logs that are not swaps (mints, burns, collects) are not
 size-filtered.
+
+During a burst the watch loop bundles whatever triggers the socket can hand
+over into one scan (a 2 ms budget per extra event, so a backlog drains for
+free while an idle market pays nothing); `--coalesce-ms` waits longer on
+purpose. Losing candidates are also skipped in later scans when their exact
+simulation inputs (quotes, gas, USD prices) are unchanged — `sims_cached` in
+the metrics line counts those skips, and opportunities are never affected.
 
 On Alchemy's Base endpoint, `newFlashblocks` sends preconfirmed block objects
 and `newFlashblockTransactions` sends bare transaction hashes; neither carries

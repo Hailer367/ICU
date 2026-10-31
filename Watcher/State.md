@@ -446,6 +446,76 @@ Not done (deferred, unchanged from §0d–§0g): mainnet manifest
 warns), live pending `eth_call` against Alchemy HTTP, watch-loop pipelining
 (deliberately not added — single-flight with the bounded queue is intended).
 
+### 0i. WebSocket transport, trigger coalescing, failed-sim cache (2026-10-31)
+
+Three latency features requested after the §0h overhaul and the max-speed
+benchmark; all implemented, unit-tested, fork-tested, and verified live.
+
+**Feature 2 — RPC calls over the WebSocket.** `chain::connect_auto(http, ws)`
+normalizes the configured WS URL (`http→ws`, `https→wss` via
+`normalize_ws_url`), compares endpoints after stripping credentials and
+default ports (`authority`), and returns a single WS-backed provider iff they
+point at the same endpoint:
+one persistent connection for both subscriptions and all calls. All eight
+provider-construction sites in `main.rs` were switched over. On a split
+HTTP/WS setup (e.g. anvil fork behind HTTP + Alchemy WS) the rule keeps calls
+on HTTP and only subscribes over the configured WS. Live-verified twice:
+`gas` on Alchemy prints identical values over HTTP and WS and logs
+"scanning over the WebSocket endpoint (persistent connection)".
+
+**Feature 3 — burst coalescing.** `Scanner::scan_triggers(&[Trigger])` joins
+a batch through the new pure `plan_batch` (duplicate/dust/head-tick handling
+identical to the single-trigger path; affected pools union; a batch member
+needing a full scan forces the whole batch full; pending-state members scan
+`Pending`; dedupe keys are marked only after the shared scan succeeds).
+The watch loop now actively bundles after every trigger: each additional
+fetch gets a 2 ms budget, so the socket backlog that built up during the
+previous scan drains into one batch for free, while an idle socket pays one
+2 ms timeout; `--coalesce-ms N` (`RYO_COALESCE_MS`, default 0) additionally
+waits up to N ms for events that have not arrived yet; batches cap at 32.
+Discovery worth keeping: the original "drain only what is already queued"
+(`EventStream::drain_pending`) coalesced nothing in practice because
+tungstenite frames stay in the socket until `next()` reads them; the
+2 ms-budgeted `next()` loop replaced it and `drain_pending` was deleted.
+Measured on the fork under a 24-swap burst: default mode **events 34 →
+scans 25**; `--coalesce-ms 150` **events 22 → scans 8**; identical findings
+either way, `failed=0`.
+
+**Feature 4 — failed-sim cache — with a design fix caught by integration.**
+The first implementation keyed losses to per-pool *event epochs* and skipped
+a candidate while none of its pools had new events. The new fork integration
+test (`tests/fork_simcache.rs`) proved that construction dead: every scan
+only simulates routes containing the *triggering* pools, and those pools
+advance by construction, while full scans reset the cache — the skip could
+never fire in production. Redesigned to pin the loss to its **simulation
+inputs**: `(asset, amount, route pools) → (quotes, gas price, asset USD,
+ETH USD)`, skipped only when every input is bit-identical. Equal quotes mean
+the route's pools produce equal outputs, so the on-chain result cannot have
+changed even if those pools traded in between (trades that do not move the
+quoted outputs); equal gas/USD prices keep the net-profit gate honest. No
+full-scan reset is needed any more — mismatching inputs skip nothing.
+Measured: fork test scan #1 `simulations=4` → scan #2 `simulations=2,
+sims_cached=2` with both opportunities re-found; live watch bursts now show
+`sims_cached` climbing (8 in the final 34-event burst). `ScanReport` gained
+`sims_cached`; metrics line, `--json` (`simsCached`), and `print_report`
+surface it.
+
+Verification (all on 2026-10-31):
+
+- `cargo test`: **72 lib tests + 1 WS integration test**, both fork tests
+  green; `cargo clippy --all-targets -D warnings` and `cargo fmt --all --check`
+  clean.
+- `tests/fork_opportunity.rs` with `RYO_FORK_EXECUTE=1` still pays
+  **exactly** the simulated profit (`894041505887578` wei WETH, byte-for-byte
+  equal), so the cache never hides a winner.
+- New `tests/fork_simcache.rs` (ignored; `RYO_FORK_RPC`): two consecutive
+  full scans of a quiet fork must skip changed-input nothing and re-find
+  everything.
+- Live Alchemy: trigger stream on the persistent WS with the key redacted;
+  every scan against the (non-existent on mainnet) anvil core errors
+  "failed to decode core.paused" and reports no opportunity — the fail-closed
+  read path behaves correctly against a real address holding no code.
+
 ---
 
 ## 1. Goal and hard constraints
@@ -594,6 +664,10 @@ Important Alloy mapping details:
   heterogeneous `(target, calldata)` reads, returning raw bytes per call with
   whole-batch vs per-call failure distinguished. Used by the batched core-state
   read, feed reads, and gas-snapshot oracle reads.
+- §0i: `normalize_ws_url`, `same_endpoint`, and `connect_auto(http, ws)` —
+  when the configured WS points at the same endpoint as HTTP (credentials and
+  default ports ignored), all calls run over the persistent WebSocket
+  connection instead of per-request HTTP; otherwise plain HTTP is used.
 
 ### `src/events.rs`
 
@@ -698,7 +772,8 @@ against the live endpoint was not exercised (the mock test covers it).
 
 - `Scanner::new(provider, manifest, settings)`.
 - `scan_once()`, `scan_once_with(block)`, `scan_trigger(&Trigger)`,
-  `evaluate(affected, block)`.
+  `scan_triggers(&[Trigger])` (§0i: a whole trigger batch becomes at most one
+  scan via the pure `plan_batch`), `evaluate(affected, block)`.
 - `plan(route, amount)` for the CLI; enforces watcher gas ceiling, core gas
   ceiling, and `min_net_profit_usd`.
 - Routes are enumerated once per asset at construction.
@@ -729,6 +804,10 @@ against the live endpoint was not exercised (the mock test covers it).
 - Refine top `max_candidates` on factors `[0.5, 0.75, 1.0, 1.5, 2.0]`,
   truncated by `amount_grid_points`; the best absolute profit is kept.
 - Simulate top `min(max_candidates, max_simulations)` concurrently (buffer 4).
+- §0i failed-sim cache: a definitive loss is stored with its simulation inputs
+  `(quotes, gas price, asset/ETH USD)` keyed by `(asset, amount, route pools)`
+  and skipped only on a bit-identical later candidate; capacity 8192 with
+  clear-on-overflow. `ScanReport.sims_cached` counts skips.
 - `eth_estimateGas` uses `manifest.operator` as the sender.
 - Gas snapshot + ETH/USD is cached for 2 seconds to smooth event bursts.
 - Builds execution floors with `per_leg_slippage_bps`, `minProfit` with
@@ -741,8 +820,9 @@ against the live endpoint was not exercised (the mock test covers it).
   - `net_usd >= min_net_profit_usd`
 - `ScanReport` includes block, affected pools, routes/quotes/simulations,
   notes, and opportunities, plus §0h per-phase milliseconds (`core_ms`,
-  `gas_ms`, `probe_ms`, `refine_ms`, `simulate_ms`); `watch --json` emits them
-  under `timingsMs` and the metrics line logs running averages.
+  `gas_ms`, `probe_ms`, `refine_ms`, `simulate_ms`) and §0i `sims_cached`;
+  `watch --json` emits them under `timingsMs`/`simsCached` and the metrics
+  line logs running averages.
 
 ### `src/main.rs` (CLI)
 
@@ -756,7 +836,7 @@ quote  --asset USDC --amount 1000 --route univ3:500,univ3:100
 simulate --asset USDC --amount 1000 --route univ3:500,univ3:100
 plan   --asset USDC --amount 1000 --route univ3:500,univ3:100
 scan   [--pools 0,1] [--pending] [--json]
-watch  [--max-events N] [--json] [--show-empty] [--no-scan] [--metrics-every N]
+watch  [--max-events N] [--json] [--show-empty] [--no-scan] [--metrics-every N] [--coalesce-ms N]
 history [--blocks 43200] [--from-block N] [--to-block N] [--chunk 500] [--out data/swaps.jsonl]
 decode 0x...
 ```
@@ -781,6 +861,7 @@ Global options and env vars:
 --max-hops       RYO_MAX_HOPS
 --assets         RYO_ASSETS
 --fallback-gas   RYO_FALLBACK_GAS
+--coalesce-ms    RYO_COALESCE_MS   (watch only; 0 = bundle backlog only)
 ```
 
 `watch` currently **logs opportunities only**. In `--mode live` it prints a
@@ -797,15 +878,16 @@ cd Watcher
 cargo test
 ```
 
-Result: **54 lib tests + 1 WebSocket integration test passed, 0 failed**
-(2026-10-31 §0h; 27 before the completion pass, 31 after it, 36 after the history
-module, 37 after the replay staleness fix, 39 after the swap-size filter,
-44 after adding notional decoding tests, 54 after the speed-overhaul batch
-integrity/decoding tests). `cargo clippy --all-targets` is
+Result: **72 lib tests + 1 WebSocket integration test passed, 0 failed**
+(2026-10-31 §0i; 27 before the completion pass, 31 after it, 36 after the
+history module, 37 after the replay staleness fix, 39 after the swap-size
+filter, 44 after adding notional decoding tests, 54 after the speed-overhaul
+batch integrity/decoding tests, 72 after the coalescing/WS/batch-transport
+tests). `cargo clippy --all-targets` is
 clean after fixes.
 `tests/events_ws.rs` uses an in-process mock server and needs no network.
-`tests/fork_opportunity.rs` is `#[ignore]`d and needs a local Anvil fork; it is
-not part of a plain `cargo test`.
+`tests/fork_opportunity.rs` and `tests/fork_simcache.rs` are `#[ignore]`d and
+need a local Anvil fork; they are not part of a plain `cargo test`.
 
 Coverage of unit tests:
 
@@ -827,6 +909,11 @@ Coverage of unit tests:
   per-(route, amount) no-cross-contamination, zero/failed-job skips, merged vs
   sequential quote-count equality; Chainlink feed mapping, round decoding,
   staleness/sign bails, and decimal scaling
+- (§0i) `plan_batch` coalescing semantics (12 cases: dedupe, dust twins, head
+  ticks, union of affected pools, pending-state promotion, full-scan forcing),
+  WS-endpoint normalization/matching (incl. credentials and default ports),
+  and the input-pinned failed-sim cache (skip only on bit-identical quotes,
+  gas, and USD prices; identity covers amount and route; bounded)
 
 ### Live Base HTTP checks
 
@@ -1058,9 +1145,10 @@ Current code only logs. To send transactions later:
 Done: route enumeration cache, gas/ETH cache, quote dedupe + concurrent chunks,
 two-phase duplicate-trigger suppression, bounded event queue, metrics line,
 debug-level quote failures, head-gap/reorg full rescan, gas gate before
-quoting, and (§0h) multi-amount quote batching, single-call core-state read,
+quoting, (§0h) multi-amount quote batching, single-call core-state read,
 batched Chainlink feeds with cached decimals, concurrent gas snapshot, and
-parallel per-asset scans.
+parallel per-asset scans, and (§0i) same-endpoint WebSocket call transport,
+burst trigger coalescing, and the input-pinned failed-sim cache.
 
 Still open:
 
@@ -1074,7 +1162,8 @@ Still open:
   per-asset overlap remain a reading caveat, not a gap.
 - Watch-loop pipelining (process the next trigger while a scan runs) is still
   intentionally not done: single-flight + the bounded queue is the designed
-  behaviour. A short-window trigger coalesce is a possible future option.
+  behaviour. Burst coalescing (§0i, `--coalesce-ms`) is now the implemented
+  middle ground; pipelining stays out.
 
 ---
 
