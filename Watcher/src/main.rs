@@ -180,6 +180,11 @@ enum Command {
         pending: bool,
         #[arg(long)]
         json: bool,
+        /// Skip the second pass that re-prices finalists at a newly resolved
+        /// block. Off only for latency comparison; the pass costs nothing
+        /// when no opportunity was found.
+        #[arg(long)]
+        no_freshness: bool,
     },
     /// Subscribe to Base events and scan on each trigger.
     Watch {
@@ -202,6 +207,11 @@ enum Command {
         /// bundling (0 = never wait).
         #[arg(long, env = "RYO_COALESCE_MS", default_value_t = 0)]
         coalesce_ms: u64,
+        /// Skip the second pass that re-prices finalists at a newly resolved
+        /// block. Off only for latency comparison; the pass costs nothing
+        /// when no opportunity was found.
+        #[arg(long)]
+        no_freshness: bool,
     },
     /// Download historical swap logs for the registry pools as JSONL.
     History {
@@ -273,7 +283,12 @@ async fn run() -> Result<()> {
             pools,
             pending,
             json,
-        } => scan_command(&settings, &pools, pending, json).await,
+            no_freshness,
+        } => {
+            let mut settings = settings;
+            settings.freshness = !no_freshness;
+            scan_command(&settings, &pools, pending, json).await
+        }
         Command::Watch {
             max_events,
             json,
@@ -281,7 +296,10 @@ async fn run() -> Result<()> {
             no_scan,
             metrics_every,
             coalesce_ms,
+            no_freshness,
         } => {
+            let mut settings = settings;
+            settings.freshness = !no_freshness;
             watch_command(
                 &settings,
                 cli.source,
@@ -324,6 +342,7 @@ fn settings_from_cli(cli: &Cli) -> Settings {
         fallback_gas: cli.fallback_gas,
         probe_amounts_usd: cli.probe_usd.clone(),
         min_swap_usd: cli.min_swap_usd,
+        freshness: true,
     }
 }
 
@@ -744,6 +763,7 @@ struct WatchMetrics {
     probe_millis: u64,
     refine_millis: u64,
     simulate_millis: u64,
+    fresh_millis: u64,
 }
 
 impl WatchMetrics {
@@ -760,13 +780,14 @@ impl WatchMetrics {
         self.probe_millis += report.probe_ms;
         self.refine_millis += report.refine_ms;
         self.simulate_millis += report.simulate_ms;
+        self.fresh_millis += report.fresh_ms;
     }
 
     fn summary(&self) -> String {
         let scans = self.scans.max(1) as u128;
         let avg = |total: u128| (total / scans) as u64;
         format!(
-            "events={} scans={} failed={} routes={} quotes={} simulations={} sims_cached={} opportunities={} avg_scan_ms={} avg_core_ms={} avg_gas_ms={} avg_probe_ms={} avg_refine_ms={} avg_simulate_ms={}",
+            "events={} scans={} failed={} routes={} quotes={} simulations={} sims_cached={} opportunities={} avg_scan_ms={} avg_core_ms={} avg_gas_ms={} avg_probe_ms={} avg_refine_ms={} avg_simulate_ms={} avg_fresh_ms={}",
             self.events,
             self.scans,
             self.failed_scans,
@@ -781,6 +802,7 @@ impl WatchMetrics {
             avg(self.probe_millis as u128),
             avg(self.refine_millis as u128),
             avg(self.simulate_millis as u128),
+            avg(self.fresh_millis as u128),
         )
     }
 }
@@ -992,8 +1014,13 @@ fn print_report(report: &ScanReport) {
         report.opportunities.len()
     );
     println!(
-        "  ms: core {} gas {} probe {} refine {} simulate {}",
-        report.core_ms, report.gas_ms, report.probe_ms, report.refine_ms, report.simulate_ms
+        "  ms: core {} gas {} probe {} refine {} simulate {} fresh {}",
+        report.core_ms,
+        report.gas_ms,
+        report.probe_ms,
+        report.refine_ms,
+        report.simulate_ms,
+        report.fresh_ms
     );
     for note in &report.notes {
         println!("  note: {note}");
@@ -1070,6 +1097,7 @@ fn report_json(report: &ScanReport) -> serde_json::Value {
             "probe": report.probe_ms,
             "refine": report.refine_ms,
             "simulate": report.simulate_ms,
+            "fresh": report.fresh_ms,
         },
         "opportunities": report.opportunities.iter().map(opportunity_json).collect::<Vec<_>>(),
     })

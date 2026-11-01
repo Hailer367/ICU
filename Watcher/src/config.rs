@@ -195,6 +195,10 @@ pub struct Settings {
     /// Swaps smaller than this USD notional are ignored before quoting. Stored
     /// as configured; the scanner always enforces a hard floor on top.
     pub min_swap_usd: f64,
+    /// After a scan finds opportunities, re-quote and re-simulate the
+    /// finalists at a newly resolved block so the reported numbers describe
+    /// the freshest consistent state. Costs nothing when nothing was found.
+    pub freshness: bool,
 }
 
 impl Default for Settings {
@@ -217,6 +221,7 @@ impl Default for Settings {
             fallback_gas: 450_000,
             probe_amounts_usd: vec![500.0, 2_000.0, 8_000.0],
             min_swap_usd: 500.0,
+            freshness: true,
         }
     }
 }

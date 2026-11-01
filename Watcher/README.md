@@ -33,6 +33,13 @@ flashblock, so it cannot be pinned; a scan reports `head_drift` instead. If the
 pinned block turns out to have been re-orged, the scan is reported as void
 rather than as an empty market — as is any scan where legs could not be priced.
 
+When a scan *does* find opportunities, a second **freshness pass** re-runs
+only those finalists: it resolves a new block, re-quotes and re-simulates the
+trades there, and the report then describes that block. The pass costs
+nothing when nothing was found, skips itself when the head has not moved, and
+is all-or-nothing — if any finalist cannot be re-priced, the pass-1 numbers
+stand and the report says so. One report never mixes two blocks.
+
 ## Layout
 
 ```
@@ -40,7 +47,7 @@ src/events.rs    raw JSON-RPC WebSocket client, subscriptions, reconnect, trigge
 src/routes.rs    venue/pool registry, cycle enumeration, adapter calldata, route hash
 src/venues.rs    per-venue quote encoding/decoding, Multicall3 batching
 src/amm.rs       local exact-price math for constant-product pools (checked U256 only)
-src/scanner.rs   event-driven scan: quotes → rank → refine → simulate → gates
+src/scanner.rs   event-driven scan: quotes → rank → refine → simulate → gates → freshness pass
 src/simulate.rs  RyoCore.simulate call and result decoding
 src/gas.rs       Base gas snapshot, per-candidate L1 fee upper bound (fail-closed), ETH/USD feed
 src/chain.rs     provider helpers (eth_call, estimate_gas, ERC20 reads)
@@ -94,8 +101,8 @@ The script writes the manifest in the exact shape this crate expects
 | `quote --asset USDC --amount 1000 --route univ3:500,univ3:100` | Quotes one route |
 | `simulate ...` | Runs one route through `RyoCore.simulate` |
 | `plan ...` | `simulate` plus calldata, floors, route hash, gas estimate |
-| `scan [--pools 0,1] [--pending] [--json]` | One scan (all pools, or only affected ones) |
-| `watch [--show-empty] [--no-scan] [--metrics-every N] [--coalesce-ms N] [--json]` | Event loop |
+| `scan [--pools 0,1] [--pending] [--json] [--no-freshness]` | One scan (all pools, or only affected ones) |
+| `watch [--show-empty] [--no-scan] [--metrics-every N] [--coalesce-ms N] [--json] [--no-freshness]` | Event loop |
 | `history [--blocks 43200] [--chunk 500] [--out data/swaps.jsonl]` | Downloads historical swap logs for the 12 pools as JSONL |
 | `decode 0x...` | Decodes revert data |
 

@@ -1,6 +1,6 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-11-01 (fail-closed cost reads; see §0l)
+Last updated: 2026-11-01 (freshness pass; see §0m)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -831,6 +831,68 @@ Base fork + `Deploy.s.sol` deployment, fork block 53376203):
   The point of §0l is the failure mode (zero no longer means "free"), not a
   cheaper-looking trade.
 
+### 0m. Freshness pass — finalists re-priced at a new pin (#4) — DONE 2026-11-01
+
+Closes the first §0k "NOT done" item. Pinning (§0k) traded ~one block of
+staleness for internal consistency; this wins it back for exactly the
+reported finalists.
+
+Design (as proposed in §0k): after pass 1 produces opportunities, resolve a
+**new** pin and re-quote + re-simulate *only the finalists* there — never a
+re-search. Rules:
+
+- Runs only when pass 1 found something (the common case costs zero RPC) and
+  skips itself when the new pin equals the old one ("head unchanged;
+  opportunities are already fresh").
+- **All-or-nothing merge** (`merge_refreshed`, pure + unit-tested): every
+  finalist must reach a conclusive outcome at the new pin, or the pass-1 set
+  stands untouched with a report note. A partially refreshed list would mix
+  two blocks — exactly the lie §0k removed.
+- Outcomes per finalist: `Replaced` (still profitable at the fresh pin),
+  `Gone` (the fresh state truthfully rejects it — definitive sim verdict or
+  sub-threshold net: a legitimate removal), `Inconclusive` (re-quote failed,
+  feed missing, sim transport — voids the whole pass).
+- The pass re-reads its **own core state** at the fresh pin: a core paused
+  between the blocks, or a gas spike past either ceiling, voids the refresh
+  rather than reporting a stale "yes" as if it were new.
+- `simulate_route` is reused unchanged, so simulate-what-you-propose still
+  holds: pass-2 floors are built from pass-2 quotes and become the calldata.
+- On success the report's `block`/`pin_hash`/re-org guard/`head_drift` all
+  move to the fresh pin; a new `fresh_ms` phase timer surfaces in `--json`
+  (`timingsMs.fresh`) and the watch metrics (`avg_fresh_ms`).
+- Settings knob `freshness` (default on) with `--no-freshness` on `scan` and
+  `watch` for latency A/B; no env var, matching `--show-empty`.
+
+Findings while verifying:
+
+- **An empty block legitimately changes the cost numbers.** Mining one
+  transaction-free block lowers the EIP-1559 base fee, so `net_usd` may move
+  (and gas wei did: 648,196,556,074,030 → 648,183,842,828,380). The honest
+  unchanged-state invariant is therefore **exact `simulated_profit`
+  equality** (no state moved ⇒ the trade pays the same), with cost differences
+  expected — the first version of the test asserted net equality and was
+  wrong about the chain, not about the code.
+- **Fork tests must fail via `bail!`, not `assert!`**: a panicking assert
+  unwinds past `evm_revert` and leaves the fork skewed for the next test
+  (observed: the leftover skew drained the vault's USDC and the next run's
+  skew tx reverted). `tests/freshness_pass.rs` is written bail-style
+  throughout; the older fork tests keep the latent flaw.
+
+Verification (fresh Anvil Base fork at 53377305, clean redeploy; foundry
+1.8.7):
+
+- `cargo test --lib` — **94 tests** (new `freshness_merge_is_all_or_nothing`
+  covering Replaced/Gone/Inconclusive, all-Gone as a valid empty verdict, and
+  reason joining); clippy `-D warnings` and fmt clean.
+- New `tests/freshness_pass.rs` (ignored): 4 finalists at block 53377309 →
+  one empty block mined → all four Applied at 53377310 with identical
+  simulated profits, `block` fields naming the new pin, and both Skipped
+  branches (in-scan same-head, and post-refresh head) verified. Passed.
+- Regression, unchanged forks: `fork_opportunity` with `RYO_FORK_EXECUTE=1`
+  still pays **exactly** the simulated profit (`6713490651707550` WETH wei);
+  `fork_simcache` and all four `pinned_block` tests (including the
+  every-number-one-block invariant) green; `local_math` differential green.
+
 ---
 
 ## 2. Repository layout
@@ -1112,7 +1174,13 @@ against the live endpoint was not exercised (the mock test covers it).
   notes, and opportunities, plus §0h per-phase milliseconds (`core_ms`,
   `gas_ms`, `probe_ms`, `refine_ms`, `simulate_ms`) and §0i `sims_cached`;
   `watch --json` emits them under `timingsMs`/`simsCached` and the metrics
-  line logs running averages.
+  line logs running averages. §0m adds `fresh_ms` (`timingsMs.fresh`,
+  `avg_fresh_ms`).
+- §0m freshness pass: when pass 1 finds opportunities and the head has moved,
+  `Scanner::freshness_pass` re-pins, re-reads core/gas/USD context, re-quotes
+  and re-simulates only the finalists, and replaces the report set
+  all-or-nothing (any inconclusive finalist keeps the pass-1 numbers and the
+  original pin). `--no-freshness` disables it on `scan`/`watch`.
 
 ### `src/main.rs` (CLI)
 
@@ -1670,12 +1738,11 @@ for you.
 ## 11. Next move (one line)
 
 #1 (local constant-product math, §0j), #2 (one pinned block per scan plus
-simulate-what-you-propose, §0k) and the fail-closed cost reads (§0l — the L1
+simulate-what-you-propose, §0k), the fail-closed cost reads (§0l — the L1
 fee upper bound is read per candidate at its real tx size and can no longer
-default to zero) are finished and verified against real Base.
-Next in value order: a **freshness pass** (re-quote and re-simulate only the
-finalists at a newly resolved pin, to win back the ~200 ms of pending state
-that pinning gave up); then cache only
+default to zero) and the freshness pass (§0m — finalists re-priced at a new
+pin, all-or-nothing) are finished and verified against real Base.
+Next in value order: cache only
 profit-related reverts in the failed-sim cache and separate the `RyoCore` and
 adapter error namespaces, which currently both claim `ZeroAddress()`. Then CI,
 because every behavioural proof above is `#[ignore]`d and needs a live fork.

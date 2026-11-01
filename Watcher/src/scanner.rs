@@ -163,6 +163,9 @@ pub struct ScanReport {
     pub probe_ms: u64,
     pub refine_ms: u64,
     pub simulate_ms: u64,
+    /// Wall time of the freshness pass; zero when it never ran (no
+    /// opportunities, or the head did not move).
+    pub fresh_ms: u64,
 }
 
 /// What woke the scan, not what it reads.
@@ -282,6 +285,61 @@ impl FailedSimCache {
         }
         self.losses.insert(key, inputs);
     }
+}
+
+/// One refreshed finalist's outcome in the freshness pass.
+#[derive(Debug)]
+enum Refresh<T> {
+    /// Re-quoted and re-simulated at the new pin, still profitable.
+    Replaced(T),
+    /// The new state truthfully says the trade no longer pays — a definitive
+    /// simulation verdict or a sub-threshold net. A legitimate removal, not
+    /// a failure.
+    Gone,
+    /// The refresh could not complete (a leg could not be re-quoted, a feed
+    /// disappeared, the simulation could not be re-run). Nothing is known, so
+    /// the whole pass must be treated as inconclusive.
+    Inconclusive(String),
+}
+
+/// All-or-nothing merge for the freshness pass. One inconclusive finalist
+/// voids the entire refresh: a report where only some numbers moved would
+/// stitch two blocks together, exactly the lie §0k removed. Conclusive
+/// outcomes replace the set wholesale, dropping `Gone` entries.
+fn merge_refreshed<T: Clone>(outcomes: &[Refresh<T>]) -> Result<Vec<T>, String> {
+    let mut fresh = Vec::with_capacity(outcomes.len());
+    let mut inconclusive: Vec<&str> = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            Refresh::Replaced(value) => fresh.push(value.clone()),
+            Refresh::Gone => {}
+            Refresh::Inconclusive(reason) => inconclusive.push(reason.as_str()),
+        }
+    }
+    if inconclusive.is_empty() {
+        Ok(fresh)
+    } else {
+        Err(inconclusive.join("; "))
+    }
+}
+
+/// Outcome of the freshness pass for one scan.
+#[derive(Debug)]
+pub enum Fresh {
+    /// The head never moved since the first pin: the pass-1 numbers are
+    /// already the freshest consistent snapshot, and no work was done.
+    Skipped(String),
+    /// The refresh could not complete (or the fresh state rejects trading
+    /// outright). The pass-1 opportunities are kept untouched — they still
+    /// describe the block the report originally named.
+    Failed(String),
+    /// Every finalist was re-quoted and re-simulated at `pin`; these
+    /// opportunities replace the pass-1 set entirely, possibly with fewer
+    /// entries (a finalist the fresh state truthfully rejects is gone).
+    Applied {
+        pin: chain::Pin,
+        opportunities: Vec<Opportunity>,
+    },
 }
 
 pub struct Scanner {
@@ -651,7 +709,7 @@ impl Scanner {
     ) -> Result<ScanReport> {
         // One block for the whole scan. Every read below, and the contract's
         // own simulation, use this pinned state; nothing re-reads "latest".
-        let pin = match chain::Pin::resolve_latest(&self.provider).await {
+        let mut pin = match chain::Pin::resolve_latest(&self.provider).await {
             Ok(pin) => pin,
             Err(err) => {
                 // A failed pin is "unknown", not "no opportunity": say so.
@@ -770,6 +828,46 @@ impl Scanner {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // Freshness pass. Pinning (§0k) bought internal consistency at the
+        // price of one block of staleness; this recovers it for exactly the
+        // reported finalists: re-pin, re-quote and re-simulate *only* them
+        // at one new pinned block. The common case pays nothing — no
+        // opportunities, or a head that has not moved, and it never mixes
+        // blocks: the final set is either every finalist at the new pin or
+        // the untouched pass-1 set.
+        if self.settings.freshness && !report.opportunities.is_empty() {
+            let started = Instant::now();
+            let first_pin = pin;
+            let before = std::mem::take(&mut report.opportunities);
+            match self.freshness_pass(first_pin, &before).await {
+                Fresh::Skipped(reason) => {
+                    report.opportunities = before;
+                    report.notes.push(reason);
+                }
+                Fresh::Failed(reason) => {
+                    report.opportunities = before;
+                    report.notes.push(format!(
+                        "{reason}; opportunities still describe block {}",
+                        first_pin.number
+                    ));
+                }
+                Fresh::Applied {
+                    pin: fresh_pin,
+                    opportunities,
+                } => {
+                    pin = fresh_pin;
+                    report.block = fresh_pin.number;
+                    report.pin_hash = fresh_pin.hash;
+                    report.opportunities = opportunities;
+                    report.notes.push(format!(
+                        "freshness pass: finalists re-priced at block {}",
+                        fresh_pin.number
+                    ));
+                }
+            }
+            report.fresh_ms += elapsed_millis(started);
+        }
+
         // Freshness, made visible instead of silently mixed into the numbers.
         // Everything above describes one pinned block; this says how far the
         // chain moved while the scan worked. A failed read here must not
@@ -810,6 +908,131 @@ impl Scanner {
             }
         }
         Ok(report)
+    }
+
+    /// The second, small pass: re-resolve a pin and re-quote + re-simulate
+    /// only the given finalists at that fresh block. Reads its own core
+    /// state too, so a core paused (or gas spiked) between the blocks voids
+    /// the refresh instead of reporting a stale "yes" as if it were new.
+    pub async fn freshness_pass(&self, first: chain::Pin, opportunities: &[Opportunity]) -> Fresh {
+        let pin = match chain::Pin::resolve_latest(&self.provider).await {
+            Ok(pin) => pin,
+            Err(err) => return Fresh::Failed(format!("could not re-pin: {err}")),
+        };
+        if pin.number == first.number {
+            return Fresh::Skipped(format!(
+                "head unchanged at block {}; opportunities are already fresh",
+                pin.number
+            ));
+        }
+        let block_id = pin.id();
+
+        let core = match self.load_core_state(pin).await {
+            Ok(core) => core,
+            Err(err) => return Fresh::Failed(format!("fresh core state unreadable: {err}")),
+        };
+        if core.paused {
+            return Fresh::Failed("core is paused at the fresh block".to_string());
+        }
+        let (gas_snapshot, eth_usd) = match self.gas_context(pin).await {
+            Ok(context) => context,
+            Err(err) => return Fresh::Failed(format!("fresh gas context failed: {err}")),
+        };
+        if eth_usd <= 0.0 {
+            return Fresh::Failed("ETH/USD unavailable at the fresh block".to_string());
+        }
+        if let Some(note) =
+            gas_ceiling_note(&self.settings, core.max_gas_price, gas_snapshot.gas_price)
+        {
+            return Fresh::Failed(note);
+        }
+        let asset_prices = self.asset_usd_prices(eth_usd, pin).await;
+        let cp = self.cp_pools(block_id).await;
+
+        // One job per finalist; identical legs dedupe inside quote_jobs, so
+        // a handful of two-hop routes costs one multicall round per leg.
+        let routes: Vec<Route> = opportunities
+            .iter()
+            .map(|opportunity| opportunity.route.clone())
+            .collect();
+        let jobs: Vec<(usize, U256)> = opportunities
+            .iter()
+            .enumerate()
+            .map(|(index, opportunity)| (index, opportunity.amount))
+            .collect();
+        let (quotes, failed) = self.quote_jobs(&routes, &jobs, block_id, &cp).await;
+        if failed > 0 {
+            return Fresh::Failed(format!(
+                "{failed} leg quotes could not be re-priced at block {}",
+                pin.number
+            ));
+        }
+
+        let mut outcomes = Vec::with_capacity(opportunities.len());
+        for (opportunity, quote) in opportunities.iter().zip(quotes) {
+            let Some(quotes) = quote else {
+                outcomes.push(Refresh::Inconclusive(format!(
+                    "{} route could not be re-quoted",
+                    opportunity.asset_symbol
+                )));
+                continue;
+            };
+            let Some(asset_usd) = asset_prices.get(&opportunity.asset).copied() else {
+                outcomes.push(Refresh::Inconclusive(format!(
+                    "{} lost its USD feed",
+                    opportunity.asset_symbol
+                )));
+                continue;
+            };
+            let decimals = self
+                .registry
+                .token(opportunity.asset)
+                .map(|token| token.decimals)
+                .unwrap_or(18);
+            // Simulate-what-you-propose holds here too: simulate_route
+            // rebuilds the floors from *these* fresh quotes and simulates
+            // exactly the steps it returns as calldata.
+            let (refreshed, definitive_loss) = simulate_route(
+                &self.provider,
+                &self.manifest,
+                &self.settings,
+                &opportunity.asset_symbol,
+                opportunity.asset,
+                decimals,
+                &opportunity.route,
+                opportunity.amount,
+                &quotes,
+                &gas_snapshot,
+                eth_usd,
+                asset_usd,
+                block_id,
+                opportunity.preconfirmed,
+            )
+            .await;
+            outcomes.push(match refreshed {
+                Some(refreshed) => Refresh::Replaced(refreshed),
+                None if definitive_loss => Refresh::Gone,
+                None => Refresh::Inconclusive(format!(
+                    "{} could not be re-simulated",
+                    opportunity.asset_symbol
+                )),
+            });
+        }
+
+        match merge_refreshed(&outcomes) {
+            Ok(mut refreshed) => {
+                refreshed.sort_by(|a, b| {
+                    b.net_usd
+                        .partial_cmp(&a.net_usd)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                Fresh::Applied {
+                    pin,
+                    opportunities: refreshed,
+                }
+            }
+            Err(reason) => Fresh::Failed(reason),
+        }
     }
 
     /// Read `paused`, `maxGasPrice`, and every asset cap in one Multicall3
@@ -2155,6 +2378,38 @@ mod tests {
         assert!(!head_requires_rescan(Some(100), 101));
         assert!(head_requires_rescan(Some(100), 102));
         assert!(head_requires_rescan(Some(100), 99));
+    }
+
+    #[test]
+    fn freshness_merge_is_all_or_nothing() {
+        // Conclusive outcomes replace wholesale; Gone entries drop out.
+        let outcomes = [
+            Refresh::Replaced("a"),
+            Refresh::Gone,
+            Refresh::Replaced("c"),
+        ];
+        assert_eq!(merge_refreshed(&outcomes).unwrap(), vec!["a", "c"]);
+
+        // All Gone is still a conclusive answer: the fresh state truthfully
+        // rejected every finalist.
+        let outcomes: [Refresh<u8>; 2] = [Refresh::Gone, Refresh::Gone];
+        assert!(merge_refreshed(&outcomes).unwrap().is_empty());
+
+        // One inconclusive finalist voids the whole pass — a partially
+        // refreshed list would mix two blocks in one report.
+        let outcomes: [Refresh<&str>; 2] = [
+            Refresh::Replaced("a"),
+            Refresh::Inconclusive("quote failed".to_string()),
+        ];
+        let err = merge_refreshed(&outcomes).unwrap_err();
+        assert_eq!(err, "quote failed");
+
+        // Multiple reasons join for the report note.
+        let outcomes: [Refresh<u8>; 2] = [
+            Refresh::Inconclusive("one".to_string()),
+            Refresh::Inconclusive("two".to_string()),
+        ];
+        assert_eq!(merge_refreshed(&outcomes).unwrap_err(), "one; two");
     }
 
     #[test]
