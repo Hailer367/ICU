@@ -1,6 +1,6 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-11-01 (end-to-end campaign; see §0n)
+Last updated: 2026-11-01 (live 30-minute websocket run audited against chain history; see §0o)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -725,6 +725,116 @@ against the fork.
 prices honestly, fails closed, and never overstates what it found. What still
 stands between this and "live" is not watcher logic: there is no submission
 path, no mainnet deployment, and no CI running any of the above on push.
+
+---
+
+### 0o. Live 30-minute run on the real websocket, audited against chain history (2026-11-01)
+
+`watch --source both` was left running against real Base (live websocket for
+triggers, live HTTP for reads) for 42m40s — the intended 30 minutes overran for
+a reason recorded below — covering blocks **53382446..53383726** with full
+logging, and its output was then checked against the same window's history
+pulled from the chain itself.
+
+**Ground truth first, independently.** `history --from-block .. --to-block ..
+--chunk 10` (the watcher's own decoder) downloaded **1,500 swaps** across 773 of
+those blocks; a separate Python screen over the same records reproduced the
+per-venue counts exactly (572 univ3:100, 256 aero:volatile, 255 univ3:500, 163
+slipstream:100, 149 univ3:3000, 55 slipstream:1, 36 univ2, 13 aero:stable,
+1 slipstream:10), which validates the screen as well as the download.
+
+**What the watcher did with it:**
+
+- 4,337 trigger lines → **1,512 distinct (tx, pool)** against 1,500 real swaps:
+  it saw essentially every event once, and the `pendingLogs`/`logs` pair arrived
+  2,172 / 2,165 times — the two feeds are balanced, so dedupe is not dropping
+  one of them.
+- **Zero swaps of $500 or more went untriggered** (0 of 112). The other 1,388
+  were below the dust floor and were correctly skipped *with a note saying so*.
+- Reaction timing over 2,094 joinable events: a pre-confirmation log is seen a
+  median of **1.24 s before the block it belongs to is mined** (min 1.79 s);
+  a mined log 0.16 s after. On a 2 s chain that is the whole point of the
+  `pending-logs` source, now measured on mainnet rather than asserted.
+- 1 WebSocket connection, 0 reconnects, 0 failed reads, `head_drift` 0 in every
+  one of the 1,222 batch reports.
+- 807 scan attempts, **all refused** with `failed to decode core.paused`, and 0
+  opportunities. That is the correct live behaviour: `RyoCore` is not deployed
+  on Base mainnet, so there is no cap, no `paused` flag and nothing to simulate.
+  `validate` says the same thing in one line: *"core at 0x… has no bytecode"*.
+  The watcher never invented work, never traded against a contract that is not
+  there, and said out loud why it was idle.
+
+**Would it have been right about the market?** The window's cross-venue gaps,
+computed from `sqrtPriceX96` where both sides are concentrated (so exact, not
+trade-average): **median 3.1 bps, max 18.6 bps** over 175 blocks. The scan needs
+roughly 90 bps gross (50 bps profit buffer + 2 × 20 bps per-leg slippage), so
+"nothing" is the arithmetically correct answer.
+
+To make that a proof rather than an estimate, the two most interesting blocks
+were replayed through the real scanner: fork Base mainnet *at that block*, deploy
+a core into the fork, run the same binary, and also ask it for the round trip on
+the pair the screen flagged.
+
+| Block | Screen said | Scanner (same block) | Watcher's own round trip at $2,000 |
+|---|---|---|---|
+| 53382472 | 114 bps (widest, trade-average) | 264 routes, 1,584 quotes, 0 simulations, 0 opportunities | −0.61 % one way, −1.67 % the other |
+| 53382600 | 18.6 bps (widest *exact* gap) | 264 routes, 1,584 quotes, 0 simulations, 0 opportunities | −0.18 % one way, −0.56 % the other |
+
+The screen's 114 bps was an artefact — a large swap's *average* execution price
+on one venue compared against another venue's *marginal* price. The scanner,
+which quotes at real sizes, prices both directions as losses. And at 53382600 the
+widest exact gap in the whole window, 18.6 bps, sits on top of two pools whose
+fees alone cost about 31 bps for the round trip (30 bps + 1 bps): the gap is not
+free money, it is smaller than the toll. In both
+cases the watcher's "nothing here" is the true answer, obtained by a different
+route than the one that would have been used to catch it.
+
+Other live mainnet features exercised in the same sitting: `gas` (base fee
+0.005 gwei, `L1 upper bound 2614967593 wei` for a 736-byte tx,
+ETH/USD $2,265.33, 450k gas = **$0.0061** — execution on Base is nearly free, so
+the binding constraint is the profit buffer, not cost), `quote` (two-leg round
+trips priced as −0.62 % and −0.045 %), `routes` (132 USDC cycles), `decode`, and
+`watch --json` (**12 of 12 stdout lines parseable**, zero log lines mixed in).
+
+Three defects surfaced, all fixed:
+
+- **Logs were painted with ANSI escapes even when redirected to a file** — a
+  regression introduced by §0n's stderr writer, because choosing the writer by
+  hand switches off the subscriber's TTY auto-detection. The 42-minute live log
+  contains thousands of escape sequences; `with_ansi(stderr().is_terminal())`
+  fixes it and the rebuilt binary writes **zero** escapes to a file. `grep` and
+  log shippers depend on this.
+- **SIGTERM was not handled.** Only `ctrl_c()` (SIGINT) reached the graceful
+  path, and a supervisor (systemd, Docker, Kubernetes) sends SIGTERM — so a
+  routine restart would have killed the process by default action with no
+  metrics summary and no clean socket close. Both signals now take the same
+  path; verified live: `shutting down on SIGTERM metrics=events=91 ...` then
+  `Pubsub service request channel closed`.
+- **`--metrics-every` could silently stop reporting.** It fired on
+  `events.is_multiple_of(every)`, but events arrive in bundled batches, so a
+  batch that strides the boundary is never a multiple again: 42 minutes at
+  `--metrics-every 300` produced **2** summaries instead of ~13. Replaced by a
+  pure `metrics_deadline` that advances past every multiple the batch jumped
+  over, with two unit tests on the `ryo-watch` binary target (the reason:
+  `cargo test --lib` does not run them; `cargo test` does).
+
+Operational trap, worth keeping: launching as `setsid nohup script &` makes the
+shell **ignore SIGINT for the whole subtree**, so `timeout -s INT 1800` logged
+its 124 "timed out" status while the watcher kept running for another 12 minutes.
+Either stop with SIGTERM (now handled) or use `timeout --kill-after`. This is why
+the recorded window is 42m40s, not 30m.
+
+Also recorded so nobody re-learns it: a free-tier Alchemy key rejects
+`eth_getLogs` beyond a **10-block range**; `history` auto-splits ranges when
+that happens, and `--chunk 10` avoids the retries entirely (1,281 blocks in
+about 40 s).
+
+Tests now: **95 lib + 2 bin**, `clippy --all-targets -D warnings` and
+`fmt --check` clean. The credential used for the live run stayed in a
+`chmod 600` temp file, is redacted by the watcher's own log line
+(`url=wss://base-mainnet.g.alchemy.com/<redacted>`), appears nowhere in the repo
+and never entered a process command line for the replay forks (those used the
+public endpoint).
 
 ---
 
@@ -1840,10 +1950,13 @@ for you.
 simulate-what-you-propose, §0k), the fail-closed cost reads (§0l — the L1
 fee upper bound is read per candidate at its real tx size and can no longer
 default to zero), the freshness pass (§0m — finalists re-priced at a new
-pin, all-or-nothing) and the end-to-end campaign (§0n — every venue executed
+pin, all-or-nothing), the end-to-end campaign (§0n — every venue executed
 on chain with `realized_gain == simulated_profit`, plus three fixes: stderr log
-writer, `effective_cap`, `skipped` metric) are finished and verified against
-real Base.
+writer, `effective_cap`, `skipped` metric) and the live 42-minute websocket run
+audited against the same window's chain history (§0o — 1,500 real swaps, every
+$500+ event triggered, gaps of 3-19 bps versus a 90 bps bar, and three more
+fixes: log colour escapes, SIGTERM shutdown, `--metrics-every`) are finished and
+verified against real Base.
 Next in value order: cache only
 profit-related reverts in the failed-sim cache and separate the `RyoCore` and
 adapter error namespaces, which currently both claim `ZeroAddress()`. Then CI,

@@ -250,6 +250,11 @@ async fn main() {
         // which otherwise get INFO lines spliced into the JSON stream as soon
         // as an opportunity is found.
         .with_writer(std::io::stderr)
+        // Choosing the writer by hand switches off the subscriber's automatic
+        // TTY detection, which would otherwise paint ANSI escapes into every
+        // redirected log file and break `grep` and log shippers. Colour only
+        // when stderr really is a terminal.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_target(false)
         .init();
 
@@ -820,6 +825,36 @@ impl WatchMetrics {
     }
 }
 
+/// Next event count at which the metrics summary is printed. A bundled batch
+/// can stride several multiples of `every` at once, and testing
+/// `events % every == 0` instead would then postpone the report indefinitely —
+/// on a busy chain that means an operator watches nothing for a long time.
+fn metrics_deadline(events: usize, every: usize, current: usize) -> usize {
+    if every == 0 || events < current {
+        return current;
+    }
+    current + every * (1 + (events - current) / every)
+}
+
+/// Resolves when SIGTERM arrives. Without a registered listener (registration
+/// failure, or a non-Unix build) it never resolves, which leaves Ctrl-C as the
+/// only graceful path instead of making the loop busy-wait.
+#[cfg(unix)]
+async fn wait_terminate(listener: &mut Option<tokio::signal::unix::Signal>) {
+    match listener.as_mut() {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_terminate(listener: &mut Option<()>) {
+    let _ = listener;
+    std::future::pending::<()>().await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn watch_command(
     settings: &Settings,
@@ -859,11 +894,33 @@ async fn watch_command(
 
     let mut events = 0usize;
     let mut metrics = WatchMetrics::default();
+    let mut next_metrics = metrics_every.max(1);
     const MAX_BATCH: usize = 32;
+    // SIGTERM is what a supervisor sends (systemd, Docker, Kubernetes). With no
+    // handler the process dies by default action and skips the summary and the
+    // clean socket close that Ctrl-C performs, so a restart looks like a crash.
+    // Registered once, outside the loop: a listener dropped between iterations
+    // would reset the disposition and could swallow a signal.
+    #[cfg(unix)]
+    let mut terminate = match tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    ) {
+        Ok(signal) => Some(signal),
+        Err(err) => {
+            warn!(%err, "failed to install the SIGTERM handler; only Ctrl-C shuts down cleanly");
+            None
+        }
+    };
+    #[cfg(not(unix))]
+    let mut terminate: Option<()> = None;
     loop {
         let trigger = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!(metrics = %metrics.summary(), "shutting down");
+                return Ok(());
+            }
+            _ = wait_terminate(&mut terminate) => {
+                info!(metrics = %metrics.summary(), "shutting down on SIGTERM");
                 return Ok(());
             }
             trigger = stream.next() => trigger?,
@@ -949,8 +1006,9 @@ async fn watch_command(
                 "scan complete (no opportunity)"
             );
         }
-        if metrics_every > 0 && events.is_multiple_of(metrics_every) {
+        if metrics_every > 0 && events >= next_metrics {
             info!(metrics = %metrics.summary(), "watch metrics");
+            next_metrics = metrics_deadline(events, metrics_every, next_metrics);
         }
         if let Some(max) = max_events
             && events >= max
@@ -1175,4 +1233,31 @@ fn token_decimals(symbol: &str) -> u8 {
 
 fn raw_to_f64(value: U256) -> f64 {
     value.to_string().parse().unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::metrics_deadline;
+
+    #[test]
+    fn metrics_report_fires_on_every_threshold() {
+        // Landing exactly on a boundary advances by one interval.
+        assert_eq!(metrics_deadline(300, 300, 300), 600);
+        assert_eq!(metrics_deadline(600, 300, 600), 900);
+        // Below the boundary the deadline is untouched, so no early report.
+        assert_eq!(metrics_deadline(299, 300, 300), 300);
+    }
+
+    #[test]
+    fn a_bundled_batch_cannot_postpone_the_report() {
+        // 1.000 events arriving at once strides three 300-boundaries. The old
+        // `events % every == 0` test printed nothing here, and would keep
+        // printing nothing until an event count happened to land exactly on a
+        // multiple — which a busy chain does not guarantee.
+        assert_eq!(metrics_deadline(1_000, 300, 300), 1_200);
+        // Still strictly ahead of what has been seen: no reprint storm.
+        assert!(metrics_deadline(1_000, 300, 300) > 1_000);
+        // Disabled reporting never schedules a deadline.
+        assert_eq!(metrics_deadline(1_000, 0, usize::MAX), usize::MAX);
+    }
 }

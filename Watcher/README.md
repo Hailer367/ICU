@@ -233,6 +233,20 @@ Anvil's gas price sits near 1 gwei, so fork runs need `--max-gas-price-gwei 3`.
 A cold fork scan is slow because Anvil fetches missing state from the upstream
 RPC on demand; repeat runs are sub-second.
 
+## Running it for long stretches
+
+`watch` handles both Ctrl-C (SIGINT) and SIGTERM: either one prints the metrics
+summary and closes the socket cleanly, so it can be supervised by systemd, Docker
+or Kubernetes without a restart looking like a crash. Logs go to **stderr** and
+are uncoloured whenever stderr is not a terminal, so a redirected or shipped log
+stays greppable; with `--json`, stdout carries only JSON. `--metrics-every N`
+prints at every N events even when they arrive inside one bundled batch.
+
+One operational trap, learned the hard way: starting the watcher from a script
+that is itself detached (`setsid nohup script &`) makes the shell ignore SIGINT
+for the whole subtree, so `timeout -s INT` will report a timeout while the
+watcher keeps running. Stop it with SIGTERM, or use `timeout --kill-after`.
+
 ## Safety notes
 
 - No private key, API key, or seed phrase is read by this crate.
