@@ -64,6 +64,14 @@ pub mod pool {
     alloy::sol! {
         function token0() external view returns (address);
         function token1() external view returns (address);
+        // Declared as uint256 to keep the return words in the same 32-byte ABI
+        // slots the pool emits (uint112/uint32 are left-padded on the wire, so
+        // the decoded values are identical). Return types never affect the
+        // selector, and this avoids a lossy uint112 conversion at the call site.
+        function getReserves()
+            external
+            view
+            returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast);
     }
 }
 
@@ -201,6 +209,9 @@ pub mod aerodrome_factory {
             external
             view
             returns (address pool);
+        // Per-pool swap fee in basis points of 10_000 (e.g. 30 = 0.30%).
+        // Governance-controlled, so it is read fresh alongside reserves.
+        function getFee(address pool, bool stable) external view returns (uint256);
     }
 }
 

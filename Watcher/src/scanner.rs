@@ -17,6 +17,7 @@ use futures_util::{StreamExt, stream};
 use tracing::{debug, info, warn};
 
 use crate::abi::ryo;
+use crate::amm::{ConstantProductPool, Curve, ten_pow};
 use crate::chain::{self, ChainProvider};
 use crate::config::{Manifest, Settings, base};
 use crate::events::Trigger;
@@ -500,7 +501,12 @@ impl Scanner {
         }
 
         let quotes = self
-            .quote_jobs(std::slice::from_ref(route), &[(0usize, amount)], block_id)
+            .quote_jobs(
+                std::slice::from_ref(route),
+                &[(0usize, amount)],
+                block_id,
+                &HashMap::new(),
+            )
             .await;
         let Some(Some(quotes)) = quotes.into_iter().next() else {
             bail!("could not quote route");
@@ -630,6 +636,11 @@ impl Scanner {
             }
         }
 
+        // One round-trip fetches every constant-product pool's reserves so the
+        // probe/refine below can price those legs locally instead of via the
+        // router. Shared across assets (same pinned block).
+        let cp = self.cp_pools(block_id).await;
+
         // Assets are independent after the shared context is resolved, so
         // scan them concurrently. `buffered` (not `buffer_unordered`) keeps
         // completion order equal to `self.assets` order, so note ordering in
@@ -640,6 +651,7 @@ impl Scanner {
         let gas_ref = &gas_snapshot;
         let prices_ref = &asset_prices;
         let affected_ref = &affected_set;
+        let cp_ref = &cp;
         let asset_reports =
             stream::iter(self.assets.iter().copied().map(move |asset| async move {
                 let result = self
@@ -652,6 +664,7 @@ impl Scanner {
                         affected_ref,
                         block,
                         block_id,
+                        cp_ref,
                     )
                     .await;
                 (asset, result)
@@ -744,6 +757,112 @@ impl Scanner {
         })
     }
 
+    /// Read every constant-product pool's live reserves (and, for Aerodrome,
+    /// its governance fee) in **one** Multicall3 round-trip, and build the
+    /// local-quote inputs keyed by pool index. Concentrated venues are omitted
+    /// and stay on-chain. A pool whose reserve (or fee) read fails is simply
+    /// left out, so its legs fall back to the remote quoter — local math is a
+    /// pure accelerator and never removes a candidate.
+    async fn cp_pools(&self, block: BlockId) -> HashMap<usize, ConstantProductPool> {
+        use crate::abi::{aerodrome_factory, pool};
+        use alloy::sol_types::SolCall;
+
+        let mut out = HashMap::new();
+        // (pool_index, curve, reserve_call_idx, fee_call_idx)
+        let mut layout: Vec<(usize, Curve, usize, Option<usize>)> = Vec::new();
+        let mut calls: Vec<(Address, alloy::primitives::Bytes)> = Vec::new();
+        for (index, cp_pool) in self.registry.pools.iter().enumerate() {
+            let curve = match cp_pool.venue {
+                Venue::UniV2 => Curve::UniV2,
+                Venue::Aerodrome { stable } => {
+                    if stable {
+                        Curve::AerodromeStable
+                    } else {
+                        Curve::AerodromeVolatile
+                    }
+                }
+                Venue::UniV3 { .. } | Venue::Slipstream { .. } => continue,
+            };
+            let reserve_idx = calls.len();
+            calls.push((
+                cp_pool.address,
+                pool::getReservesCall {}.abi_encode().into(),
+            ));
+            let fee_idx = match curve {
+                Curve::UniV2 => None,
+                Curve::AerodromeVolatile | Curve::AerodromeStable => {
+                    let stable = matches!(curve, Curve::AerodromeStable);
+                    let idx = calls.len();
+                    calls.push((
+                        base::AERODROME_FACTORY,
+                        aerodrome_factory::getFeeCall {
+                            pool: cp_pool.address,
+                            stable,
+                        }
+                        .abi_encode()
+                        .into(),
+                    ));
+                    Some(idx)
+                }
+            };
+            layout.push((index, curve, reserve_idx, fee_idx));
+        }
+        if calls.is_empty() {
+            return out;
+        }
+
+        let results = chain::multicall_raw(&self.provider, &calls, block).await;
+        let decode_reserve = |data: &alloy::primitives::Bytes| -> Option<(U256, U256)> {
+            let r = pool::getReservesCall::abi_decode_returns(data).ok()?;
+            Some((r.reserve0, r.reserve1))
+        };
+        for (index, curve, reserve_idx, fee_idx) in layout {
+            let cp_pool = &self.registry.pools[index];
+            let Some((reserve0, reserve1)) = results
+                .get(reserve_idx)
+                .and_then(|value| value.as_ref().ok())
+                .and_then(decode_reserve)
+            else {
+                continue;
+            };
+            let fee_bps = match curve {
+                Curve::UniV2 => 0,
+                Curve::AerodromeVolatile | Curve::AerodromeStable => {
+                    match fee_idx
+                        .and_then(|idx| results.get(idx))
+                        .and_then(|value| value.as_ref().ok())
+                        .and_then(|data| aerodrome_factory::getFeeCall::abi_decode_returns(data).ok())
+                    {
+                        Some(fee) => fee.try_into().unwrap_or(u32::MAX),
+                        // Unknown fee -> do not price locally; remote quoter wins.
+                        None => continue,
+                    }
+                }
+            };
+            let Some(decimals0) = self.registry.token(cp_pool.token0).map(|t| t.decimals) else {
+                continue;
+            };
+            let Some(decimals1) = self.registry.token(cp_pool.token1).map(|t| t.decimals) else {
+                continue;
+            };
+            out.insert(
+                index,
+                ConstantProductPool {
+                    address: cp_pool.address,
+                    curve,
+                    token0: cp_pool.token0,
+                    token1: cp_pool.token1,
+                    reserve0,
+                    reserve1,
+                    fee_bps,
+                    decimals0: ten_pow(decimals0),
+                    decimals1: ten_pow(decimals1),
+                },
+            );
+        }
+        out
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn scan_asset(
         &self,
@@ -755,6 +874,7 @@ impl Scanner {
         affected: &Option<HashSet<usize>>,
         block: ScanBlock,
         block_id: BlockId,
+        cp: &HashMap<usize, ConstantProductPool>,
     ) -> Result<AssetReport> {
         let mut report = AssetReport::default();
         let symbol = self
@@ -854,7 +974,9 @@ impl Scanner {
                 amounts.push(*amount);
             }
         }
-        let results = self.quote_jobs(&all_routes, &jobs, block_id).await;
+        let results = self
+            .quote_jobs(&all_routes, &jobs, block_id, cp)
+            .await;
         report.quotes += count_quotes(&results);
         update_best_from_jobs(&mut best, &best_keys, &amounts, &results);
         report.probe_ms += elapsed_millis(probe_started);
@@ -904,7 +1026,7 @@ impl Scanner {
         }
         if !refine_jobs.is_empty() {
             let quotes = self
-                .quote_jobs(&refined_routes, &refine_jobs, block_id)
+                .quote_jobs(&refined_routes, &refine_jobs, block_id, cp)
                 .await;
             report.quotes += count_quotes(&quotes);
             update_best_from_jobs(&mut best, &refine_keys, &refine_amounts, &quotes);
@@ -1046,11 +1168,28 @@ impl Scanner {
     /// Returns one entry per job, parallel to `jobs`: `Some([in, out_leg1, ...])`
     /// on a fully quoted route, `None` if any leg failed or the route did not
     /// complete every step.
+    /// Quote many independent (route, starting amount) jobs in a single
+    /// leg-walking pass.
+    ///
+    /// Each job is `(route_index, amount_in)` where `route_index` addresses
+    /// `routes`. Legs are walked one round at a time across *all* jobs
+    /// simultaneously. Constant-product legs (Uniswap V2, Aerodrome) priced
+    /// from `cp` are computed **locally** at zero RPC cost; only concentrated
+    /// legs (UniV3 / Slipstream) are batched into one multicall per round. A
+    /// constant-product pool absent from `cp` (or a dust input it refuses)
+    /// falls back to the on-chain quoter, so local math never changes the
+    /// answer — it only removes round-trips. Identical `(target, calldata)`
+    /// remote pairs collapse to one call.
+    ///
+    /// Returns one entry per job, parallel to `jobs`: `Some([in, out_leg1, ...])`
+    /// on a fully quoted route, `None` if any leg failed or the route did not
+    /// complete every step.
     async fn quote_jobs(
         &self,
         routes: &[Route],
         jobs: &[(usize, U256)],
         block: BlockId,
+        cp: &HashMap<usize, ConstantProductPool>,
     ) -> Vec<Option<Vec<U256>>> {
         let mut quotes: Vec<Option<Vec<U256>>> = jobs
             .iter()
@@ -1075,15 +1214,30 @@ impl Scanner {
             let mut request_for_job: Vec<Option<usize>> = vec![None; jobs.len()];
             let mut job_indices = Vec::new();
             for (job_index, (route_index, _)) in jobs.iter().enumerate() {
-                let Some(Some(current)) = quotes.get(job_index) else {
-                    continue;
+                // Copy the leg's running input and step *before* touching
+                // `quotes` mutably, so the local branch can push in place.
+                let input = match quotes.get(job_index) {
+                    Some(Some(current)) => current.last().copied(),
+                    _ => None,
                 };
-                let Some(input) = current.last().copied() else {
-                    continue;
-                };
+                let Some(input) = input else { continue };
                 let Some(step) = routes[*route_index].steps.get(leg) else {
                     continue;
                 };
+
+                // Local constant-product leg: exact closed form, no RPC.
+                if let Some(pool) = cp.get(&step.pool_index) {
+                    match pool.amount_out(step.token_in, input) {
+                        Some(out) => {
+                            if let Some(Some(current)) = quotes.get_mut(job_index) {
+                                current.push(out);
+                            }
+                        }
+                        None => quotes[job_index] = None,
+                    }
+                    continue;
+                }
+
                 match QuoteRequest::new(&self.manifest, step, input) {
                     Ok(request) => {
                         let key = (request.target, request.data.clone());
@@ -1105,7 +1259,7 @@ impl Scanner {
                 }
             }
             if requests.is_empty() {
-                break;
+                continue;
             }
             let results = venues::quote_batch(&self.provider, &requests, block).await;
             for job_index in job_indices {

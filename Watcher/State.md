@@ -516,6 +516,67 @@ Verification (all on 2026-10-31):
   "failed to decode core.paused" and reports no opportunity — the fail-closed
   read path behaves correctly against a real address holding no code.
 
+### 0j. Local constant-product quote math (#1) — IN PROGRESS
+
+Speed work started this session (2026-11-01). Environment now has Foundry
+1.8.7 installed (`~/.config/.foundry/bin`), and an Anvil Base fork was
+redeployed with `Deploy.s.sol` so the watcher runs end-to-end locally.
+
+Baseline (warm fork, `scan`): ~0.52 s, with the `probe` phase ~480 ms = ~92% of
+the scan. That phase is on-chain `eth_call` quoting through Multicall3, so the
+whole optimization targets it.
+
+Goal of #1: price the constant-product legs (Uniswap V2, Aerodrome classic)
+locally instead of via a router round-trip. Concentrated venues (UniV3,
+Slipstream) and the Aerodrome stable curve's on-chain path are left remote.
+
+Implemented and verified so far:
+
+- New `src/amm.rs`: a `ConstantProductPool` with three exact curves —
+  `UniV2`, `AerodromeVolatile` (fee-subtracted-then `x*y`), and
+  `AerodromeStable` (`x^3*y + y^3*x` Newton `_get_y`, a faithful port of the
+  Aerodrome `Pool.sol`, including the fixed-order invariant and the same
+  truncation). Fees/reserves were reverse-checked against live Base and matched
+  the contract source: V2 keeps 997/1000; Aerodrome `factory.getFee` returns
+  30 bps (volatile) and 5 bps (stable).
+- 5 offline ground-truth unit tests in `amm.rs` (assert local output equals
+  recorded on-chain values) — all pass; lib suite now **77 tests**, clippy and
+  fmt clean.
+- Wired into the scanner: `abi.rs` gained `pool.getReserves` and
+  `aerodrome_factory.getFee`; `Scanner::cp_pools` reads every constant-product
+  pool's reserves (+ Aerodrome fee) in **one** Multicall3 per scan; `quote_jobs`
+  prices a leg locally when its pool is in that map and otherwise falls back to
+  the remote quoter (fail-open, so local math can never drop a candidate).
+  `plan` passes an empty map (stays remote).
+- `tests/fork_opportunity.rs` with `RYO_FORK_EXECUTE=1` on the wired build
+  still executes and pays **exactly** the simulated profit
+  (`8373837482213898` wei WETH, byte-for-byte) — the substitution did not
+  change any outcome.
+- `tests/local_math.rs` (ignored; `RYO_LIVE_RPC`) pinned a block, pulled each
+  pool's live reserves/fee/decimals, and diffed local math vs the live routers
+  over 1 wei → ~$300k USDC and up to 150 WETH, both directions:
+  **51 exact matches, 0 mismatches**.
+
+STILL NOT DONE — this is a work-in-progress checkpoint, not a finished feature:
+
+- `tests/local_math.rs` is mid-rewrite to compare against the scanner's *own*
+  remote function (`venues::quote_step`) instead of a hand-written router call,
+  for a tighter proof. The rewritten version has **not yet been compiled or
+  run**; the committed file may be the pre-rewrite router-based variant.
+- Latency: on a *full* `scan` the probe time is essentially unchanged (~480 ms)
+  because 9 of 12 pools are concentrated and still go on-chain; only 3
+  constant-product legs go local. The real win is expected only when a V2 or
+  Aerodrome pool *triggers* a scan (all its routes gain a free leg) — that
+  targeted case has **not been measured yet**.
+- Reserves are re-read per scan via the multicall; the originally-imagined
+  *incremental* update from arriving Swap events (avoid even that one read) is
+  NOT implemented. No feature toggle exists to force the old all-remote path.
+- `tests/fork_simcache.rs` still fails on a totally quiet fork
+  (`simulations=0` ⇒ precondition `first.simulations > 0` unmet). Unrelated to
+  #1 but still needs a deterministic skew so it exercises the cache.
+- Coverage is only the 3 constant-product pools; concentrated-venue local math
+  is explicitly out of scope for now.
+
 ---
 
 ## 1. Goal and hard constraints
