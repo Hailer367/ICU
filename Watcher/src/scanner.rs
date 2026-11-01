@@ -1248,16 +1248,11 @@ impl Scanner {
 
         let manifest_cap = self.manifest.cap(&symbol).unwrap_or(U256::ZERO);
         let core_cap = core.caps.get(&asset).copied().unwrap_or(U256::ZERO);
-        let cap = match (manifest_cap.is_zero(), core_cap.is_zero()) {
-            (true, true) => {
-                report
-                    .notes
-                    .push(format!("{symbol} cap is zero; asset is not tradable"));
-                return Ok(report);
-            }
-            (true, false) => core_cap,
-            (false, true) => manifest_cap,
-            (false, false) => manifest_cap.min(core_cap),
+        let Some(cap) = effective_cap(manifest_cap, core_cap) else {
+            report.notes.push(format!(
+                "{symbol} cap is zero (manifest {manifest_cap}, core {core_cap}); asset is not tradable"
+            ));
+            return Ok(report);
         };
 
         // Gate before quoting: if gas is already too expensive, none of the
@@ -1890,6 +1885,19 @@ fn effective_min_swap_usd(configured: f64) -> f64 {
     configured.max(ABSOLUTE_MIN_SWAP_USD)
 }
 
+/// Tradable ceiling for an asset: `min(manifest cap, core cap)` — and **zero
+/// on either side disables the asset**. On-chain `maxTradeSize == 0` is the
+/// owner's "not tradable" switch (any `execute` reverts), not "unset"; the
+/// manifest cap works the same way. Falling back to the other cap would
+/// spend a full scan on trades the contract is guaranteed to reject.
+/// `None` means: do not scan this asset.
+fn effective_cap(manifest_cap: U256, core_cap: U256) -> Option<U256> {
+    if manifest_cap.is_zero() || core_cap.is_zero() {
+        return None;
+    }
+    Some(manifest_cap.min(core_cap))
+}
+
 /// Everything a trigger batch decides, with no I/O: whether a scan is due,
 /// which pools the batch collectively affects, which block state to quote,
 /// which trigger keys may be marked seen after a successful scan, and the
@@ -2378,6 +2386,20 @@ mod tests {
         assert!(!head_requires_rescan(Some(100), 101));
         assert!(head_requires_rescan(Some(100), 102));
         assert!(head_requires_rescan(Some(100), 99));
+    }
+
+    #[test]
+    fn either_zero_cap_disables_the_asset() {
+        let big = U256::from(8_000_000_000u64);
+        let small = U256::from(5_000_000u64);
+        assert_eq!(effective_cap(big, small), Some(small));
+        assert_eq!(effective_cap(small, big), Some(small));
+        // The contract-side disable must survive a generous manifest, and
+        // vice versa — this was the bug: a zero used to fall back to the
+        // other cap and keep scanning a not-tradable asset.
+        assert_eq!(effective_cap(big, U256::ZERO), None);
+        assert_eq!(effective_cap(U256::ZERO, big), None);
+        assert_eq!(effective_cap(U256::ZERO, U256::ZERO), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-11-01 (freshness pass; see §0m)
+Last updated: 2026-11-01 (end-to-end campaign; see §0n)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -626,6 +626,105 @@ STILL OPEN for #1 (all optional, none blocking):
 - The differential and both fork tests need a live Anvil Base fork and are
   `#[ignore]`d. There is no CI, so nothing here runs on push — see §6.
 
+---
+
+### 0n. End-to-end campaign — every feature exercised on a real Base fork (2026-11-01)
+
+Goal: before any talk of going live, run the whole watcher against manufactured
+opportunity situations, log what it said, check whether it was right, and fix
+whatever was not. Setup: an Anvil fork of Base mainnet over a private upstream
+RPC, `RyoCore` redeployed into it (`deployments/8453.anvil.json` regenerated),
+then skew → `scan --json` → execute the calldata the scanner proposed on chain
+→ compare the recipient's real balance delta against the scanner's
+`simulatedProfit`. That last comparison is the only honest test of the stack: it
+proves the quotes, the local AMM math, the gas model, the gates and the adapter
+calldata all describe the *same* trade.
+
+What was exercised, all on chain:
+
+- **Every venue family, both asset directions**: Uniswap V3 (500/3000),
+  Slipstream, Uniswap V2, Aerodrome volatile and Aerodrome stable, including
+  one route priced end-to-end by local math on both legs. Each produced a
+  finalist, each finalist's calldata was executed, and
+  `realized_gain == simulated_profit` byte-for-byte on every one (e.g. the
+  `aerodrome:volatile > univ2` route realised `127339409904744644` wei exactly
+  as predicted).
+- **Triggers and the live loop**: WS subscriptions against the real stream,
+  `pendingLogs` arriving ~1.25 s ahead of `logs`, burst coalescing, and a
+  forced mid-run disconnect through a relay that drops the socket on a timer —
+  which proved backoff → resubscribe → `Trigger::Reconnect` → full rescan.
+- **Gates and failure paths**: `min_net_profit_usd`, `max_gas_price_gwei`,
+  dust floor, zero caps, unpriced legs, `head_drift`, re-org voiding, and the
+  failed-sim cache on an unchanged chain (scan #2 `sims_cached>0`, fewer
+  simulations, no lost opportunity).
+- **Live-mode safety**: `--mode live` was run against the fork with a signer
+  configured and sent **nothing** — operator nonce and recipient balances were
+  identical before and after 66 manufactured opportunities. The watcher still
+  cannot submit; that remains by design.
+- **CLI surface**: `keys`, `routes`, `reserve`, `scan`, `gas`, `watch`,
+  `--json`, `--no-freshness`, all read back from the logs.
+
+Three real defects found and fixed:
+
+- **`--json` was not machine-readable.** `INFO`-level opportunity lines went to
+  the same stream as the JSON payload, so `scan --json | jq` failed. The tracing
+  subscriber now writes to **stderr** (`main.rs`); stdout is pure. This is a
+  correctness bug for anything piping the watcher, not cosmetics.
+- **A core-side cap of zero fell back to the manifest cap.** On chain
+  `maxTradeSize == 0` means "this asset is disabled". `scanner::effective_cap`
+  now returns `None` when *either* side is zero and notes the asset as not
+  tradable; `either_zero_cap_disables_the_asset` pins it. Before this, a
+  disabled asset could still be scanned at the manifest size.
+- **No-op batches inflated the metrics.** A scan that resolved a head but found
+  nothing still counted toward `scans` and its average latency. There is now a
+  separate `skipped` counter, so `avg=` means "a scan that did work".
+
+Findings worth remembering:
+
+- Anvil **crashed on the 6th consecutive `evm_snapshot`** and `evm_revert`
+  **consumes** the snapshot it restores (the second revert returns `false`).
+  Fork tests must take one snapshot per run and stop stacking them.
+- Several older fork tests assert with `assert!` *inside* the scenario function,
+  so a failure unwinds past `evm_revert` and leaves the fork skewed for the next
+  run — which then fails for an unrelated reason. `tests/freshness_pass.rs` is
+  written with `bail!` to avoid this; the older files still have the flaw.
+- The vault's USDC balance is **66.8k**, not the 81.7k figure quoted earlier in
+  this file; skews are sized against the real number.
+- `unpriced 1` on an Aerodrome **stable** pool is not a bug: its quoter
+  `Panic(17)`s at probe sizes beyond the thin reserve, and the scanner reports
+  the leg as unpriced rather than guessing.
+- Empty blocks legitimately move `net_usd` because the EIP-1559 base fee drops;
+  the invariant a freshness test can assert is **`simulated_profit` equality**,
+  not `net_usd` equality.
+
+Final integrated run: `events=135 scans=5 skipped=3 failed=0 routes=300
+quotes=2500 simulations=66 opportunities=66`, and the executed finalist
+(`aerodrome:volatile > univ2`, both legs priced by local math) realised
+`127339409904744644` wei — exactly its own `simulated_profit`.
+
+Speed, measured on the fork. Warm (state already cached by the node), a
+trigger-targeted scan over ~44 routes: `avg_scan_ms=50`, `probe 41 ms`,
+`simulate 43 ms`, `gas 0 ms`, `fresh 0 ms` — i.e. one pinned block's worth of
+work fits comfortably inside Base's ~2 s block time, and `pendingLogs` buys a
+further ~1.25 s. A warm *full* scan (all 12 pools, ~500 quotes) is ~0.3 s. The
+freshness pass re-prices finalists in ~138 ms. Cold (a freshly redeployed fork
+that has to fetch storage from the upstream node slot by slot) the same full
+scan reported `avg_scan_ms=19742` and `avg_probe_ms=38217` — and note that the
+phase totals can exceed the wall average because phases are batched concurrently,
+so a cold `avg_probe_ms` is an upstream-fetch number, not a watcher number. Do
+not use cold timings to judge readiness; they say nothing about this code.
+
+Zero key leakage across every log: the upstream credential lived in a
+`chmod 600` temp file, was redacted in all output, and is deleted; it never
+entered the repo, the manifest, git config or any commit. All suites green
+after the fixes: `cargo test --lib` **95 tests**, `cargo clippy --all-targets
+-- -D warnings`, `cargo fmt --check`, and every `#[ignore]`d fork suite re-run
+against the fork.
+
+**Verdict**: the watching half is behaviourally ready — it pins one block,
+prices honestly, fails closed, and never overstates what it found. What still
+stands between this and "live" is not watcher logic: there is no submission
+path, no mainnet deployment, and no CI running any of the above on push.
 
 ---
 
@@ -1740,8 +1839,11 @@ for you.
 #1 (local constant-product math, §0j), #2 (one pinned block per scan plus
 simulate-what-you-propose, §0k), the fail-closed cost reads (§0l — the L1
 fee upper bound is read per candidate at its real tx size and can no longer
-default to zero) and the freshness pass (§0m — finalists re-priced at a new
-pin, all-or-nothing) are finished and verified against real Base.
+default to zero), the freshness pass (§0m — finalists re-priced at a new
+pin, all-or-nothing) and the end-to-end campaign (§0n — every venue executed
+on chain with `realized_gain == simulated_profit`, plus three fixes: stderr log
+writer, `effective_cap`, `skipped` metric) are finished and verified against
+real Base.
 Next in value order: cache only
 profit-related reverts in the failed-sim cache and separate the `RyoCore` and
 adapter error namespaces, which currently both claim `ZeroAddress()`. Then CI,

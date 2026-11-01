@@ -246,6 +246,10 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // Logs belong on stderr: stdout must stay pure for `--json` consumers,
+        // which otherwise get INFO lines spliced into the JSON stream as soon
+        // as an opportunity is found.
+        .with_writer(std::io::stderr)
         .with_target(false)
         .init();
 
@@ -752,6 +756,7 @@ struct WatchMetrics {
     events: usize,
     scans: usize,
     failed_scans: usize,
+    skipped: usize,
     routes: usize,
     quotes: usize,
     simulations: usize,
@@ -768,6 +773,13 @@ struct WatchMetrics {
 
 impl WatchMetrics {
     fn record(&mut self, report: &ScanReport, millis: u128) {
+        // A batch that needed no scan (dust-only, head ticks, all-duplicates)
+        // returns the default report: block 0 with nothing found. Counting it
+        // as a scan would inflate the count and dilute every phase average.
+        if report.block == 0 && report.opportunities.is_empty() {
+            self.skipped += 1;
+            return;
+        }
         self.scans += 1;
         self.scan_millis += millis;
         self.routes += report.routes_considered;
@@ -787,9 +799,10 @@ impl WatchMetrics {
         let scans = self.scans.max(1) as u128;
         let avg = |total: u128| (total / scans) as u64;
         format!(
-            "events={} scans={} failed={} routes={} quotes={} simulations={} sims_cached={} opportunities={} avg_scan_ms={} avg_core_ms={} avg_gas_ms={} avg_probe_ms={} avg_refine_ms={} avg_simulate_ms={} avg_fresh_ms={}",
+            "events={} scans={} skipped={} failed={} routes={} quotes={} simulations={} sims_cached={} opportunities={} avg_scan_ms={} avg_core_ms={} avg_gas_ms={} avg_probe_ms={} avg_refine_ms={} avg_simulate_ms={} avg_fresh_ms={}",
             self.events,
             self.scans,
+            self.skipped,
             self.failed_scans,
             self.routes,
             self.quotes,

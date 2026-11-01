@@ -325,11 +325,14 @@ async fn finalists_are_repriced_at_a_fresh_pin() {
     let node: Value = raw(&provider, "anvil_nodeInfo", serde_json::json!([]))
         .await
         .expect("anvil_nodeInfo failed; this test needs a local Anvil fork, not a real node");
-    assert_eq!(
-        node["forkConfig"]["forkUrl"].as_str(),
-        Some("https://mainnet.base.org"),
-        "expected a Base fork"
+    assert!(
+        node["forkConfig"].is_object(),
+        "expected an Anvil fork (forkConfig missing from nodeInfo)"
     );
+    let chain_id = chain::chain_id(&provider)
+        .await
+        .expect("eth_chainId failed");
+    assert_eq!(chain_id, 8453, "expected a Base fork, got chain {chain_id}");
 
     let snapshot: String = raw(&provider, "evm_snapshot", serde_json::json!([]))
         .await

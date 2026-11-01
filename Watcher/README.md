@@ -57,6 +57,7 @@ src/errors.rs    revert decoding (RyoCore, adapters, OZ; routers/Balancer are no
 src/history.rs   historical Swap dataset for replay
 src/main.rs      CLI
 tests/           mock-WebSocket test, local-vs-onchain differential, ignored Anvil fork tests
+                 (opportunity, failed-sim cache, freshness pass)
 examples/        capture_pin.rs — regenerates the ground-truth tables pinned in src/amm.rs
 deployments/     machine-readable manifests written by ryo/script/Deploy.s.sol
 ```
@@ -107,6 +108,11 @@ The script writes the manifest in the exact shape this crate expects
 | `decode 0x...` | Decodes revert data |
 
 `--pools` uses the indices printed by `routes` / `validate`.
+
+With `--json`, **stdout is the JSON payload and nothing else**: logs, metrics and
+opportunity lines all go to stderr, so `scan --json | jq` never has to strip a
+prefix. Anything that consumes the watcher programmatically should rely on that
+separation.
 
 Route specs use `venue[:param]` labels, comma separated, starting and ending at
 `--asset`:
@@ -195,6 +201,15 @@ RYO_FORK_RPC=http://127.0.0.1:8545 RYO_FORK_EXECUTE=1 \
 The test snapshots the fork and reverts afterwards, so it can be re-run without
 a reset. It is `#[ignore]`d because it needs a live fork.
 
+Two more ignored fork suites cover the rest of the loop:
+`tests/fork_simcache.rs` (a second full scan on an unchanged chain must reuse the
+failed-simulation cache without hiding a winner) and
+`tests/freshness_pass.rs` (finalists re-quoted and re-simulated at a newly
+resolved pin; under automine it proves both the same-head skip and the
+applied-at-the-next-block path). Anvil **consumes** a snapshot on revert — a
+second `evm_revert` of the same id returns `false` — and stacking snapshots
+crashed the node after the sixth one, so take exactly one per run.
+
 ## Local Anvil playbook
 
 ```bash
@@ -221,6 +236,9 @@ RPC on demand; repeat runs are sub-second.
 ## Safety notes
 
 - No private key, API key, or seed phrase is read by this crate.
-- `--mode live` is accepted but only logs; sending is not implemented.
+- `--mode live` is accepted but only logs; sending is not implemented. This was
+  verified on a fork — including with a funded dev `PRIVATE_KEY` present in the
+  environment: across 66 manufactured opportunities the operator nonce and the
+  recipient balances never moved.
 - No priority-fee bidding: fees come from the node's default estimate.
 - Treat `deployments/*.json` as data. Only the address fields matter at runtime.
