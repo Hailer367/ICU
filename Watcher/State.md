@@ -516,7 +516,7 @@ Verification (all on 2026-10-31):
   "failed to decode core.paused" and reports no opportunity — the fail-closed
   read path behaves correctly against a real address holding no code.
 
-### 0j. Local constant-product quote math (#1) — IN PROGRESS
+### 0j. Local constant-product quote math (#1) — DONE 2026-11-01
 
 Speed work started this session (2026-11-01). Environment now has Foundry
 1.8.7 installed (`~/.config/.foundry/bin`), and an Anvil Base fork was
@@ -557,25 +557,75 @@ Implemented and verified so far:
   over 1 wei → ~$300k USDC and up to 150 WETH, both directions:
   **51 exact matches, 0 mismatches**.
 
-STILL NOT DONE — this is a work-in-progress checkpoint, not a finished feature:
+FINISHED this session (2026-11-01, later). Three gaps closed:
 
-- `tests/local_math.rs` is mid-rewrite to compare against the scanner's *own*
-  remote function (`venues::quote_step`) instead of a hand-written router call,
-  for a tighter proof. The rewritten version has **not yet been compiled or
-  run**; the committed file may be the pre-rewrite router-based variant.
-- Latency: on a *full* `scan` the probe time is essentially unchanged (~480 ms)
-  because 9 of 12 pools are concentrated and still go on-chain; only 3
-  constant-product legs go local. The real win is expected only when a V2 or
-  Aerodrome pool *triggers* a scan (all its routes gain a free leg) — that
-  targeted case has **not been measured yet**.
-- Reserves are re-read per scan via the multicall; the originally-imagined
-  *incremental* update from arriving Swap events (avoid even that one read) is
-  NOT implemented. No feature toggle exists to force the old all-remote path.
-- `tests/fork_simcache.rs` still fails on a totally quiet fork
-  (`simulations=0` ⇒ precondition `first.simulations > 0` unmet). Unrelated to
-  #1 but still needs a deterministic skew so it exercises the cache.
-- Coverage is only the 3 constant-product pools; concentrated-venue local math
-  is explicitly out of scope for now.
+- **The fail-open claim above was not true in code.** `quote_jobs` priced a
+  local leg and, when `ConstantProductPool::amount_out` returned `None`, set
+  `quotes[job] = None` and `continue`d — the candidate was deleted, never
+  quoted. The leg decision is now extracted into `scanner::price_leg` returning
+  `LegPrice::{Local, Onchain}`, and *every* non-`Local` outcome (pool absent
+  from this scan's reserves, dust rounding to zero, a non-converging stable
+  iteration, an empty side, an implausible fee) falls through to the on-chain
+  quoter. `scanner::tests::local_refusals_fall_back_to_the_quoter` pins the
+  table per curve so the deletion cannot come back.
+- **`amm.rs` arithmetic is now fully checked.** Important correction: `U256`'s
+  `+`, `-` and `*` are implemented via `wrapping_*` (ruint
+  `impl_bin_op!`), so they **silently wrap in every profile** — they do *not*
+  panic; only `/` and `%` trap, on a zero divisor. An unchecked intermediate
+  therefore returns a plausible-looking wrong price that can rank, gate and get
+  logged, which is worse than a crash. All of `stable_k`/`_f`/`_d`/`_get_y`,
+  `subtract_fee_bps` and the stable output scaling are `checked_*`, with `None`
+  meaning "quote it on chain", never "this route is unprofitable". The
+  truncation *order* is unchanged, so the pinned on-chain values still match.
+  `raw_u256_operators_wrap_silently` pins the premise;
+  `absurd_inputs_decline_or_stay_bounded` sweeps ~750 adversarial
+  (curve, reserve, decimals, fee, amount) combinations asserting no panic and
+  no quote exceeding the destination side.
+- **`ten_pow` returns `Option`** (it used to panic for `decimals > 77`), and
+  `cp_pools` now refuses to price a pool locally on an unrepresentable
+  `decimals` or an out-of-scale `getFee`. The old code did
+  `fee.try_into().unwrap_or(u32::MAX)`, feeding a 4-billion-bps "fee" into local
+  math.
+
+Verification now, all green:
+
+- `cargo test --lib` — **88 tests** (was 77): the pinned tables plus the new
+  `amm` and `scanner` guards. `cargo clippy --all-targets` and
+  `cargo fmt --check` clean.
+- `amm.rs` pins **33** on-chain outputs across 3 pools in **both** directions
+  at Base block 53371076 — this is what closes the earlier hole where only
+  USDC→WETH (`token_in_is_token0 == false`) was ever exercised offline, even
+  though the stable branch swaps `reserve_a`/`reserve_b` *and* picks
+  `decimals_out` by that same flag.
+- `examples/capture_pin.rs` regenerates every pinned number from the fork and
+  prints its block. Re-run it rather than editing a constant by hand; that is
+  the difference between evidence and a restatement of the formula.
+- `tests/local_math.rs` (ignored; local fork by default, `RYO_LIVE_RPC` for
+  live) now diffs against **`venues::quote_step` itself** — the scanner's real
+  encode → `eth_call` → decode → reject-zero path — not a hand-written router
+  call: **78 exact matches, 12 consistent declines, 0 mismatches** across 3
+  pools, both directions. `(None, Ok(_))` and `(Some(_), Err(_))` both `bail`,
+  so a local refusal that the chain would have paid for fails the test.
+- `tests/fork_opportunity.rs` (ignored): still finds 3 opportunities after a
+  real skew, best `net_usd=12.96`. `tests/fork_simcache.rs` (ignored): now
+  manufactures its own skew, so it no longer needs a busy fork — scan #1
+  `simulations=4 cached=0`, scan #2 `simulations=3 cached=1`, opportunities
+  preserved at 3.
+
+STILL OPEN for #1 (all optional, none blocking):
+
+- Latency of the *targeted* case (one V2/Aerodrome pool triggers a scan, so all
+  its routes gain a free leg) has still not been measured. A full `scan` stays
+  ~0.52 s because 9 of 12 pools are concentrated. The fallback adds round-trips
+  only for refusals, which the refine grid's `0.5×probe` floor makes rare in
+  practice.
+- Reserves are still re-read per scan (one multicall). Incremental updates from
+  arriving `Swap` events are not implemented.
+- Coverage remains the 3 constant-product pools; concentrated-venue local math is
+  out of scope.
+- The differential and both fork tests need a live Anvil Base fork and are
+  `#[ignore]`d. There is no CI, so nothing here runs on push — see §6.
+
 
 ---
 
@@ -601,6 +651,116 @@ The Alchemy Base `https://` and `wss://` endpoints were supplied and tested on
 2026-10-30 (§0g). The key is kept in the environment only; it is not stored in
 the repo or any file. HTTP/fork testing still works against public Base RPC and
 Anvil.
+
+### 0k. One pinned block per scan (#2) — DONE 2026-11-01
+
+The bug: `evaluate` resolved a block *tag* (`latest`/`pending`) and passed it to
+every read, while separately calling `eth_blockNumber` for the report. Base
+produces a block every ~2 s and a scan takes ~0.5 s, so a scan routinely quoted
+block N and simulated block N+1. A profit figure like that describes a trade
+that was possible in neither block. Three related lies came out of the same
+root: `Opportunity.block` was the *gas snapshot's* block (a cache up to 2 s
+old), the simulation used a `minAmountOut` floor of 1 on every leg while the
+proposed calldata used 0.98x floors, and the head marker `last_block` was
+written both by `newHeads` and by scans, which made any slow scan look like a
+missed block and forced a full rescan.
+
+The fix:
+
+- `chain::Pin` — number, **hash**, timestamp and base fee, resolved once at the
+  start of `evaluate` (and of `plan`, `gas`, `simulate`). Every read after it —
+  core state, constant-product reserves, leg quotes, the GasPriceOracle batch,
+  Chainlink feeds and `RyoCore.simulate` — uses `pin.id()`. `gas::snapshot` no
+  longer fetches a block of its own, so it is also one round-trip cheaper.
+- Pinned by hash, not number. Base nodes (Alchemy documents it) accept a
+  32-byte block hash for `eth_call`, and a hash cannot be re-interpreted by a
+  re-org the way a number can.
+- **`pending` cannot be pinned**: on Base it reports a hash of `0x0000…0000`
+  (measured), which is exactly why it is unsuitable — it is a moving target by
+  definition. Scans now read the newest *confirmed* block and report
+  `head_drift` (blocks produced during the scan) instead of silently mixing
+  states. `ScanBlock::Pending` survives as a *scheduling* signal only.
+- The gas cache is reused only when `snapshot.block_number == pin.number`. The
+  old time-based reuse could price a scan at block N's fees while quoting N+1.
+- **Simulate the trade that is proposed.** Floors are built first, then the
+  simulation runs those exact steps, and the same steps become the `execute`
+  calldata. Consequence, verified below: the executed transaction now pays
+  *exactly* the simulated profit, because they are the same trade.
+- Re-org guard: after the scan, re-read the header at `pin.number`; if its hash
+  differs, the report is `reorged` and the CLI prints `SCAN VOID` and suppresses
+  the opportunities. A discarded block can still answer reads, so without this
+  a re-org would produce confident numbers about nothing.
+- Failure visibility: `quote_failures` counts legs the chain could not price at
+  all, and `scan_health_note` turns any non-zero count into a report note
+  ("N of M leg quotes could not be priced; zero opportunities here does not
+  mean no opportunity existed"). Previously a re-org, a rate limit or a quoter
+  revert was indistinguishable from an empty market — it looked like the
+  watcher had looked and found nothing.
+- `evaluate` no longer writes `last_block`; `newHeads` owns that marker, which
+  is what the "no polling loop" design claimed.
+
+Field facts learned while testing (measured, not assumed):
+
+- Alchemy Base `eth_call` accepts number, tag **or block hash** for the block
+  parameter.
+- Archive depth: Alchemy treats state older than ~128 blocks as archive data.
+  A scan's pin is seconds old, so a standard node is enough.
+- After a genuine re-org on Anvil, `eth_call` at the discarded hash fails with
+  `-32001 Resource not found` rather than returning stale state — the failure
+  mode `quote_failures` exists to surface.
+- Base sequencer re-orgs are real (the sequencer can discard blocks it already
+  broadcast); they are rare, which is why the guard detects rather than assumes.
+
+Verification, all green:
+
+- `cargo test --lib` — **92 tests**, clippy and fmt clean. New: `Pin` id/drift/
+  supersession units, `scan_health_note`, plus a `!report.reorged` no-false-
+  positive assertion in the fork test.
+- `tests/pinned_block.rs` (new, 4 ignored tests):
+  * `pinned_reads_are_immutable_while_the_chain_moves` — the decisive one. Pin,
+    read the UniV3 price, move 60k USDC through that pool, read again: the
+    pinned answer is **identical** (`tick -199056`) while the current price
+    moved (`tick -199026`). It `bail`s if the skew left the price unchanged, so
+    the equality can never be vacuous.
+  * `a_reorg_of_the_pinned_block_is_detected_and_voids_the_scan` — snapshot
+    *behind* a block, mine it, revert, mine a different block at the same
+    number, then assert the guard fires. It fails loudly if no real re-org was
+    produced (`block kept the same hash … this test proves nothing`).
+  * `every_number_in_a_scan_describes_one_block` — full scan (264 routes, 1622
+    quotes, 4 opportunities after a manufactured skew): the reported block/hash
+    pair is a real block, every `Opportunity.block` equals the scan's block,
+    drift is honest, and unpriced legs are noted. It asserts the scan did work,
+    because with `Settings::default()` it had found nothing and passed vacuously.
+  * `pin_block_and_hash_describe_the_same_canonical_block` — hash form and
+    number form agree byte-for-byte.
+- Live Base (Alchemy, real mainnet state): canonicality test 10/10 across
+  successive heads; `local_math` differential against mainnet routers **77
+  exact, 13 consistent declines** on pools whose reserves had moved since the
+  fork snapshot; `gas` prints one pinned block (53373732) with real oracle and
+  feed values.
+- Fork end-to-end: `fork_opportunity` with `RYO_FORK_EXECUTE=1` now sends the
+  *simulated* trade and the recipient gains exactly `6397428454595845` WETH —
+  equal to the simulated profit, which is the first time measurement and
+  execution describe the same calldata. `fork_simcache` unchanged in behavior
+  (`simulations 4 -> 3`, `sims_cached 1`, opportunities preserved).
+- Fork-only tests now take `RYO_FORK_RPC` and call `anvil_nodeInfo` first, so
+  pointing them at a real node fails with an explanation instead of a
+  transport error (verified against live).
+
+NOT done, in order of value:
+
+- **Flashblock freshness.** Pinning trades ~200 ms of freshness for internal
+  consistency. The right recovery is a second, small pass: re-resolve a pin and
+  re-quote+re-simulate only the finalists, so each pass is consistent and the
+  final number is fresh. Not built.
+- `gas.rs` still defaults the L1 fee upper bound to **zero** when the oracle
+  read fails (`gas.rs:68-83`), which invents profit; and the tx size for it is
+  a hardcoded 2000 for every candidate.
+- Any revert (`errors.rs` `Empty`/`Unknown`) is still cached as a definitive
+  loss in the failed-sim cache with no TTL; adapter/core error namespaces still
+  collide; router/Balancer selectors are still unmapped despite the README
+  claim.
+- No CI: every behavioural test here is `#[ignore]`d and needs a live fork.
 
 ---
 
@@ -1208,8 +1368,10 @@ two-phase duplicate-trigger suppression, bounded event queue, metrics line,
 debug-level quote failures, head-gap/reorg full rescan, gas gate before
 quoting, (§0h) multi-amount quote batching, single-call core-state read,
 batched Chainlink feeds with cached decimals, concurrent gas snapshot, and
-parallel per-asset scans, and (§0i) same-endpoint WebSocket call transport,
-burst trigger coalescing, and the input-pinned failed-sim cache.
+parallel per-asset scans, (§0i) same-endpoint WebSocket call transport,
+burst trigger coalescing, and the input-pinned failed-sim cache, and (§0j)
+local constant-product pricing with a verified-on-chain differential and
+guaranteed fallback to the remote quoter.
 
 Still open:
 
@@ -1344,6 +1506,18 @@ cargo test
 cargo clippy --all-targets
 cargo fmt --all --check
 
+# #1/#2 verification (needs the Anvil fork below, or RYO_LIVE_RPC for live Base)
+cargo run --example capture_pin                      # reprint the pinned tables
+cargo test --test local_math -- --ignored --nocapture # local vs venues::quote_step
+cargo test --test pinned_block -- --ignored --nocapture --test-threads=1
+cargo test --test fork_simcache -- --ignored --nocapture
+
+# Read-only checks against live Base (no RyoCore needed; real prices)
+RYO_LIVE_RPC="$BASE_HTTP_RPC" RYO_LIVE_MANIFEST=deployments/8453.example.json \
+  cargo test --test pinned_block pin_block_and_hash -- --ignored --nocapture
+RYO_LIVE_RPC="$BASE_HTTP_RPC" RYO_LIVE_MANIFEST=deployments/8453.example.json \
+  cargo test --test local_math -- --ignored --nocapture
+
 # Public Base read-only tests
 cargo run -- gas
 cargo run -- routes --asset USDC
@@ -1426,8 +1600,16 @@ for you.
 
 ## 11. Next move (one line)
 
-Decide whether to deploy `RyoCore` to Base mainnet (real gas, owner/operator
-keys, writes `deployments/8453.json`); only then can the watcher scan against
-real mainnet state. Everything that can be verified without that deployment is
-done: live Alchemy events (use `--source pending-logs` or `both`), full scan
-loop on a deployed fork, and the 24h dataset for replay.
+#1 (local constant-product math, §0j) and #2 (one pinned block per scan plus
+simulate-what-you-propose, §0k) are finished and verified against real Base.
+Next in value order: a **freshness pass** (re-quote and re-simulate only the
+finalists at a newly resolved pin, to win back the ~200 ms of pending state
+that pinning gave up); then make the cost reads **fail closed** — the L1 fee
+upper bound still defaults to zero when the oracle read fails (`gas.rs:68-83`)
+and the tx size is a fixed 2000 for every candidate; then cache only
+profit-related reverts in the failed-sim cache and separate the `RyoCore` and
+adapter error namespaces, which currently both claim `ZeroAddress()`. Then CI,
+because every behavioural proof above is `#[ignore]`d and needs a live fork.
+Everything else that can be verified without a mainnet deployment is done: live
+Alchemy events (use `--source pending-logs` or `both`), full scan loop on a
+deployed fork, and the 24h dataset for replay.

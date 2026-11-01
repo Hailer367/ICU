@@ -23,7 +23,7 @@ use crate::config::{Manifest, Settings, base};
 use crate::events::Trigger;
 use crate::gas::{self, GasSnapshot, TradeCost};
 use crate::history;
-use crate::routes::{Registry, Route, Venue, enumerate_cycles};
+use crate::routes::{Registry, Route, RouteStep, Venue, enumerate_cycles};
 use crate::simulate::{self, SimulateError};
 use crate::venues::{self, QuoteRequest};
 
@@ -45,6 +45,38 @@ const DEDUPE_CAPACITY: usize = 2_048;
 /// trip (pool fees + profit buffer), $0.25 needs about $45 of notional. The
 /// floor applies even when `min_swap_usd` is configured lower.
 const ABSOLUTE_MIN_SWAP_USD: f64 = 45.0;
+/// Upper bound on a sane Aerodrome `getFee` answer, in basis points of 10_000.
+const AERO_FEE_MAX: U256 = U256::from_limbs([10_000u64, 0, 0, 0]);
+
+/// How one leg of a scan job gets priced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegPrice {
+    /// Priced locally from pinned reserves, at zero RPC cost.
+    Local(U256),
+    /// Local math has no answer for this leg — concentrated liquidity, a pool
+    /// absent from this scan's reserve fetch, or a genuine refusal (dust that
+    /// rounds to zero output, a non-converging stable iteration, an over-draw,
+    /// an implausible fee). Every one of these must still be quoted on-chain:
+    /// "local math is unsure" is not evidence about profitability, and
+    /// treating it as such would silently delete a payable route.
+    Onchain,
+}
+
+/// Decide how to price one leg. Pure and side-effect free so the
+/// "local refusal never drops a candidate" invariant is directly testable.
+pub fn price_leg(
+    cp: &HashMap<usize, ConstantProductPool>,
+    step: &RouteStep,
+    input: U256,
+) -> LegPrice {
+    match cp
+        .get(&step.pool_index)
+        .and_then(|pool| pool.amount_out(step.token_in, input))
+    {
+        Some(out) => LegPrice::Local(out),
+        None => LegPrice::Onchain,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Opportunity {
@@ -82,6 +114,10 @@ struct AssetReport {
     notes: Vec<String>,
     routes_considered: usize,
     quotes: usize,
+    /// Legs the chain could not price at all this scan (reverts on the quoter,
+    /// transport failures, undecodable returns). Kept apart from `quotes` so a
+    /// blinding failure is never reported as an empty market.
+    quote_failures: usize,
     simulations: usize,
     sims_cached: usize,
     opportunities: Vec<Opportunity>,
@@ -92,10 +128,28 @@ struct AssetReport {
 
 #[derive(Debug, Clone, Default)]
 pub struct ScanReport {
+    /// The single block every read and the simulation in this scan used.
     pub block: u64,
+    /// Hash of that block. Report it alongside the number so a scan can be
+    /// replayed against exactly the state that produced it: two blocks can
+    /// share a number after a re-org, never a hash.
+    pub pin_hash: Option<B256>,
+    /// Blocks the chain produced while the scan was running. Zero means the
+    /// pinned state was still head when the scan finished; a non-zero value is
+    /// still a *consistent* scan, just one whose numbers are now that many
+    /// blocks old.
+    pub head_drift: u64,
+    /// The pinned block was replaced by a re-org while the scan ran, so every
+    /// number in this report describes a block that is no longer canonical.
+    /// Callers must treat the scan as void rather than as "no opportunity".
+    pub reorged: bool,
     pub affected_pools: Vec<Address>,
     pub routes_considered: usize,
     pub quotes: usize,
+    /// See `AssetReport::quote_failures`: how much of this scan could not be
+    /// answered. Zero with zero opportunities means "nothing to find"; non-zero
+    /// means "we could not look properly".
+    pub quote_failures: usize,
     pub simulations: usize,
     /// Finalists skipped because their last simulation was a definitive loss
     /// at an unchanged market state.
@@ -111,19 +165,19 @@ pub struct ScanReport {
     pub simulate_ms: u64,
 }
 
+/// What woke the scan, not what it reads.
+///
+/// Every scan pins one concrete block for all of its reads (see `chain::Pin`),
+/// so this no longer selects a block tag: `pending` state has no hash and
+/// shifts every flashblock interval, and a scan that quotes at one moment and
+/// simulates at another reports a trade that was possible in neither. `Pending`
+/// still matters for *scheduling* — a pending trigger takes the urgent slot in
+/// the queue and widens the batch to a full scan when it cannot be attributed
+/// to a known pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanBlock {
     Latest,
     Pending,
-}
-
-impl ScanBlock {
-    fn id(self) -> BlockId {
-        match self {
-            Self::Latest => BlockId::latest(),
-            Self::Pending => BlockId::pending(),
-        }
-    }
 }
 
 struct CoreState {
@@ -306,17 +360,24 @@ impl Scanner {
 
     /// Read a gas snapshot and ETH/USD price, reusing a recent pair when the
     /// watcher is processing a burst of triggers.
-    async fn gas_context(&self) -> Result<(GasSnapshot, f64)> {
+    async fn gas_context(&self, pin: chain::Pin) -> Result<(GasSnapshot, f64)> {
         {
             let cache = self.gas_cache.lock().expect("gas cache mutex poisoned");
             if let Some(cached) = cache.as_ref()
                 && cached.at.elapsed() < GAS_CACHE_TTL
+                // Reuse only for the *same* block. The old time-based reuse
+                // could price a scan at block N's fees while everything else
+                // in that scan read block N+1.
+                && cached.snapshot.block_number == pin.number
             {
                 return Ok((cached.snapshot.clone(), cached.eth_usd));
             }
         }
-        let snapshot = gas::snapshot(&self.provider, 2_000).await?;
-        let eth_usd = gas::eth_usd_price(&self.provider, snapshot.timestamp)
+        let snapshot = gas::snapshot(&self.provider, 2_000, &pin).await?;
+        // A missing ETH/USD price must not degrade to "free gas": the scan
+        // bails on a non-positive price below. `unwrap_or(0.0)` keeps that as
+        // the single, explicit gate rather than silently passing it.
+        let eth_usd = gas::eth_usd_price(&self.provider, &pin)
             .await
             .unwrap_or(0.0);
         if eth_usd > 0.0 {
@@ -333,7 +394,7 @@ impl Scanner {
     /// Read and cache the decimals for every configured asset's USD feed.
     /// These are immutable, so one batched read per scanner replaces a
     /// per-scan round-trip inside the price fetch.
-    async fn ensure_feed_decimals(&self, feeds: &[Address]) {
+    async fn ensure_feed_decimals(&self, feeds: &[Address], block: BlockId) {
         use crate::abi::chainlink;
         use alloy::sol_types::SolCall;
 
@@ -355,7 +416,7 @@ impl Scanner {
             .iter()
             .map(|feed| (*feed, chainlink::decimalsCall {}.abi_encode().into()))
             .collect();
-        let results = chain::multicall_raw(&self.provider, &calls, BlockId::latest()).await;
+        let results = chain::multicall_raw(&self.provider, &calls, block).await;
         let mut cache = self
             .feed_decimals
             .lock()
@@ -381,11 +442,7 @@ impl Scanner {
     /// asset. Assets without a usable feed are simply absent; the scan path
     /// treats a missing price as "no usable USD feed", matching the old
     /// per-asset bail semantics.
-    async fn asset_usd_prices(
-        &self,
-        eth_usd: f64,
-        snapshot: &GasSnapshot,
-    ) -> HashMap<Address, f64> {
+    async fn asset_usd_prices(&self, eth_usd: f64, pin: chain::Pin) -> HashMap<Address, f64> {
         let mut prices = HashMap::new();
         let mut requests: Vec<(Address, u64)> = Vec::new();
         for asset in &self.assets {
@@ -406,14 +463,13 @@ impl Scanner {
             return prices;
         }
         let feeds: Vec<Address> = requests.iter().map(|(feed, _)| *feed).collect();
-        self.ensure_feed_decimals(&feeds).await;
+        self.ensure_feed_decimals(&feeds, pin.id()).await;
         let decimals = self
             .feed_decimals
             .lock()
             .expect("feed decimals mutex poisoned")
             .clone();
-        let resolved =
-            gas::feed_prices(&self.provider, &requests, snapshot.timestamp, &decimals).await;
+        let resolved = gas::feed_prices(&self.provider, &requests, &pin, &decimals).await;
         for (feed, result) in resolved {
             if let Ok(price) = result
                 && price > 0.0
@@ -470,14 +526,14 @@ impl Scanner {
 
     /// Quote and simulate one explicit route. Used by the CLI `plan` command.
     pub async fn plan(&self, route: &Route, amount: U256) -> Result<Option<Opportunity>> {
-        let block_id = BlockId::latest();
-        let core = self.load_core_state().await?;
+        let pin = chain::Pin::resolve_latest(&self.provider).await?;
+        let block_id = pin.id();
+        let core = self.load_core_state(pin).await?;
         if core.paused {
             bail!("core is paused");
         }
-        let (gas_snapshot, eth_usd) = self.gas_context().await?;
-        let asset_usd =
-            gas::asset_usd_price(&self.provider, route.asset, gas_snapshot.timestamp).await?;
+        let (gas_snapshot, eth_usd) = self.gas_context(pin).await?;
+        let asset_usd = gas::asset_usd_price(&self.provider, route.asset, &pin).await?;
         let symbol = self
             .manifest
             .token_symbol(route.asset)
@@ -500,7 +556,7 @@ impl Scanner {
             bail!(note);
         }
 
-        let quotes = self
+        let (quotes, _failed) = self
             .quote_jobs(
                 std::slice::from_ref(route),
                 &[(0usize, amount)],
@@ -593,17 +649,29 @@ impl Scanner {
         affected: Option<Vec<usize>>,
         block: ScanBlock,
     ) -> Result<ScanReport> {
-        let block_id = block.id();
+        // One block for the whole scan. Every read below, and the contract's
+        // own simulation, use this pinned state; nothing re-reads "latest".
+        let pin = match chain::Pin::resolve_latest(&self.provider).await {
+            Ok(pin) => pin,
+            Err(err) => {
+                // A failed pin is "unknown", not "no opportunity": say so.
+                warn!(error = %err, "could not pin a block; scan aborted");
+                return Err(err);
+            }
+        };
+        let block_id = pin.id();
         let head_started = Instant::now();
-        let block_number = chain::block_number(&self.provider).await?;
-        {
-            let mut last = self.last_block.lock().expect("last block mutex poisoned");
-            *last = Some(block_number);
-        }
+        let block_number = pin.number;
+        // NOTE: deliberately does *not* touch `last_block`. That marker is
+        // owned by `newHeads` alone; a scan writing its own pinned block there
+        // made every scan slower than one block look like a skipped head, which
+        // then forced a full rescan — the polling loop this design exists to
+        // avoid. Freshness is reported by `head_drift` instead.
 
-        let core = self.load_core_state().await?;
+        let core = self.load_core_state(pin).await?;
         let mut report = ScanReport {
             block: block_number,
+            pin_hash: pin.hash,
             core_ms: elapsed_millis(head_started),
             ..Default::default()
         };
@@ -613,8 +681,8 @@ impl Scanner {
         }
 
         let gas_started = Instant::now();
-        let (gas_snapshot, eth_usd) = self.gas_context().await?;
-        let asset_prices = self.asset_usd_prices(eth_usd, &gas_snapshot).await;
+        let (gas_snapshot, eth_usd) = self.gas_context(pin).await?;
+        let asset_prices = self.asset_usd_prices(eth_usd, pin).await;
         report.gas_ms += elapsed_millis(gas_started);
         if eth_usd <= 0.0 {
             report
@@ -679,6 +747,7 @@ impl Scanner {
                     report.notes.extend(asset_report.notes);
                     report.routes_considered += asset_report.routes_considered;
                     report.quotes += asset_report.quotes;
+                    report.quote_failures += asset_report.quote_failures;
                     report.simulations += asset_report.simulations;
                     report.sims_cached += asset_report.sims_cached;
                     report.probe_ms += asset_report.probe_ms;
@@ -700,6 +769,46 @@ impl Scanner {
                 .partial_cmp(&a.net_usd)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // Freshness, made visible instead of silently mixed into the numbers.
+        // Everything above describes one pinned block; this says how far the
+        // chain moved while the scan worked. A failed read here must not
+        // invalidate a scan that already completed, so drift is simply not
+        // reported in that case.
+        // Was the block we just scanned replaced while we worked? Cheaper and
+        // safer than assuming: re-read the header at our own number and check
+        // its hash. Reads can still succeed against a discarded block, so
+        // without this a re-org would produce confident numbers about nothing.
+        if pin.hash.is_some() {
+            match chain::header_hash(&self.provider, pin.number).await {
+                Ok(current) if pin.is_superseded_by(current) => {
+                    report.reorged = true;
+                    report.notes.push(format!(
+                        "block {} was re-orged during this scan (its hash is now {});                          these numbers describe a discarded block and are void",
+                        pin.number,
+                        current.map(|h| h.to_string()).unwrap_or_default()
+                    ));
+                }
+                // Cannot confirm is not the same as re-orged: say nothing here,
+                // and let the numbers stand.
+                Ok(None) => {}
+                Err(err) => debug!(error = %err, "could not re-check the pinned block"),
+                Ok(Some(_)) => {}
+            }
+        }
+
+        if let Some(note) = scan_health_note(report.quotes, report.quote_failures) {
+            report.notes.push(note);
+        }
+        if let Ok(head_now) = chain::block_number(&self.provider).await {
+            report.head_drift = pin.blocks_behind(head_now);
+            if report.head_drift > 0 {
+                report.notes.push(format!(
+                    "numbers describe block {} ({} blocks behind head {head_now})",
+                    pin.number, report.head_drift
+                ));
+            }
+        }
         Ok(report)
     }
 
@@ -711,7 +820,7 @@ impl Scanner {
     /// bails rather than trading blind. Caps are fail-open exactly as before:
     /// a cap that reverts or is missing decodes to zero, which disables that
     /// asset. All reads share one block, so the state is consistent.
-    async fn load_core_state(&self) -> Result<CoreState> {
+    async fn load_core_state(&self, pin: chain::Pin) -> Result<CoreState> {
         use alloy::sol_types::SolCall;
 
         let core = self.manifest.core;
@@ -725,7 +834,7 @@ impl Scanner {
                 ryo::maxTradeSizeCall { asset: *asset }.abi_encode().into(),
             ));
         }
-        let results = chain::multicall_raw(&self.provider, &calls, BlockId::latest()).await;
+        let results = chain::multicall_raw(&self.provider, &calls, pin.id()).await;
 
         let paused = match results.first() {
             Some(Ok(data)) => {
@@ -831,9 +940,20 @@ impl Scanner {
                     match fee_idx
                         .and_then(|idx| results.get(idx))
                         .and_then(|value| value.as_ref().ok())
-                        .and_then(|data| aerodrome_factory::getFeeCall::abi_decode_returns(data).ok())
-                    {
-                        Some(fee) => fee.try_into().unwrap_or(u32::MAX),
+                        .and_then(|data| {
+                            aerodrome_factory::getFeeCall::abi_decode_returns(data).ok()
+                        }) {
+                        // A fee above the 10_000 basis-point scale cannot be a
+                        // price, so it is not priced locally either.
+                        Some(fee) if fee <= AERO_FEE_MAX => fee.to::<u32>(),
+                        Some(fee) => {
+                            warn!(
+                                pool = %cp_pool.address,
+                                fee = %fee,
+                                "implausible Aerodrome fee; pricing this pool remotely"
+                            );
+                            continue;
+                        }
                         // Unknown fee -> do not price locally; remote quoter wins.
                         None => continue,
                     }
@@ -843,6 +963,16 @@ impl Scanner {
                 continue;
             };
             let Some(decimals1) = self.registry.token(cp_pool.token1).map(|t| t.decimals) else {
+                continue;
+            };
+            // Unrepresentable `decimals` means the registry is wrong, not that
+            // the pool is worthless; leave it to the on-chain quoter.
+            let (Some(scale0), Some(scale1)) = (ten_pow(decimals0), ten_pow(decimals1)) else {
+                warn!(
+                    pool = %cp_pool.address,
+                    decimals0, decimals1,
+                    "token decimals outside the representable range; pricing this pool remotely"
+                );
                 continue;
             };
             out.insert(
@@ -855,8 +985,8 @@ impl Scanner {
                     reserve0,
                     reserve1,
                     fee_bps,
-                    decimals0: ten_pow(decimals0),
-                    decimals1: ten_pow(decimals1),
+                    decimals0: scale0,
+                    decimals1: scale1,
                 },
             );
         }
@@ -974,9 +1104,8 @@ impl Scanner {
                 amounts.push(*amount);
             }
         }
-        let results = self
-            .quote_jobs(&all_routes, &jobs, block_id, cp)
-            .await;
+        let (results, failed) = self.quote_jobs(&all_routes, &jobs, block_id, cp).await;
+        report.quote_failures += failed;
         report.quotes += count_quotes(&results);
         update_best_from_jobs(&mut best, &best_keys, &amounts, &results);
         report.probe_ms += elapsed_millis(probe_started);
@@ -1025,9 +1154,10 @@ impl Scanner {
             }
         }
         if !refine_jobs.is_empty() {
-            let quotes = self
+            let (quotes, refine_failed) = self
                 .quote_jobs(&refined_routes, &refine_jobs, block_id, cp)
                 .await;
+            report.quote_failures += refine_failed;
             report.quotes += count_quotes(&quotes);
             update_best_from_jobs(&mut best, &refine_keys, &refine_amounts, &quotes);
         }
@@ -1167,7 +1297,8 @@ impl Scanner {
     ///
     /// Returns one entry per job, parallel to `jobs`: `Some([in, out_leg1, ...])`
     /// on a fully quoted route, `None` if any leg failed or the route did not
-    /// complete every step.
+    /// complete every step — plus how many remote legs the chain refused to
+    /// price, which is missing information rather than a verdict.
     /// Quote many independent (route, starting amount) jobs in a single
     /// leg-walking pass.
     ///
@@ -1183,14 +1314,16 @@ impl Scanner {
     ///
     /// Returns one entry per job, parallel to `jobs`: `Some([in, out_leg1, ...])`
     /// on a fully quoted route, `None` if any leg failed or the route did not
-    /// complete every step.
+    /// complete every step — plus how many remote legs the chain refused to
+    /// price, which is missing information rather than a verdict.
     async fn quote_jobs(
         &self,
         routes: &[Route],
         jobs: &[(usize, U256)],
         block: BlockId,
         cp: &HashMap<usize, ConstantProductPool>,
-    ) -> Vec<Option<Vec<U256>>> {
+    ) -> (Vec<Option<Vec<U256>>>, usize) {
+        let mut failures = 0usize;
         let mut quotes: Vec<Option<Vec<U256>>> = jobs
             .iter()
             .map(|(route_index, amount)| {
@@ -1225,15 +1358,13 @@ impl Scanner {
                     continue;
                 };
 
-                // Local constant-product leg: exact closed form, no RPC.
-                if let Some(pool) = cp.get(&step.pool_index) {
-                    match pool.amount_out(step.token_in, input) {
-                        Some(out) => {
-                            if let Some(Some(current)) = quotes.get_mut(job_index) {
-                                current.push(out);
-                            }
-                        }
-                        None => quotes[job_index] = None,
+                // Local constant-product leg. A refusal (dust input, a
+                // non-converging stable iteration, an over-draw, an implausible
+                // fee) is *not* evidence that the route is unprofitable, so it
+                // must not delete the candidate: fall through to the quoter.
+                if let LegPrice::Local(out) = price_leg(cp, step, input) {
+                    if let Some(Some(current)) = quotes.get_mut(job_index) {
+                        current.push(out);
                     }
                     continue;
                 }
@@ -1254,6 +1385,7 @@ impl Scanner {
                     }
                     Err(err) => {
                         debug!(error = %err, "failed to encode quote request");
+                        failures += 1;
                         quotes[job_index] = None;
                     }
                 }
@@ -1267,6 +1399,7 @@ impl Scanner {
                     continue;
                 };
                 let Some(result) = results.get(request_index) else {
+                    failures += 1;
                     quotes[job_index] = None;
                     continue;
                 };
@@ -1278,20 +1411,24 @@ impl Scanner {
                     }
                     Err(err) => {
                         debug!(error = %err, "quote failed");
+                        failures += 1;
                         quotes[job_index] = None;
                     }
                 }
             }
         }
 
-        quotes
-            .into_iter()
-            .zip(jobs.iter())
-            .map(|(quote, (route_index, _))| {
-                let route = &routes[*route_index];
-                quote.filter(|values| values.len() == route.steps.len() + 1)
-            })
-            .collect()
+        (
+            quotes
+                .into_iter()
+                .zip(jobs.iter())
+                .map(|(quote, (route_index, _))| {
+                    let route = &routes[*route_index];
+                    quote.filter(|values| values.len() == route.steps.len() + 1)
+                })
+                .collect(),
+            failures,
+        )
     }
 }
 
@@ -1316,10 +1453,17 @@ async fn simulate_route(
     block: BlockId,
     preconfirmed: bool,
 ) -> (Option<Opportunity>, bool) {
-    let discovery_steps = match simulate::discovery_steps(route, manifest) {
+    // Build the *real* trade first, then simulate exactly that. The old order
+    // simulated with a permissive floor of 1 on every leg while proposing
+    // 0.98x floors, so the profit reported was measured on calldata that would
+    // have been a different — and reverting — trade. Quoting, flooring and
+    // simulating all happen at the scan's single pinned block, so the floors
+    // derived from these quotes describe the state the contract sees.
+    let floors = build_floors(quotes, settings.per_leg_slippage_bps);
+    let steps = match route.to_steps(manifest, &floors) {
         Ok(steps) => steps,
         Err(err) => {
-            debug!(error = %err, "failed to build discovery steps");
+            debug!(error = %err, "failed to build route steps");
             return (None, false);
         }
     };
@@ -1329,7 +1473,7 @@ async fn simulate_route(
         manifest.core,
         asset,
         amount,
-        discovery_steps,
+        steps.clone(),
         block,
     )
     .await
@@ -1357,10 +1501,6 @@ async fn simulate_route(
         Err(_) => return (None, false),
     };
 
-    let floors = build_floors(quotes, settings.per_leg_slippage_bps);
-    let Ok(steps) = route.to_steps(manifest, &floors) else {
-        return (None, false);
-    };
     let buffer = U256::from(settings.min_profit_buffer_bps.min(9_999));
     let min_profit = profit_raw.saturating_mul(U256::from(10_000) - buffer) / U256::from(10_000);
     let call = ryo::executeCall {
@@ -1493,6 +1633,24 @@ fn head_requires_rescan(last: Option<u64>, head: u64) -> bool {
         Some(last) => head > last.saturating_add(1) || head < last,
         None => false,
     }
+}
+
+/// Distinguish "nothing to find" from "we could not look".
+///
+/// A leg the chain refuses to price used to be indistinguishable from an
+/// unprofitable route, both surfacing as zero opportunities. On a re-org, a
+/// rate limit, or a quoter revert that blindness is total and silent, so any
+/// failure is reported with its share of the work attempted.
+fn scan_health_note(quotes: usize, failures: usize) -> Option<String> {
+    if failures == 0 {
+        return None;
+    }
+    let attempted = quotes + failures;
+    Some(format!(
+        "{failures} of {attempted} leg quotes could not be priced ({:.0}%); this scan is \
+         incomplete, and zero opportunities here does not mean no opportunity existed",
+        100.0 * failures as f64 / attempted.max(1) as f64
+    ))
 }
 
 fn effective_min_swap_usd(configured: f64) -> f64 {
@@ -1744,7 +1902,17 @@ fn gas_ceiling_note(
     core_max_gas_price: U256,
     gas_price: U256,
 ) -> Option<String> {
-    let watcher_max = U256::from((settings.max_gas_price_gwei * 1e9) as u128);
+    // `f64 as u128` saturates, so a non-finite or negative setting would
+    // otherwise surface as a nonsensical "ceiling 0 wei" and silently blind
+    // every scan. Fail closed either way, but name the real cause.
+    let ceiling_gwei = settings.max_gas_price_gwei;
+    if !ceiling_gwei.is_finite() || ceiling_gwei < 0.0 {
+        return Some(format!(
+            "configured gas ceiling {ceiling_gwei} gwei is not a number of gwei; \
+             refusing to trade (set RYO_MAX_GAS_PRICE_GWEI)"
+        ));
+    }
+    let watcher_max = U256::from((ceiling_gwei * 1e9) as u128);
     if gas_price > watcher_max {
         return Some(format!(
             "gas price {gas_price} wei exceeds watcher ceiling {watcher_max} wei"
@@ -2001,6 +2169,28 @@ mod tests {
         assert_eq!(deduper.order.len(), 1);
     }
 
+    /// "Nothing to find" and "nothing could be priced" must not look alike.
+    #[test]
+    fn health_note_separates_an_empty_market_from_a_blinded_scan() {
+        assert_eq!(scan_health_note(500, 0), None);
+
+        let note = scan_health_note(0, 40).expect("all legs unpriced must be reported");
+        assert!(note.contains("40 of 40"), "{note}");
+        assert!(
+            note.contains("does not mean no opportunity existed"),
+            "the note has to say the failure is not a verdict: {note}"
+        );
+
+        // A handful of unpriced legs inside a large scan still gets reported,
+        // with the share so an operator can judge it.
+        let partial = scan_health_note(990, 10).expect("partial blindness is a note");
+        assert!(partial.contains("10 of 1000"), "{partial}");
+        assert!(partial.contains("1%"), "{partial}");
+
+        // Never a division by zero on an all-failed, zero-quote scan.
+        assert!(scan_health_note(0, 1).is_some());
+    }
+
     #[test]
     fn gas_ceiling_gate() {
         let settings = Settings::default();
@@ -2016,6 +2206,63 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    /// `f64 as u128` saturates, so a typo'd or infinite ceiling used to surface
+    /// as "ceiling 0 wei" — every scan rejected for a reason that blamed the
+    /// chain rather than the config. It still fails closed; now it says so.
+    #[test]
+    fn gas_ceiling_names_a_misconfigured_ceiling() {
+        let price = U256::from(1_000_000u64);
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            let settings = Settings {
+                max_gas_price_gwei: bad,
+                ..Settings::default()
+            };
+            let note = gas_ceiling_note(&settings, U256::ZERO, price)
+                .expect("a non-numeric ceiling must reject, not silently pass");
+            assert!(
+                note.contains("not a number of gwei") && note.contains("RYO_MAX_GAS_PRICE_GWEI"),
+                "note blames the wrong thing: {note}"
+            );
+        }
+        // A sane ceiling still passes its own price.
+        let settings = Settings {
+            max_gas_price_gwei: 0.05,
+            ..Settings::default()
+        };
+        assert!(gas_ceiling_note(&settings, U256::ZERO, U256::from(40_000_000u64)).is_none());
+    }
+
+    /// Pins the current slippage-floor behaviour, including its wart: a leg
+    /// whose quoted output is smaller than the floor rounds **up to 1**, which
+    /// switches that leg's slippage protection off. Harmless for a paper watcher
+    /// (such a route cannot clear a USD profit gate), but it is the kind of
+    /// default that must not survive into real execution unnoticed.
+    #[test]
+    fn floors_saturate_to_one_for_dust_outputs() {
+        let quotes = [
+            U256::from(1_000_000_000u64),
+            U256::from(1u8),
+            U256::from(300u64),
+        ];
+        let floors = build_floors(&quotes, 20);
+        assert_eq!(floors.len(), 2, "the starting amount is not a leg output");
+        assert_eq!(
+            floors[0],
+            U256::from(1u8),
+            "a dust output floors to 1: no real slippage protection on that leg"
+        );
+        assert_eq!(
+            floors[1],
+            U256::from(299u64),
+            "300 * 9980 / 10000 truncates"
+        );
+
+        // The floor can never exceed the quote, and never underflows.
+        for (quote, floor) in quotes.iter().skip(1).zip(&floors) {
+            assert!(floor <= quote, "{floor} > {quote}");
+        }
     }
 
     #[test]
@@ -2460,5 +2707,151 @@ mod tests {
             "unknown pool upgrades the batch to a full scan"
         );
         assert_eq!(plan.block, ScanBlock::Pending, "the pending log dominates");
+    }
+
+    fn cp_step(venue: Venue, input: U256) -> (RouteStep, U256) {
+        let step = RouteStep {
+            pool_index: 0,
+            token_in: base::USDC,
+            token_out: base::WETH,
+            venue,
+            data: venue.data(),
+        };
+        (step, input)
+    }
+
+    fn cp(
+        curve: Curve,
+        reserve0: U256,
+        reserve1: U256,
+        fee_bps: u32,
+    ) -> HashMap<usize, ConstantProductPool> {
+        let mut map = HashMap::new();
+        map.insert(
+            0,
+            ConstantProductPool {
+                address: base::WETH,
+                curve,
+                token0: base::WETH,
+                token1: base::USDC,
+                reserve0,
+                reserve1,
+                fee_bps,
+                decimals0: ten_pow(18).unwrap(),
+                decimals1: ten_pow(6).unwrap(),
+            },
+        );
+        map
+    }
+
+    /// The invariant that makes local math an optimisation rather than a
+    /// strategy change: **local math never deletes a candidate.** A refusal, a
+    /// missing pool, or an unusable fee all route to the on-chain quoter.
+    #[test]
+    fn local_refusals_fall_back_to_the_quoter() {
+        let priced = U256::from(1_000_000u64);
+
+        // A pool this scan never fetched reserves for: quote it on chain.
+        let (step, input) = cp_step(Venue::UniV2, priced);
+        assert_eq!(price_leg(&HashMap::new(), &step, input), LegPrice::Onchain);
+
+        // Empty side: no local answer, but the route is still worth quoting.
+        for curve in [
+            Curve::UniV2,
+            Curve::AerodromeVolatile,
+            Curve::AerodromeStable,
+        ] {
+            let empty = cp(curve, U256::ZERO, U256::from(10u128.pow(18)), 30);
+            assert_eq!(
+                price_leg(&empty, &step, input),
+                LegPrice::Onchain,
+                "{curve:?} with an empty side must be quoted on chain"
+            );
+        }
+
+        // Dust that rounds to a zero output: decline locally, conclude nothing
+        // about the route. (The stable curve prices dust at *some* output for
+        // these reserves, so it is exercised through its own refusal mode
+        // below rather than through rounding.)
+        for curve in [Curve::UniV2, Curve::AerodromeVolatile] {
+            let full = cp(
+                curve,
+                U256::from(10u128.pow(18)),
+                U256::from(10u128.pow(18)),
+                30,
+            );
+            assert_eq!(
+                price_leg(&full, &step, U256::from(1u8)),
+                LegPrice::Onchain,
+                "{curve:?} dust must fall back, not drop the candidate"
+            );
+        }
+
+        // An over-scale fee is not a price: every curve that consults it must
+        // hand the leg to the quoter instead of pricing garbage.
+        for curve in [Curve::AerodromeVolatile, Curve::AerodromeStable] {
+            let bogus = cp(
+                curve,
+                U256::from(10u128.pow(18)),
+                U256::from(10u128.pow(18)),
+                u32::MAX,
+            );
+            assert_eq!(
+                price_leg(&bogus, &step, input),
+                LegPrice::Onchain,
+                "{curve:?} with an implausible fee must be quoted on chain"
+            );
+            let cent = cp(
+                curve,
+                U256::from(10u128.pow(18)),
+                U256::from(10u128.pow(18)),
+                10_000,
+            );
+            assert_eq!(
+                price_leg(&cent, &step, input),
+                LegPrice::Onchain,
+                "{curve:?} at a 100% fee leaves nothing to price"
+            );
+        }
+
+        // A healthy pool with a real answer is priced locally, at zero RPC cost.
+        let healthy = cp(
+            Curve::UniV2,
+            U256::from(332_274_501_113_338_591_906u128),
+            U256::from(754_915_714_028u128),
+            0,
+        );
+        assert!(
+            matches!(
+                price_leg(&healthy, &step, U256::from(1_000_000_000u64)),
+                LegPrice::Local(_)
+            ),
+            "a normal-size input on a real pool must be priced locally"
+        );
+    }
+
+    /// A leg is only ever priced locally when the *pool being walked* is the
+    /// pool in `cp` — indexing by `pool_index` rather than by venue means a
+    /// route cannot borrow another pool's reserves.
+    #[test]
+    fn price_leg_keys_on_the_walked_pool_index() {
+        let (step, input) = cp_step(Venue::UniV2, input_amount());
+        let mut other_index = step;
+        other_index.pool_index = 7;
+        let healthy = cp(
+            Curve::UniV2,
+            U256::from(332_274_501_113_338_591_906u128),
+            U256::from(754_915_714_028u128),
+            0,
+        );
+        assert_eq!(
+            price_leg(&healthy, &other_index, input),
+            LegPrice::Onchain,
+            "pool 7 is not in this scan's reserves; must not reuse pool 0"
+        );
+    }
+
+    fn input_amount() -> U256 {
+        U256::from(1_000_000_000u64)
     }
 }

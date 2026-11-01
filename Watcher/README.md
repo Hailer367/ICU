@@ -22,22 +22,44 @@ WebSocket trigger ─► affected pools ─► quote routes touching them
 There is no "is there a trade yet?" polling loop. Fresh quotes and gas prices
 are fetched only after an event. `scan` exists for manual checks and tests.
 
+Every scan reads **one pinned block**. It resolves the newest confirmed block
+(by hash) at the start and uses that same state for reserves, quotes, the price
+feeds, the gas oracle and `RyoCore.simulate` — then simulates the *same* floors
+it proposes in the `execute` calldata. Base produces a block roughly every two
+seconds and a scan takes half a second, so without this the profit figure would
+stitch two blocks together and describe a trade that was possible in neither.
+`pending` is not used for reads: on Base it has no hash and changes every
+flashblock, so it cannot be pinned; a scan reports `head_drift` instead. If the
+pinned block turns out to have been re-orged, the scan is reported as void
+rather than as an empty market — as is any scan where legs could not be priced.
+
 ## Layout
 
 ```
 src/events.rs    raw JSON-RPC WebSocket client, subscriptions, reconnect, trigger queue
 src/routes.rs    venue/pool registry, cycle enumeration, adapter calldata, route hash
 src/venues.rs    per-venue quote encoding/decoding, Multicall3 batching
+src/amm.rs       local exact-price math for constant-product pools (checked U256 only)
 src/scanner.rs   event-driven scan: quotes → rank → refine → simulate → gates
 src/simulate.rs  RyoCore.simulate call and result decoding
 src/gas.rs       Base gas snapshot, L1 fee upper bound, ETH/USD feed
 src/chain.rs     provider helpers (eth_call, estimate_gas, ERC20 reads)
 src/config.rs    settings, manifest, Base addresses
-src/errors.rs    revert decoding (core, adapters, routers, Balancer, OZ)
+src/abi.rs       hand-written call selectors for the venues and oracles
+src/errors.rs    revert decoding (RyoCore, adapters, OZ; routers/Balancer are not mapped)
+src/history.rs   historical Swap dataset for replay
 src/main.rs      CLI
-tests/           mock-WebSocket test, ignored Anvil fork test
+tests/           mock-WebSocket test, local-vs-onchain differential, ignored Anvil fork tests
+examples/        capture_pin.rs — regenerates the ground-truth tables pinned in src/amm.rs
 deployments/     machine-readable manifests written by ryo/script/Deploy.s.sol
 ```
+
+`src/amm.rs` prices Uniswap V2 and Aerodrome classic legs from the pool's
+reserves instead of paying a router round-trip. Two rules make it safe: every
+operator is `checked_*` (`U256`'s `+ - *` wrap silently, which would return a
+plausible wrong price rather than failing), and a local refusal means *quote it
+on chain* — never *this route is unprofitable*. `tests/local_math.rs` diffs it
+against the scanner's own remote path.
 
 ## Quick start
 

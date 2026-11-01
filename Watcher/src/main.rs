@@ -497,9 +497,12 @@ async fn read_address(provider: &ChainProvider, to: Address, data: Vec<u8>) -> R
 
 async fn print_gas(settings: &Settings) -> Result<()> {
     let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
-    let snapshot = gas::snapshot(&provider, 2_000).await?;
-    let eth_usd = gas::eth_usd_price(&provider, snapshot.timestamp).await?;
-    println!("block:          {}", snapshot.block_number);
+    // Same rule as the scan path: every number printed here comes from one
+    // pinned block, so the fee market and the prices agree with each other.
+    let pin = chain::Pin::resolve_latest(&provider).await?;
+    let snapshot = gas::snapshot(&provider, 2_000, &pin).await?;
+    let eth_usd = gas::eth_usd_price(&provider, &pin).await?;
+    println!("block:          {} (pinned)", snapshot.block_number);
     println!("base fee:       {} wei", snapshot.base_fee);
     println!("priority fee:   {} wei", snapshot.priority_fee);
     println!("gas price:      {} wei", snapshot.gas_price);
@@ -508,7 +511,7 @@ async fn print_gas(settings: &Settings) -> Result<()> {
     println!("L1 upper bound: {} wei", snapshot.l1_fee_upper_bound);
     println!("ETH/USD:        ${eth_usd:.2}");
     for (symbol, asset) in [("USDC", base::USDC), ("WETH", base::WETH)] {
-        match gas::asset_usd_price(&provider, asset, snapshot.timestamp).await {
+        match gas::asset_usd_price(&provider, asset, &pin).await {
             Ok(price) => println!("{symbol}/USD:        ${price:.6}"),
             Err(err) => println!("{symbol}/USD:        unavailable ({err})"),
         }
@@ -615,19 +618,10 @@ async fn simulate_command(
     let route = parse_route(&registry, asset, route_spec)?;
     let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let steps = simulate::discovery_steps(&route, &manifest)?;
-    let now_secs = gas::latest_timestamp(&provider).await?;
+    let pin = chain::Pin::resolve_latest(&provider).await?;
     println!("core:  {}", manifest.core);
     println!("route: {}", route.venues().join(" > "));
-    match simulate::simulate(
-        &provider,
-        manifest.core,
-        asset,
-        amount,
-        steps,
-        BlockId::latest(),
-    )
-    .await
-    {
+    match simulate::simulate(&provider, manifest.core, asset, amount, steps, pin.id()).await {
         Ok(simulation) => {
             if simulation.profit <= alloy::primitives::I256::ZERO {
                 println!(
@@ -636,16 +630,21 @@ async fn simulate_command(
                 );
             } else {
                 let profit_raw: U256 = simulation.profit.try_into().unwrap_or(U256::ZERO);
-                let price = gas::asset_usd_price(&provider, asset, now_secs)
-                    .await
-                    .unwrap_or(0.0);
-                let profit_usd = gas::profit_usd(profit_raw, decimals, price);
-                println!(
-                    "profit: {} {} (~${:.4})",
-                    format_amount(profit_raw, decimals),
-                    asset_symbol,
-                    profit_usd
-                );
+                // A missing price is printed as missing. Turning it into 0.0
+                // would render a real profit as "~$0.0000".
+                match gas::asset_usd_price(&provider, asset, &pin).await {
+                    Ok(price) => println!(
+                        "profit: {} {} (~${:.4})",
+                        format_amount(profit_raw, decimals),
+                        asset_symbol,
+                        gas::profit_usd(profit_raw, decimals, price)
+                    ),
+                    Err(err) => println!(
+                        "profit: {} {} (USD unavailable: {err})",
+                        format_amount(profit_raw, decimals),
+                        asset_symbol
+                    ),
+                }
             }
         }
         Err(simulate::SimulateError::Revert { decoded, raw }) => {
@@ -972,10 +971,12 @@ fn decode_command(data: &str) -> Result<()> {
 
 fn print_report(report: &ScanReport) {
     println!(
-        "block {} | routes {} | quotes {} | simulations {} | sims cached {} | opportunities {}",
+        "block {} (drift {}) | routes {} | quotes {} | unpriced {} | simulations {} | sims cached {} | opportunities {}",
         report.block,
+        report.head_drift,
         report.routes_considered,
         report.quotes,
+        report.quote_failures,
         report.simulations,
         report.sims_cached,
         report.opportunities.len()
@@ -986,6 +987,12 @@ fn print_report(report: &ScanReport) {
     );
     for note in &report.notes {
         println!("  note: {note}");
+    }
+    // A discarded block can still answer reads, so the numbers above would be
+    // internally consistent and completely meaningless. Refuse to present them.
+    if report.reorged {
+        println!("  SCAN VOID: the pinned block was re-orged; opportunities suppressed");
+        return;
     }
     for opportunity in &report.opportunities {
         println!(
@@ -1037,9 +1044,13 @@ fn print_opportunity(opportunity: &Opportunity) {
 fn report_json(report: &ScanReport) -> serde_json::Value {
     serde_json::json!({
         "block": report.block,
+        "pinHash": report.pin_hash.map(|hash| hash.to_string()),
+        "headDrift": report.head_drift,
+        "reorged": report.reorged,
         "affectedPools": report.affected_pools.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "routesConsidered": report.routes_considered,
         "quotes": report.quotes,
+        "quoteFailures": report.quote_failures,
         "simulations": report.simulations,
         "simsCached": report.sims_cached,
         "notes": report.notes,

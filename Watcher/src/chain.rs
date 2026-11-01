@@ -1,6 +1,6 @@
 use alloy::eips::BlockId;
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::transports::{RpcError, TransportErrorKind};
@@ -207,6 +207,102 @@ pub async fn block_number(provider: &ChainProvider) -> Result<u64> {
         .context("failed to read block number")
 }
 
+/// One immutable chain state that a whole scan reads and simulates against.
+///
+/// Resolved once, up front, and then reused for *every* read in that scan:
+/// pool reserves, quotes, the contract's own simulation, gas and price feeds.
+/// A profit figure stitched together from two different blocks describes a
+/// trade that was possible in neither of them, so consistency is not a
+/// nicety — without it the number is simply not about anything that happened.
+///
+/// Pinned by **hash** where the node gives one, because a block *number* can be
+/// re-orged into different state part-way through a scan, while a hash
+/// identifies exactly the block the quotes came from. Pending state cannot be
+/// pinned at all — Base nodes return `0x0000…0000` as its hash — which is
+/// exactly why it is unsuitable: "pending" is a moving target by definition. So
+/// a scan reads the newest *confirmed* block and reports how far behind head it
+/// turned out to be, rather than silently mixing states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pin {
+    pub number: u64,
+    /// `None` only for a provider that withholds the header hash.
+    pub hash: Option<B256>,
+    pub timestamp: u64,
+    pub base_fee_per_gas: Option<u64>,
+}
+
+impl Pin {
+    /// The newest confirmed block, in one round-trip.
+    pub async fn resolve_latest(provider: &ChainProvider) -> Result<Self> {
+        let block = provider
+            .get_block_by_number(alloy::rpc::types::BlockNumberOrTag::Latest)
+            .await
+            .context("failed to read the latest block for pinning")?
+            .context("latest block not found")?;
+        Ok(Self {
+            number: block.header.number,
+            hash: Some(block.header.hash),
+            timestamp: block.header.timestamp,
+            base_fee_per_gas: block.header.base_fee_per_gas,
+        })
+    }
+
+    /// A pin from known header fields, for tests and for callers that already
+    /// fetched the block.
+    pub fn from_header(
+        number: u64,
+        hash: Option<B256>,
+        timestamp: u64,
+        base_fee: Option<u64>,
+    ) -> Self {
+        Self {
+            number,
+            hash,
+            timestamp,
+            base_fee_per_gas: base_fee,
+        }
+    }
+
+    /// The block id every read in this scan must use.
+    pub fn id(self) -> BlockId {
+        match self.hash {
+            Some(hash) => BlockId::hash(hash),
+            None => BlockId::number(self.number),
+        }
+    }
+
+    /// Has the block this pin names been replaced? Compare against the hash
+    /// the node now reports for the same *number*.
+    ///
+    /// A sequencer can discard blocks it already broadcast, which is the one
+    /// thing hash-pinning cannot survive silently: the reads would still
+    /// succeed, but against a block that is no longer canonical. `None` means
+    /// the node could not say (no header for that number) — never guess.
+    pub fn is_superseded_by(&self, current_hash: Option<B256>) -> bool {
+        match (self.hash, current_hash) {
+            (Some(pinned), Some(current)) => pinned != current,
+            _ => false,
+        }
+    }
+
+    /// How many blocks head moved while the scan ran. Zero is the hope; a
+    /// non-zero value is still a *consistent* scan, just one taken against a
+    /// state that is now this many blocks old.
+    pub fn blocks_behind(self, head: u64) -> u64 {
+        head.saturating_sub(self.number)
+    }
+}
+
+/// The hash the node currently reports for a block *number*, or `None` when it
+/// has no such block. Used to notice that a pinned block was replaced.
+pub async fn header_hash(provider: &ChainProvider, number: u64) -> Result<Option<B256>> {
+    let block = provider
+        .get_block_by_number(alloy::rpc::types::BlockNumberOrTag::Number(number))
+        .await
+        .with_context(|| format!("failed to read block {number} header"))?;
+    Ok(block.map(|block| block.header.hash))
+}
+
 pub async fn chain_id(provider: &ChainProvider) -> Result<u64> {
     provider
         .get_chain_id()
@@ -395,5 +491,53 @@ mod tests {
         );
         assert_eq!(authority("https:///path"), None);
         assert_eq!(authority("plain text"), None);
+    }
+
+    /// The whole point of the pin is that it identifies *one* block, so the
+    /// hash must be what the reads use whenever the node provides one.
+    #[test]
+    fn pin_reads_by_hash_when_the_node_gives_one() {
+        let hash = B256::repeat_byte(0x7d);
+        let pin = Pin::from_header(1234, Some(hash), 99, Some(5));
+        assert_eq!(pin.id(), BlockId::Hash(hash.into()));
+
+        // A node that withholds the hash still gets a fixed block, not a tag.
+        let unhashed = Pin::from_header(1234, None, 99, None);
+        assert_eq!(unhashed.id(), BlockId::number(1234));
+    }
+
+    /// A scan that pins block N and then sees head move must report the
+    /// distance honestly — and a head that goes *backwards* (a re-org, or a
+    /// node falling behind) must not underflow or panic.
+    /// A re-orged block keeps its number but loses its hash.
+    #[test]
+    fn pin_detects_a_superseded_block() {
+        let hash = B256::repeat_byte(0x11);
+        let pin = Pin::from_header(100, Some(hash), 10, None);
+        assert!(
+            !pin.is_superseded_by(Some(hash)),
+            "same hash is the same block"
+        );
+        assert!(
+            pin.is_superseded_by(Some(B256::repeat_byte(0x22))),
+            "a different hash at the same number is a re-org"
+        );
+        // Unknown is not evidence of a re-org, and must not be reported as one.
+        assert!(!pin.is_superseded_by(None));
+        // A number-only pin cannot detect anything.
+        assert!(!Pin::from_header(100, None, 10, None).is_superseded_by(Some(hash)));
+    }
+
+    #[test]
+    fn pin_drift_saturates_and_counts_forward() {
+        let pin = Pin::from_header(100, Some(B256::ZERO), 10, None);
+        assert_eq!(pin.blocks_behind(100), 0);
+        assert_eq!(pin.blocks_behind(101), 1);
+        assert_eq!(pin.blocks_behind(u64::MAX), u64::MAX - 100);
+        assert_eq!(
+            pin.blocks_behind(99),
+            0,
+            "a head behind the pin is not negative drift"
+        );
     }
 }

@@ -22,14 +22,20 @@ pub struct GasSnapshot {
     pub l1_fee_upper_bound: U256,
 }
 
-/// Read the fee market: one latest-block fetch, `eth_gasPrice`,
-/// `eth_maxPriorityFeePerGas`, and the three GasPriceOracle reads as one
-/// Multicall3 batch — all four groups run concurrently. The previous version
-/// issued seven sequential round-trips.
-pub async fn snapshot(provider: &ChainProvider, tx_size: usize) -> Result<GasSnapshot> {
+/// Read the fee market *at one pinned block*: `eth_gasPrice`,
+/// `eth_maxPriorityFeePerGas` and the three GasPriceOracle reads as one
+/// Multicall3 batch, all concurrent. The block header itself is not fetched —
+/// the pin already carries the number, timestamp and base fee, so this saves
+/// the round-trip the old version spent re-reading a block it had just pinned.
+pub async fn snapshot(
+    provider: &ChainProvider,
+    tx_size: usize,
+    pin: &chain::Pin,
+) -> Result<GasSnapshot> {
     use alloy::primitives::Bytes;
     use alloy::sol_types::SolCall;
 
+    let block = pin.id();
     let oracle_calls: Vec<(Address, Bytes)> = vec![
         (
             base::GAS_PRICE_ORACLE,
@@ -49,16 +55,12 @@ pub async fn snapshot(provider: &ChainProvider, tx_size: usize) -> Result<GasSna
         ),
     ];
 
-    let (block_result, gas_price_result, priority_result, oracle_result) = tokio::join!(
-        provider.get_block_by_number(BlockNumberOrTag::Latest),
+    let (gas_price_result, priority_result, oracle_result) = tokio::join!(
         chain::gas_price(provider),
         provider.get_max_priority_fee_per_gas(),
-        chain::multicall_raw(provider, &oracle_calls, BlockId::latest()),
+        chain::multicall_raw(provider, &oracle_calls, block),
     );
 
-    let block = block_result
-        .context("failed to read latest block")?
-        .context("latest block not found")?;
     let gas_price = U256::from(gas_price_result.context("failed to read eth_gasPrice")?);
     let priority_fee =
         U256::from(priority_result.context("failed to read eth_maxPriorityFeePerGas")?);
@@ -83,9 +85,9 @@ pub async fn snapshot(provider: &ChainProvider, tx_size: usize) -> Result<GasSna
     });
 
     Ok(GasSnapshot {
-        block_number: block.header.number,
-        timestamp: block.header.timestamp,
-        base_fee: U256::from(block.header.base_fee_per_gas.unwrap_or(0)),
+        block_number: pin.number,
+        timestamp: pin.timestamp,
+        base_fee: U256::from(pin.base_fee_per_gas.unwrap_or(0)),
         priority_fee,
         gas_price,
         l1_base_fee,
@@ -111,14 +113,17 @@ pub fn is_stale(updated_at: u64, now: u64, max_age_secs: u64) -> bool {
     now > updated_at.saturating_add(max_age_secs)
 }
 
+/// Read one feed **at the pin**: the answer and the staleness clock both come
+/// from the same block, so a price can never be judged fresh against a chain
+/// time that was read from a later one.
 pub async fn chainlink_price(
     provider: &ChainProvider,
     feed: Address,
     max_age_secs: u64,
-    now_secs: u64,
+    pin: &chain::Pin,
 ) -> Result<f64> {
     let data = chainlink::latestRoundDataCall {}.abi_encode().into();
-    let bytes = chain::eth_call(provider, feed, data, BlockId::latest())
+    let bytes = chain::eth_call(provider, feed, data, pin.id())
         .await
         .map_err(|e| anyhow::anyhow!("latestRoundData failed: {e}"))?;
     let result = chainlink::latestRoundDataCall::abi_decode_returns(&bytes)
@@ -127,14 +132,18 @@ pub async fn chainlink_price(
         bail!("Chainlink feed {feed} returned a non-positive answer");
     }
     let updated_at: u64 = result.updatedAt.try_into().unwrap_or(0);
-    if is_stale(updated_at, now_secs, max_age_secs) {
-        bail!("Chainlink feed {feed} is stale: updatedAt={updated_at}, now={now_secs}");
+    if is_stale(updated_at, pin.timestamp, max_age_secs) {
+        bail!(
+            "Chainlink feed {feed} is stale: updatedAt={updated_at}, now={}",
+            pin.timestamp
+        );
     }
 
     let decimals = call_u8(
         provider,
         feed,
         chainlink::decimalsCall {}.abi_encode().into(),
+        pin.id(),
     )
     .await?;
     let answer: f64 = result
@@ -149,8 +158,9 @@ async fn call_u8(
     provider: &ChainProvider,
     to: Address,
     data: alloy::primitives::Bytes,
+    block: BlockId,
 ) -> Result<u8> {
-    let bytes = chain::eth_call(provider, to, data, BlockId::latest())
+    let bytes = chain::eth_call(provider, to, data, block)
         .await
         .map_err(|e| anyhow::anyhow!("call failed: {e}"))?;
     Ok(bytes.last().copied().unwrap_or(0))
@@ -211,7 +221,7 @@ pub fn feed_price_from_round(
 pub async fn feed_prices(
     provider: &ChainProvider,
     requests: &[(Address, u64)],
-    now_secs: u64,
+    pin: &chain::Pin,
     decimals: &std::collections::HashMap<Address, u8>,
 ) -> std::collections::HashMap<Address, std::result::Result<f64, String>> {
     use alloy::sol_types::SolCall;
@@ -219,7 +229,7 @@ pub async fn feed_prices(
         .iter()
         .map(|(feed, _)| (*feed, chainlink::latestRoundDataCall {}.abi_encode().into()))
         .collect();
-    let raw = chain::multicall_raw(provider, &calls, BlockId::latest()).await;
+    let raw = chain::multicall_raw(provider, &calls, pin.id()).await;
     requests
         .iter()
         .zip(raw)
@@ -227,7 +237,7 @@ pub async fn feed_prices(
             let price = match data {
                 Ok(data) => match decimals.get(feed) {
                     Some(decimals) => {
-                        feed_price_from_round(*feed, &data, *max_age, now_secs, *decimals)
+                        feed_price_from_round(*feed, &data, *max_age, pin.timestamp, *decimals)
                             .map_err(|err| err.to_string())
                     }
                     None => Err(format!("Chainlink feed {feed} decimals are unknown")),
@@ -243,15 +253,15 @@ pub async fn feed_prices(
 pub async fn asset_usd_price(
     provider: &ChainProvider,
     asset: Address,
-    now_secs: u64,
+    pin: &chain::Pin,
 ) -> Result<f64> {
     let (feed, max_age) = usd_feed_for_asset(asset)
         .with_context(|| format!("no verified USD feed for asset {asset}"))?;
-    chainlink_price(provider, feed, max_age, now_secs).await
+    chainlink_price(provider, feed, max_age, pin).await
 }
 
-pub async fn eth_usd_price(provider: &ChainProvider, now_secs: u64) -> Result<f64> {
-    chainlink_price(provider, base::ETH_USD_FEED, 7_200, now_secs).await
+pub async fn eth_usd_price(provider: &ChainProvider, pin: &chain::Pin) -> Result<f64> {
+    chainlink_price(provider, base::ETH_USD_FEED, 7_200, pin).await
 }
 
 pub fn raw_to_f64(value: U256, decimals: u8) -> f64 {
@@ -276,7 +286,11 @@ pub fn trade_cost(
     l1_fee_wei: U256,
     eth_usd: f64,
 ) -> TradeCost {
-    let l2_fee_wei = U256::from(gas_used) * effective_gas_price;
+    // Saturating, not wrapping: `U256`'s `*` silently wraps in every profile,
+    // and a wrapped *fee* would come back as a small number that passes the
+    // profit gate. Saturation makes the cost absurdly large instead, which
+    // rejects the trade — the safe direction for an upper bound.
+    let l2_fee_wei = U256::from(gas_used).saturating_mul(effective_gas_price);
     let total_fee_wei = l2_fee_wei.saturating_add(l1_fee_wei);
     let total_fee_usd = wei_to_eth(total_fee_wei) * eth_usd;
     TradeCost {
@@ -320,6 +334,27 @@ mod tests {
         );
         assert_eq!(cost.l2_fee_wei, U256::from(100_000u128 * 1_000_000_000u128));
         assert!(cost.total_fee_usd > 0.0);
+    }
+
+    /// An absurd gas price must make the cost *bigger*, never smaller. `U256`'s
+    /// `*` wraps silently, so an unchecked product here would hand the profit
+    /// gate a tiny fee and invent an opportunity.
+    #[test]
+    fn trade_cost_saturates_instead_of_wrapping() {
+        let cost = trade_cost(u64::MAX, U256::MAX, U256::ZERO, 3_000.0);
+        assert_eq!(
+            cost.l2_fee_wei,
+            U256::MAX,
+            "fee math wrapped instead of saturating; the gate would see a cheap trade"
+        );
+        assert!(
+            cost.total_fee_usd.is_finite() && cost.total_fee_usd > 0.0,
+            "a saturated fee must still read as an enormous cost"
+        );
+
+        // Same for the L1 leg adding on top.
+        let both = trade_cost(u64::MAX, U256::MAX, U256::MAX, 3_000.0);
+        assert_eq!(both.total_fee_wei, U256::MAX);
     }
 
     #[test]
