@@ -1,6 +1,6 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-10-31 (scan-path speed overhaul; see §0h)
+Last updated: 2026-11-01 (fail-closed cost reads; see §0l)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -761,6 +761,75 @@ NOT done, in order of value:
   collide; router/Balancer selectors are still unmapped despite the README
   claim.
 - No CI: every behavioural test here is `#[ignore]`d and needs a live fork.
+
+### 0l. Fail-closed cost reads (#3) — DONE 2026-11-01
+
+First item on the §0k "NOT done" list (the L1 bullet there is now fixed; the
+flashblock-freshness, cache-precision and CI bullets remain). `gas::snapshot`
+silently defaulted the L1 fee upper bound to **zero** when the oracle read
+failed (`gas.rs:68-85`), and `simulate_route` fed that value into
+`trade_cost` — the cost leg of the profit gate could therefore *invent*
+profit. Every candidate also paid for a hardcoded 2,000-byte tx size
+regardless of its calldata.
+
+Spec fact (verified against the OP Stack Fjord predeploy spec):
+`getL1FeeUpperBound(unsignedTxSize)` adds `+68` for the signature and
+`+size/255+16` for the FastLZ compression margin itself ("covers 99.99 % of
+transactions"); callers pass the unsigned size without the signature. So a
+calldata-derived size plus a documented envelope is a legitimate bound.
+
+Changes:
+
+- `GasSnapshot` no longer carries the upper bound and `snapshot` no longer
+  takes `tx_size`. The two remaining oracle reads (`l1BaseFee`, `blobBaseFee`)
+  are display-only in the `gas` CLI and became `Option<U256>`: a failed read
+  prints `unavailable` instead of a fake zero.
+- New `gas::l1_fee_upper_bound(provider, tx_size, block)`: one pinned
+  `eth_call` + decode, error on failure — no zero default anywhere.
+- New `gas::unsigned_tx_size(calldata_len) = calldata_len + ENVELOPE_OVERHEAD
+  (120)`, the envelope documented (type byte + RLP of the tx fields; the
+  contract adds the signature and compression margin itself). A typical 2-hop
+  `execute` carries ~616 B of calldata → a 736 B bound against the old 2,000;
+  the MAX_STEPS=8 worst case is ~1,956 B → 2,076.
+- `simulate_route` reads the bound **at each candidate's own calldata size**,
+  after building the calldata and *before* `eth_estimateGas` (the cheaper
+  round-trip gates first). A failed read skips the candidate as
+  *inconclusive* — `(None, false)`, so the failed-sim cache never learns a
+  network artifact as a definitive loss — matching the existing
+  `SimulateError::Transport` handling. Failure direction follows the
+  codebase rule: a wrong "no" is safe, a zero-fee "yes" was not.
+- `opportunity_json` now exposes `l1FeeWei`/`l2FeeWei` for cost-path auditing.
+
+Cost: up to `max_simulations` (8) extra pinned `eth_call`s per asset per
+trigger. Sizes cluster (same step count + data width ⇒ same calldata length),
+so a size-keyed cache is a possible follow-up; not built.
+
+Verification (this machine; Foundry 1.8.7 installed via `foundryup`, Anvil
+Base fork + `Deploy.s.sol` deployment, fork block 53376203):
+
+- `cargo test --lib` — **93 tests** (new:
+  `unsigned_tx_size_adds_a_documented_envelope`), plus the WS integration
+  test; `cargo clippy --all-targets` clean, `cargo fmt --all --check` clean.
+- Live public Base `gas`: one pinned block (53375874); L1 base fee
+  47,564,549 wei, blob base fee 2,601,635 wei, L1 upper bound
+  2,889,221,452 wei **for a labeled 736-byte tx**, 450k gas cost $0.006117.
+- `tests/fork_opportunity.rs` with `RYO_FORK_EXECUTE=1`: `routes=44
+  quotes=412 simulations=6 opportunities=4`; the executed transaction paid
+  **exactly** `7795257470845533` WETH wei, byte-for-byte equal to the
+  simulated profit — the new per-candidate cost leg never changed an outcome.
+- `tests/fork_simcache.rs`: scan #1 `simulations=6 cached=0` → scan #2
+  `simulations=4 cached=2`, all 4 opportunities re-found.
+- `tests/pinned_block.rs` (4 ignored tests): all pass, including the full-scan
+  consistency test (264 routes, 1,644 quotes, 6 simulations, 6 opportunities).
+- `tests/local_math.rs` on the fork: 78 exact matches, 12 consistent declines
+  — identical to the §0j record.
+- Warm fork full scan: 292 ms probe / ~0.3 s total, no regression. The extra
+  `eth_call`s land only on simulate finalists (the fork run made 6); the
+  quote/refine path is untouched.
+- Scale note: Base L1 fees are sub-cent, so at ~736 B vs the old 2,000 B the
+  bound differs by well under a hundredth of a cent — `net_usd` barely moves.
+  The point of §0l is the failure mode (zero no longer means "free"), not a
+  cheaper-looking trade.
 
 ---
 
@@ -1600,13 +1669,13 @@ for you.
 
 ## 11. Next move (one line)
 
-#1 (local constant-product math, §0j) and #2 (one pinned block per scan plus
-simulate-what-you-propose, §0k) are finished and verified against real Base.
+#1 (local constant-product math, §0j), #2 (one pinned block per scan plus
+simulate-what-you-propose, §0k) and the fail-closed cost reads (§0l — the L1
+fee upper bound is read per candidate at its real tx size and can no longer
+default to zero) are finished and verified against real Base.
 Next in value order: a **freshness pass** (re-quote and re-simulate only the
 finalists at a newly resolved pin, to win back the ~200 ms of pending state
-that pinning gave up); then make the cost reads **fail closed** — the L1 fee
-upper bound still defaults to zero when the oracle read fails (`gas.rs:68-83`)
-and the tx size is a fixed 2000 for every candidate; then cache only
+that pinning gave up); then cache only
 profit-related reverts in the failed-sim cache and separate the `RyoCore` and
 adapter error namespaces, which currently both claim `ZeroAddress()`. Then CI,
 because every behavioural proof above is `#[ignore]`d and needs a live fork.

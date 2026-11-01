@@ -17,21 +17,55 @@ pub struct GasSnapshot {
     pub base_fee: U256,
     pub priority_fee: U256,
     pub gas_price: U256,
-    pub l1_base_fee: U256,
-    pub blob_base_fee: U256,
-    pub l1_fee_upper_bound: U256,
+    /// Display-only context. These two gate nothing, so a failed read is
+    /// reported as `None` rather than a fake zero. The value that *does*
+    /// gate the profit check is read per candidate by
+    /// [`l1_fee_upper_bound`], which fails closed.
+    pub l1_base_fee: Option<U256>,
+    pub blob_base_fee: Option<U256>,
+}
+
+/// Non-calldata bytes of an unsigned EIP-1559 transaction: type byte, the RLP
+/// of nonce/maxFee/maxPriorityFee/gasLimit (<= 9 bytes each), `to` (21),
+/// value, the data length prefix, and chainId. 120 is a generous ceiling.
+/// `getL1FeeUpperBound` adds the 68-byte signature and the FastLZ compression
+/// margin (`+size/255+16`) itself, per the OP Stack spec, so callers pass
+/// exactly this.
+pub const ENVELOPE_OVERHEAD: usize = 120;
+
+/// Unsigned tx size to hand the oracle for a transaction carrying `calldata_len`
+/// bytes of calldata.
+pub const fn unsigned_tx_size(calldata_len: usize) -> usize {
+    calldata_len + ENVELOPE_OVERHEAD
+}
+
+/// The L1 fee upper bound for a transaction of this size, **at the pinned
+/// block**. Fail-closed by design: if the oracle cannot answer, the caller
+/// gets an error, never a zero that would invent profit.
+pub async fn l1_fee_upper_bound(
+    provider: &ChainProvider,
+    tx_size: usize,
+    block: BlockId,
+) -> Result<U256> {
+    let data = gas_oracle::getL1FeeUpperBoundCall {
+        unsignedTxSize: U256::from(tx_size),
+    }
+    .abi_encode()
+    .into();
+    let bytes = chain::eth_call(provider, base::GAS_PRICE_ORACLE, data, block)
+        .await
+        .map_err(|e| anyhow::anyhow!("getL1FeeUpperBound({tx_size}) failed: {e}"))?;
+    gas_oracle::getL1FeeUpperBoundCall::abi_decode_returns(&bytes)
+        .context("failed to decode getL1FeeUpperBound")
 }
 
 /// Read the fee market *at one pinned block*: `eth_gasPrice`,
-/// `eth_maxPriorityFeePerGas` and the three GasPriceOracle reads as one
-/// Multicall3 batch, all concurrent. The block header itself is not fetched —
-/// the pin already carries the number, timestamp and base fee, so this saves
-/// the round-trip the old version spent re-reading a block it had just pinned.
-pub async fn snapshot(
-    provider: &ChainProvider,
-    tx_size: usize,
-    pin: &chain::Pin,
-) -> Result<GasSnapshot> {
+/// `eth_maxPriorityFeePerGas` and the two informational GasPriceOracle reads
+/// as one Multicall3 batch, all concurrent. The block header itself is not
+/// fetched — the pin already carries the number, timestamp and base fee, so
+/// this saves the round-trip the old version spent re-reading a block it had
+/// just pinned.
+pub async fn snapshot(provider: &ChainProvider, pin: &chain::Pin) -> Result<GasSnapshot> {
     use alloy::primitives::Bytes;
     use alloy::sol_types::SolCall;
 
@@ -45,14 +79,6 @@ pub async fn snapshot(
             base::GAS_PRICE_ORACLE,
             gas_oracle::blobBaseFeeCall {}.abi_encode().into(),
         ),
-        (
-            base::GAS_PRICE_ORACLE,
-            gas_oracle::getL1FeeUpperBoundCall {
-                unsignedTxSize: U256::from(tx_size),
-            }
-            .abi_encode()
-            .into(),
-        ),
     ];
 
     let (gas_price_result, priority_result, oracle_result) = tokio::join!(
@@ -65,23 +91,18 @@ pub async fn snapshot(
     let priority_fee =
         U256::from(priority_result.context("failed to read eth_maxPriorityFeePerGas")?);
 
-    // Oracle reads keep the old per-call tolerance: a failed component falls
-    // back to zero rather than blocking the scan.
-    let oracle_value = |index: usize, decoded: fn(&Bytes) -> Option<U256>| -> U256 {
+    // Display-only values: a failed component reads as None, never as zero.
+    let oracle_value = |index: usize, decoded: fn(&Bytes) -> Option<U256>| -> Option<U256> {
         oracle_result
             .get(index)
             .and_then(|data| data.as_ref().ok())
             .and_then(decoded)
-            .unwrap_or(U256::ZERO)
     };
     let l1_base_fee = oracle_value(0, |data| {
         gas_oracle::l1BaseFeeCall::abi_decode_returns(data).ok()
     });
     let blob_base_fee = oracle_value(1, |data| {
         gas_oracle::blobBaseFeeCall::abi_decode_returns(data).ok()
-    });
-    let l1_fee_upper_bound = oracle_value(2, |data| {
-        gas_oracle::getL1FeeUpperBoundCall::abi_decode_returns(data).ok()
     });
 
     Ok(GasSnapshot {
@@ -92,7 +113,6 @@ pub async fn snapshot(
         gas_price,
         l1_base_fee,
         blob_base_fee,
-        l1_fee_upper_bound,
     })
 }
 
@@ -313,6 +333,17 @@ mod tests {
     fn converts_raw_units() {
         assert!((raw_to_f64(U256::from(1_000_000u64), 6) - 1.0).abs() < 1e-12);
         assert!((raw_to_f64(U256::from(1_000_000_000_000_000_000u64), 18) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unsigned_tx_size_adds_a_documented_envelope() {
+        assert_eq!(unsigned_tx_size(0), ENVELOPE_OVERHEAD);
+        assert!(unsigned_tx_size(100) < unsigned_tx_size(101));
+        // Real execute calldata: ~616 B for a 2-hop route, ~1,956 B at the
+        // contract's MAX_STEPS = 8. The old hardcoded 2_000 tx size therefore
+        // over-reserved the common case by ~2.7x.
+        assert_eq!(unsigned_tx_size(616), 736);
+        assert_eq!(unsigned_tx_size(1956), 2076);
     }
 
     #[test]

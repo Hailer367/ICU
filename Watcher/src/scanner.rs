@@ -373,7 +373,7 @@ impl Scanner {
                 return Ok((cached.snapshot.clone(), cached.eth_usd));
             }
         }
-        let snapshot = gas::snapshot(&self.provider, 2_000, &pin).await?;
+        let snapshot = gas::snapshot(&self.provider, &pin).await?;
         // A missing ETH/USD price must not degrade to "free gas": the scan
         // bails on a non-positive price below. `unwrap_or(0.0)` keeps that as
         // the single, explicit gate rather than silently passing it.
@@ -1510,6 +1510,21 @@ async fn simulate_route(
         minProfit: min_profit,
     };
     let calldata = Bytes::from(call.abi_encode());
+
+    // Price the L1 leg at the candidate's *actual* tx size, and fail closed:
+    // a missing read skips this candidate as inconclusive (the failed-sim
+    // cache stays clean), it never defaults to zero, which would invent
+    // profit. Read before `estimate_gas` — the cheaper round-trip gates first.
+    let l1_fee =
+        match gas::l1_fee_upper_bound(provider, gas::unsigned_tx_size(calldata.len()), block).await
+        {
+            Ok(fee) => fee,
+            Err(err) => {
+                warn!(error = %err, "L1 fee upper bound unavailable; candidate skipped");
+                return (None, false);
+            }
+        };
+
     let Ok(route_hash) = route.route_hash(manifest, &floors) else {
         return (None, false);
     };
@@ -1529,12 +1544,7 @@ async fn simulate_route(
         }
     };
 
-    let cost = gas::trade_cost(
-        gas_used,
-        gas_snapshot.gas_price,
-        gas_snapshot.l1_fee_upper_bound,
-        eth_usd,
-    );
+    let cost = gas::trade_cost(gas_used, gas_snapshot.gas_price, l1_fee, eth_usd);
     let profit_usd = gas::profit_usd(profit_raw, decimals, asset_usd);
     let net_usd = profit_usd - cost.total_fee_usd;
     debug!(

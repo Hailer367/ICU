@@ -500,15 +500,30 @@ async fn print_gas(settings: &Settings) -> Result<()> {
     // Same rule as the scan path: every number printed here comes from one
     // pinned block, so the fee market and the prices agree with each other.
     let pin = chain::Pin::resolve_latest(&provider).await?;
-    let snapshot = gas::snapshot(&provider, 2_000, &pin).await?;
+    let snapshot = gas::snapshot(&provider, &pin).await?;
     let eth_usd = gas::eth_usd_price(&provider, &pin).await?;
+    let fee_oracle_value = |value: Option<U256>| match value {
+        Some(value) => value.to_string(),
+        None => "unavailable".to_string(),
+    };
     println!("block:          {} (pinned)", snapshot.block_number);
     println!("base fee:       {} wei", snapshot.base_fee);
     println!("priority fee:   {} wei", snapshot.priority_fee);
     println!("gas price:      {} wei", snapshot.gas_price);
-    println!("L1 base fee:    {} wei", snapshot.l1_base_fee);
-    println!("blob base fee:  {} wei", snapshot.blob_base_fee);
-    println!("L1 upper bound: {} wei", snapshot.l1_fee_upper_bound);
+    println!(
+        "L1 base fee:    {} wei",
+        fee_oracle_value(snapshot.l1_base_fee)
+    );
+    println!(
+        "blob base fee:  {} wei",
+        fee_oracle_value(snapshot.blob_base_fee)
+    );
+    // Label the size the bound is priced at: a typical 2-hop RyoCore.execute
+    // carries ~616 bytes of calldata. The scan path prices each candidate at
+    // its own calldata size instead.
+    let tx_size = gas::unsigned_tx_size(616);
+    let l1_fee = gas::l1_fee_upper_bound(&provider, tx_size, pin.id()).await?;
+    println!("L1 upper bound: {l1_fee} wei (for a {tx_size}-byte tx)");
     println!("ETH/USD:        ${eth_usd:.2}");
     for (symbol, asset) in [("USDC", base::USDC), ("WETH", base::WETH)] {
         match gas::asset_usd_price(&provider, asset, &pin).await {
@@ -516,12 +531,7 @@ async fn print_gas(settings: &Settings) -> Result<()> {
             Err(err) => println!("{symbol}/USD:        unavailable ({err})"),
         }
     }
-    let cost = gas::trade_cost(
-        450_000,
-        snapshot.gas_price,
-        snapshot.l1_fee_upper_bound,
-        eth_usd,
-    );
+    let cost = gas::trade_cost(450_000, snapshot.gas_price, l1_fee, eth_usd);
     println!("450k gas cost:  ${:.6}", cost.total_fee_usd);
     Ok(())
 }
@@ -1078,6 +1088,8 @@ fn opportunity_json(opportunity: &Opportunity) -> serde_json::Value {
         "gasUsed": opportunity.gas_used,
         "gasPrice": opportunity.gas_price.to_string(),
         "gasCostUsd": opportunity.cost.total_fee_usd,
+        "l2FeeWei": opportunity.cost.l2_fee_wei.to_string(),
+        "l1FeeWei": opportunity.cost.l1_fee_wei.to_string(),
         "floors": opportunity.floors.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "minProfit": opportunity.min_profit.to_string(),
         "routeHash": opportunity.route_hash.to_string(),

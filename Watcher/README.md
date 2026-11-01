@@ -42,7 +42,7 @@ src/venues.rs    per-venue quote encoding/decoding, Multicall3 batching
 src/amm.rs       local exact-price math for constant-product pools (checked U256 only)
 src/scanner.rs   event-driven scan: quotes → rank → refine → simulate → gates
 src/simulate.rs  RyoCore.simulate call and result decoding
-src/gas.rs       Base gas snapshot, L1 fee upper bound, ETH/USD feed
+src/gas.rs       Base gas snapshot, per-candidate L1 fee upper bound (fail-closed), ETH/USD feed
 src/chain.rs     provider helpers (eth_call, estimate_gas, ERC20 reads)
 src/config.rs    settings, manifest, Base addresses
 src/abi.rs       hand-written call selectors for the venues and oracles
