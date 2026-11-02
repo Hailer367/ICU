@@ -1997,6 +1997,30 @@ comparable to the Uniswap 0.01% pool, and the fee=100 tier is deep enough that
 are in the registry so far, because those are the assets the core currently
 trades.
 
+**Scan latency after the registry grew 12 → 16 pools** (Anvil fork of
+53427742, `--max-gas-price-gwei 2`, three full sweeps each way after a warm-up):
+
+| pools in sweep | routes | quotes | probe ms |
+| --- | --- | --- | --- |
+| 16 (all) | 480 | 2878 | 831 / 819 / 794 |
+| 12 (Pancake-only cycles dropped) | 456 | 2734 | 750 / 802 / 822 |
+
+Roughly +5 % of cycles and +3 % of probe time, which is inside the spread of
+the 12-pool runs themselves. Probe cost is dominated by fixed Multicall3
+round-trips, not by per-quote work, so four more pools barely move it. The
+event-driven path is stricter still: a Pancake swap only re-prices cycles that
+contain a Pancake pool. Caveat: `--pools` filters *affected* cycles rather than
+shrinking the registry, so this is an upper bound on the added cost, not a
+clean A/B.
+
+**Deployed on the fork** (`Deploy.s.sol` broadcast, `8453.fork.json`): five
+adapters whitelisted, caps USDC 500k / WETH 250, `validate` green on the new
+manifest. Note for whoever re-runs this: the node this session used has a
+non-standard dev mnemonic, so `PRIVATE_KEY`
+`0xac0974…` maps to `0xeb81a4a2…5e5e…`, which must be funded with
+`anvil_setBalance` before the broadcast, otherwise the script dies in the
+simulation pass with `lack of funds (0)`.
+
 **Pancake V2 is not worth wiring.** Its Base pairs are dust: WETH/USDC holds
 0.165 WETH + 373 USDC, WETH/cbBTC and USDC/cbBTC are effectively empty.
 
