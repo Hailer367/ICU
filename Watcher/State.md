@@ -2039,6 +2039,139 @@ off-chain curve must model. Defer.
 
 ---
 
+### 0r. Tier 1 pair expansion - researched, deliberately NOT wired (2026-11-02)
+
+Deferred by decision after the venue work; this section is the whole handoff, so
+a fresh session needs nothing from the conversation that produced it.
+
+**Why expanding assets is not the same as expanding pools.** Two facts bound the
+design:
+
+- `RyoCore.execute` checks `maxTradeSize[asset]` against the *flash-loaned
+  amount only* (`src/RyoCore.sol:189-191`); intermediate legs are unbounded and
+  are guarded solely by per-leg `minAmountOut` floors and route continuity.
+- The Base Balancer Vault holds meaningful USDC and WETH and little else.
+
+Consequence: every cycle must still start and end at USDC or WETH, but cbBTC /
+EURC / USDT can be *intermediate* legs with no Vault liquidity at all. Adding
+them buys triangles (`USDC -> cbBTC -> WETH -> USDC`), which is where genuinely
+new edges live, and also multiplies the cycle set far more than four extra Pancake
+pools did.
+
+**Measured pool set** (live `getPool` on each factory, Base block ~53,427,000,
+2026-11-02; `L` = in-range liquidity in raw units at that moment, so treat it as
+an order-of-magnitude signal, not a constant). Pools marked dead returned `L = 0`
+and must NOT go in the registry.
+
+*cbBTC/USDC* (`cbBTC = 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf`, 8 dp)
+- Pancake: 100 `0xb94b22332abf5f89877a14cc88f2abc48c34b3df` (L 5.4e11),
+  500 `0x26e263efdc91f0d3279e2ec2bd58a7ca5c2fce62` (2.6e10),
+  2500 `0x748bb91fc5f4200302d9a79185bc161260a1b461` (2.9e9),
+  10000 `0xbd65764c8eb1b8858d323066f488b73f6fe22dc9` (dead)
+- UniV3: 500 `0xfbb6eed8e7aa03b138556eedaf5d271a5e1e43ef` (2.3e12 - deepest),
+  3000 `0xec558e484cc9f2210714e345298fdc53b253c27d` (4.7e11),
+  100 `0xe9e25e35aa99a2a60155010802b81a25c45ba185` (1.1e8),
+  10000 `0x3e7586d52a9d07f8611b8ecf6ccc8a689c34a659` (1.0e9)
+- Slipstream: 100 `0x4e962bb3889bf030368f56810a9c96b83cb3e778` (2.9e11)
+- Aerodrome volatile: `0x9c38b55f9a9aba91bbcedeb12bf4428f47a6a0b8` (dead)
+- **Not checked: UniV2 `getPair`.** Do it before writing the registry entry.
+
+*cbBTC/WETH*
+- Pancake: 100 `0xc211e1f853a898bd1302385ccde55f33a8c4b3f3` (6.9e16),
+  500 `0xd974d59e30054cf1abeded0c9947b0d8baf90029` (3.5e15),
+  2500 `0x5b3613ef9a535b48e82e2800acb77053dfec93b1` (5.2e14),
+  10000 `0xa97c08bc49c246e583a3557f2922daa9e5d1b404` (dead)
+- UniV3: 500 `0x7aea2e8a3843516afa07293a10ac8e49906dabd1` (3.5e17 - by far the
+  deepest), 3000 `0x8c7080564b5a792a33ef2fd473fba6364d5495e5` (1.0e17),
+  10000 `0x233571eae953d9d59eefc0769f71dc19287ddccb`, 100 `0x4c1e404a013bf1917faf2dbf5e5cef3e9bafb5aa`
+- Slipstream: 100 `0x70acdf2ad0bf2402c957154f944c19ef4e1cbae1` (2.3e16),
+  10 `0xffa192f04b1e5f9f5124fb40a96407564492ed20` (4.8e8, effectively dead)
+- Aerodrome volatile: `0x2578365b3dfa7ffe60108e181efb79feddec2319` (dead)
+
+*USDC/EURC* (`EURC = 0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42`, 6 dp)
+- UniV3: 500 `0x7279c08a36333e12c3fc81747963264c100d66fb` (4.7e12 - deepest),
+  100 `0x6a1c74e023fe2619516f89408e9d8c541e4e3eef` (1.8e10),
+  3000 `0x03d8219070e54a55a9ce60889ead2ffd18eb6aa9`, 10000 `0xd99fad95b3d1235b403ee26c5b16531d9aa8e576`
+- Pancake: 100 `0x1ca42c7219f0cb1b67927e26502320cb98f725bd` (5.9e11); 500 /
+  2500 / 10000 (`0xbcc009c3ae38374944b73bb00334f50aa7bfd29a`,
+  `0x1f4fee8d9e0a3afa3ee0ac1051e323f4369ff465`,
+  `0xcd83e5e45ee238a88717b2b20aec93c616d698dc`) were all dead
+- Aerodrome **stable**: `0xef0d374fe41fc6da7f8ed7c56c10a8f2a4f75313` (L 0 at that
+  block - recheck, stable EUR/USD is exactly what an Aerodrome stable pool is for)
+- Slipstream 10 `0x2e63586d8e385aba0800b061fdd0eb65d23b87e7` (dead)
+
+Second-order candidates already found: `WETH/EURC` (Pancake 500
+`0xb4a43d89b5d356065646389fd677ca762efcd780` L 8.5e15, UniV3 3000
+`0x260441e9574c0633c70c5cff3a47d75dc9bc3e22`), `WETH/AERO` (four venues,
+Slipstream 200 `0x82321f3beb69f503380d6b233857d5c43562e2d0` L 2.3e22 is the
+deepest AERO pool anywhere), `USDT/USDC`, and a batch of high-volume /
+low-reserve tokenized-equity pairs (MSTRc, SNDKc, xdp, SPCXc vs USDC) whose
+spreads were the widest observed but whose ~$1M reserves cap size at a few
+thousand dollars per trade.
+
+**Volume context** (GeckoTerminal, dex-scoped endpoint, 2026-11-02, third-party
+and not independently confirmed): Pancake V3 WETH/USDC 0.01% $35.7M/24h,
+cbBTC/WETH 0.01% $35.0M, cbBTC/USDC 0.01% $24.7M; UniV3 WETH/USDC 0.3% $65.8M
+($149M reserve), cbBTC/WETH 0.05% $24.9M, cbBTC/USDC 0.05% $9.97M; Slipstream
+WETH/USDC 0.05% $14.5M, cbBTC/USDC 0.05% $3.6M, EURC/USDC 0.05% $2.15M.
+The `dexes/{dex_id}/pools` endpoint works; `pools?dex_id=` is silently ignored
+and returns an unfiltered global list - that mistake produced a bogus
+"every venue trades this pair" table on the first pass, so use the scoped form.
+
+**Five questions to settle before writing code**, in the order that matters:
+
+1. Cycle count. The registry is 16 pools / 480 routes today. Adding ~12 live
+   Tier 1 pools takes two-hop cycles from 240 toward 500+ and three-hop far
+   more. §0q measured the 12 -> 16 step at ~3 % of probe time; 16 -> 28 is a
+   different regime and must be re-measured with the same method before merge.
+2. `Registry::base_usdc_weth()` is named for, and structured around, two
+   tokens: its `tokens` map holds only USDC and WETH, and the comment above the
+   pool list warns that token0/token1 order matters for amount decoding. It
+   needs a real rename plus `Token` entries (symbol + decimals) for cbBTC/EURC.
+3. Anything that assumes the quote asset is USDC. `swap_notional_usd`
+   (`scanner.rs:2475`) returns `None` for pools without a USDC leg, so cbBTC/WETH
+   swaps silently skip the freshness/dust screen. Decide: screen on a USD proxy,
+   or accept the gap knowingly.
+4. USD prices for the new assets. `config::base` already carries
+   `BTC_USD_FEED` and `EUR_USD_FEED`; check `gas::asset_usd_price` actually
+   walks them, because profit-in-USD and the sqrt(P*D) floors both depend on it.
+5. Caps. `Deploy.s.sol` already reads `MAX_TRADE_CBBTC` / `MAX_TRADE_EURC`, but
+   those set caps on assets that would become *intermediates*, which the cap
+   check never reads. Confirm no dead config is left implying otherwise.
+
+**Test plan when it is picked up:** extend `test/fork/PancakeFork.t.sol` style
+coverage with (a) a `USDC -> cbBTC -> USDC` two-venue cycle through the real
+Vault, (b) a three-asset triangle `USDC -> cbBTC -> WETH -> USDC`, (c) the same
+for EURC, and note that 8-decimal cbBTC makes `minAmountOut` floors and the
+dust constants decimals-sensitive - every literal in those tests must be
+written with the right exponent. Re-run `cargo test --lib`, the foundry suite,
+and the §0q latency A/B.
+
+**Venue gap worth more than any new pair:** Uniswap V4 on Base does roughly
+$11.5M/day and is unsupported. Pancake Infinity CLMM is live on Base but its
+best pool was $0.53M/24h on a $0.1M reserve, which empirically supports keeping
+Infinity deferred (§0q).
+
+**Environment gotchas that cost real time this session:**
+- Foundry now installs to `/home/runner/.config/.foundry/bin` (not
+  `~/.foundry/bin`); `foundryup` alone may not have run, and `forge`/`cast`
+  are not on PATH by default here.
+- The local anvil used a non-standard dev mnemonic: `PRIVATE_KEY 0xac0974...`
+  derives `0xeb81a4a25e5e1b0B96a863F70682f25F4317C902`, which is unfunded, so
+  `forge script` dies in the simulation pass with `lack of funds (0)` before
+  broadcasting anything. Fix: `anvil_setBalance` that address first. Check with
+  `eth_getCode` on the manifest core - the script prints addresses and writes
+  the manifest even when nothing was broadcast.
+- Scans on an Anvil fork need `--max-gas-price-gwei 2`; the fork's ~1 gwei
+  estimate otherwise trips the watcher's 0.05 gwei ceiling and the scan reports
+  `routes 0` in a way that looks like "no opportunity" rather than "skipped".
+- Free-tier Alchemy: `eth_getLogs` is capped at a **10-block** range, and
+  large `eth_call` batches 429 under load - batch ~60 and back off
+  exponentially. The public `mainnet.base.org` rejects `eth_getLogs` outright;
+  `publicnode` works for logs but not archive state.
+
+---
+
 ## 8. Key protocol facts / gotchas
 
 - `RyoCore.simulate` **always reverts**. Success is
@@ -2199,9 +2332,10 @@ now declares `AdapterZeroAddress`, `AdapterZeroAmount` and
 `AdapterNotContract(address)`. Before this, `errors.rs` matched the core branch
 first, so an adapter revert decoded as a core bug and the three adapter
 selectors were dead code; `core_and_adapter_namespaces_do_not_collide` pins it.
-Next in value order: measure the scan-latency cost of the larger registry
-(done, see §0q: ~3 % of probe time), deploy `PancakeV3Adapter` on mainnet, and
-cache only profit-related reverts in the failed-sim cache. Then CI, because
+Next in value order: deploy `PancakeV3Adapter` on mainnet, then pick up the
+Tier 1 pair expansion from §0r, which has the measured pool addresses, the five
+open design questions and the test plan written down. Then cache only
+profit-related reverts in the failed-sim cache. Then CI, because
 every behavioural proof above is `#[ignore]`d and needs a live fork.
 Everything else that can be verified without a mainnet deployment is done: live
 Alchemy events (use `--source pending-logs` or `both`), full scan loop on a
