@@ -102,8 +102,9 @@ The script writes the manifest in the exact shape this crate expects
 | `quote --asset USDC --amount 1000 --route univ3:500,univ3:100` | Quotes one route |
 | `simulate ...` | Runs one route through `RyoCore.simulate` |
 | `plan ...` | `simulate` plus calldata, floors, route hash, gas estimate |
-| `scan [--pools 0,1] [--pending] [--json] [--no-freshness]` | One scan (all pools, or only affected ones) |
-| `watch [--show-empty] [--no-scan] [--metrics-every N] [--coalesce-ms N] [--json] [--no-freshness]` | Event loop |
+| `scan [--pools 0,1] [--pending] [--json] [--no-freshness] [--no-dynamic-floors]` | One scan (all pools, or only affected ones) |
+| `watch [--show-empty] [--no-scan] [--metrics-every N] [--coalesce-ms N] [--json] [--no-freshness] [--no-dynamic-floors]` | Event loop |
+| `floors [--json]` | Per-pool trigger table: live fee, USD depth, and the minimum swap the watcher reacts to |
 | `history [--blocks 43200] [--chunk 500] [--out data/swaps.jsonl]` | Downloads historical swap logs for the 12 pools as JSONL |
 | `decode 0x...` | Decodes revert data |
 
@@ -146,7 +147,7 @@ default `mainnet.base.org` endpoint rejects `eth_getLogs` with
 | `--max-candidates` | `RYO_MAX_CANDIDATES` | `16` | Routes refined per asset |
 | `--max-simulations` | `RYO_MAX_SIMULATIONS` | `8` | `simulate` calls per asset per trigger |
 | `--probe-usd` | `RYO_PROBE_USD` | `500,2000,8000` | Probe sizes in USD |
-| `--min-swap-usd` | `RYO_MIN_SWAP_USD` | `500` | Ignore trigger swaps below this USD notional ($45 hard floor) |
+| `--min-swap-usd` | `RYO_MIN_SWAP_USD` | `500` | Fallback trigger floor: used in fixed mode, and for any pool whose fee/depth read failed ($45 hard floor always applies) |
 | `--max-hops` | `RYO_MAX_HOPS` | `2` | Route length (2 = one pool out, one back) |
 | `--assets` | `RYO_ASSETS` | `USDC,WETH` | Assets scanned, in order |
 | `--fallback-gas` | `RYO_FALLBACK_GAS` | `450000` | Gas estimate used if `eth_estimateGas` fails |
@@ -156,11 +157,22 @@ Opportunities must pass **all** gates: core not paused, watcher gas ceiling,
 core `maxGasPrice`, positive simulated profit, and net USD ≥
 `min-net-profit-usd`. Trade size is capped by `min(manifest cap, core cap)`.
 
-In `watch`, a swap in one of the 12 pools is the trigger. Swaps below
-`--min-swap-usd` are ignored before any quoting; the 24h dataset shows this
-drops ~78 % of events while keeping ~99 % of the swaps that can open a
-$0.25 opportunity. Logs that are not swaps (mints, burns, collects) are not
-size-filtered.
+In `watch`, a swap in one of the 12 pools is the trigger. Swaps are ignored
+before any quoting when they are smaller than the pool's **dynamic trigger
+floor** (on by default; `--no-dynamic-floors` restores the fixed
+`--min-swap-usd`). One Multicall3 round-trip every 30 s reads each pool's live
+fee and depth, and the floor is the smaller swap that could even theoretically
+move that pool enough to clear its own round-trip cost plus the configured
+buffers: a $500 swap moves the $40M UniV3 0.05% pool ~1 bp (skipped), while a
+$50 swap can clear a shallow pool (scanned). Every term of the model errs
+toward scanning; a floor must never skip a trade the gates would have taken.
+Fail-open: any pool whose fee/depth cannot be read falls back to
+`--min-swap-usd`, and the $45 absolute floor applies in every mode. A skipped
+swap is never marked seen, so the two-phase dedupe semantics are unchanged.
+Non-swap logs (mint, burn, collect) are not size-filtered. The old 24h
+dataset's ~78 % scan reduction is conservative for this filter; measured
+2026-11-02: the same live window produced 94 fixed-mode scans vs 24
+dynamic-mode scans, with per-scan latency unchanged (~120 ms warm).
 
 During a burst the watch loop bundles whatever triggers the socket can hand
 over into one scan (a 2 ms budget per extra event, so a backlog drains for

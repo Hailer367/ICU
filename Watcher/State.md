@@ -1,6 +1,7 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-11-01 (live 30-minute websocket run audited against chain history; see §0o)
+Last updated: 2026-11-02 (per-pool dynamic trigger floors shipped and
+audited against live Base, a fork, and a 10k-event replay; see §0p)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -1077,6 +1078,136 @@ Tests now: **95 lib + 2 bin**, `clippy --all-targets -D warnings` and
 and never entered a process command line for the replay forks (those used the
 public endpoint).
 
+### 0p. Per-pool dynamic trigger floors (2026-11-02)
+
+The fixed $500 dust filter (§0f) asked "is this swap big?"; the honest question
+is "could this swap move *this pool* enough to matter?". A $500 swap into the
+~$42M univ3:500 pool moves it ~1 bp — hopeless; a $300 swap into a $2.4k pool
+moves it 12 % — the fixed floor simply misses those. This session shipped
+pool-specific floors; the fixed floor remains as the fallback and as
+`--no-dynamic-floors` for A/B.
+
+Design (`scanner.rs`, all additive to the trigger path):
+
+- `PoolFloors` + `read_pool_floors`: **one** Multicall3 batch (≤ 32 calls) reads
+  every registry pool's fee and depth — `getReserves` (+ Aerodrome factory
+  `getFee`) for constant-product pools, `slot0` + `fee()` + `liquidity()` for
+  V3/Slipstream. Cached 30 s (`POOL_FLOORS_TTL`); fetched once per trigger
+  batch before `plan_batch`, never per trigger. Reads are advisory state
+  (`latest`), so the pinned-money-block rules of §0k are untouched.
+- Depth: CP pools use the USDC-side reserve; concentrated pools use the virtual
+  in-range quote reserve `L·√P` (word 0 of `slot0` is `sqrtPriceX96` in every
+  V3-family layout, so it is parsed as a raw word instead of trusting a tuple
+  — Uni and Slipstream disagree on the trailing fields).
+- Fee source is **measured, never assumed**: an earlier note here implied
+  slipstream fees followed tick spacing; live `fee()` reads disproved it
+  (ts=10 and ts=50 both charge 5 bps, ts=100 charges 8.33, ts=1 charges 0.8).
+  UniV2 stays the documented 30 bps (no on-chain getter, same constant as
+  `amm.rs`).
+- Floor math (`trigger_floor_usd`, pure): with price move `m ≈ 2s/D` and
+  round-trip cost `c = fee_self + cheapest other fee + 2×slippage + buffer`,
+  a scan is pointless unless **both** `m > c` (you cannot even cover fees) and
+  the §0f edge estimate `s²/D ≥ min_net_profit_usd` hold, so
+  `floor = max(c·D/2, √(P·D))`, then clamped by the existing $45 absolute floor.
+  `max`, not sum — both are *necessary* conditions, anything stronger would
+  skip trades the gates might take. Every approximation errs toward scanning.
+- Integration: `plan_batch` takes `floor_of: &dyn Fn(Option<usize>) -> f64`
+  instead of one scalar; the Log arm now resolves the pool index before the
+  dust check. Unknown pools, non-swap logs, and `Reconnect`/gap full scans are
+  untouched. Skipped dust still never marks the dedupe key (two-phase rule).
+  The note line now names the pool's own floor: `swap ~$263 below the $865
+  minimum; skipped`.
+- Fail-open: any pool whose fee/depth/floor is missing or non-finite uses
+  `--min-swap-usd` (which becomes exactly that: the fallback floor).
+- New CLI: `ryo-watch floors [--json]` prints venue / fee bps / USD depth /
+  floor per pool — the audit surface for tuning, new venues, and debugging.
+  `PoolFloors::rows()` exposes the same for tests.
+- Settings: `dynamic_floors: bool` (default `true`; matches the freshness
+  pattern — subcommand flag only, no env var).
+
+Measured floors on live Base (2026-11-02): univ3:100 $12.4k, univ3:500
+$203k, univ3:3000 $9.7M (depth $1.6B — the floor is the fee term, it can never
+be cleared by anything the caps allow), univ3:10000 $56k, slip:1 $865,
+slip:10/50/200 $45 (their floors compute below it and clamp), slip:100 $113k,
+univ2 $4.5k, aero volatile $4.1k, aero stable $59.
+
+Verification, all green:
+
+- `cargo test --lib`: **102 tests** (was 95) — new: floor-model table
+  (`trigger_floor_model_is_pool_specific`), bound-selection
+  (`takes_the_wider_of_fee_and_edge_bounds`), input rejection
+  (`rejects_unusable_inputs`), `cl_depth` pinned to captured live
+  `slot0`/liquidity words of univ3:500 (±price-drift band) and unit-scaled at
+  `sqrtPriceX96 = 2^96`, `pool_floors_fall_back_per_pool`, and
+  `dynamic_floors_are_per_pool_not_per_batch` — the same $300 notional on two
+  pools gets one scan and one named skip. Clippy `-D warnings` and fmt clean.
+- New `tests/dynamic_floors.rs` (ignored; Anvil fork + deployed core) proved
+  all three claims on a real fork in one snapshot: 12 computed floors with the
+  expected fees/depths; **a $300 slipstream:10 skew that the fixed floor
+  silently drops yields 7 opportunities at ~$39 net each under dynamic mode**;
+  the same trigger under `--no-dynamic-floors` is skipped with the historical
+  note; a $600 univ3:500 noise swap is skipped by the pool floor while fixed
+  mode burns 44 routes/196 quotes on it.
+- Live A/B on the user's Alchemy endpoint (key env-only, redacted): 4-minute
+  windows over the deployed fork — fixed `events=405 scans=94
+  avg_scan_ms=126`, dynamic `events=337 scans=24 avg_scan_ms=121` (warm).
+  **~3.5× fewer scans, per-scan latency unchanged** — the floor refresh costs
+  one multicall per 30 s, and it rides the same socket as the quotes. A first
+  cold-fork run reported 4.6 s scans; per §0n that is Anvil's upstream fetch,
+  not the watcher. `floors --json` over Alchemy: 12/12 dynamic.
+- Replay over a fresh 2h dataset (10,538 events): fixed mode would scan 2,569,
+  dynamic scans 0 swaps — every one of those scans was a swap smaller than its
+  own pool could ever pay for (largest events in-window: $39k on univ3:500 →
+  18.6 bps vs ~97 bps cost; $970k on univ3:3000 → 12.1 bps vs ~121 bps).
+  Safety audit of all 10,538 skips: **0 contradictions ≥ $45**; the 14
+  borderline cases are $5–$10 swaps on the two near-empty slipstream pools
+  sitting under the pre-existing $45 absolute floor, which applies identically
+  in both modes and predates this work. (The 24 real-time dynamic scans were
+  non-swap logs — mints/collects on univ3:100/500 — which stay unfiltered by
+  design; reconciled from the logs.)
+
+Lessons and gotchas learned the hard way this session:
+
+- **Aerodrome's Slipstream router does not accept `deadline = 0`** as
+  "no deadline": it `require`s `block.timestamp <= deadline` straight through,
+  so a 0 deadline reverts with no data. SwapRouter02 special-cases 0. Traced on
+  the fork (`TIMESTAMP → GT → ISZERO → REVERT` at ~25k gas, no subcalls).
+- In a `sol!` binding the **function name is the selector**. Renaming the
+  UniV3 copy to `exactInputSingleUni` to dodge a collision produced a selector
+  that does not exist; two routers with the same-named function need two
+  modules (as done in the test).
+- Fork-test approvals must cover *every* router a scenario may use; the noise
+  swap reverted until SwapRouter02 got one too.
+- Old lesson re-confirmed: a panicking `assert!` inside a fork scenario
+  unwinds past `evm_revert` and poisons the next run (observed again as a
+  `fork_simcache` failure that only reproduced in batch order after an
+  assert-style suite; the pristine-HEAD A/B proved the code innocent). New
+  suites stay `bail!`-style.
+- Free-tier caveats unchanged: publicnode intermittently 403s; `--chunk 20`
+  and retries kept the download inside the limit.
+
+Extension points for the coming work (new pairs, new venues):
+
+- `read_pool_floors` is registry-driven: a new venue needs one arm in the call
+  builder (how to read fee + depth) and its quote path, and it gets floors for
+  free. A second USDC-less pair would additionally need
+  `swap_notional_usd`/`swap_deltas` generalized to *some* quote leg with a
+  price feed — currently non-USDC pools simply stay unfiltered (safe, honest).
+- Floors for pools whose depth is below the clamp cost nothing: they become
+  `$45` and behave like the old "always scan dust-plus" for that pool.
+- The cheapest-partner term is global-minimum fee; if a future universe
+  restricts partners (side rules), that is the one line to revisit
+  (`cheapest_excluding`).
+
+NOT done (deliberate):
+
+- Floors are not refreshed by the trigger itself (a huge swap changes depth —
+  the next scan's own quotes see it; floors are advisory by design).
+- No per-pair USD legs beyond USDC (see above).
+- No cap on the dynamic floor for absurdly deep pools: univ3:3000's $9.7M
+  floor just means "never" — correct, since its fees can never be cleared at
+  any allowed size; if the manifest caps grow, revisit sizing terms.
+
 ---
 
 ## 1. Goal and hard constraints
@@ -1175,7 +1306,9 @@ Hand-written `sol!` definitions:
 - `ryo`: `Step`, `execute`, `simulate`, views (`owner`, `pendingOwner`,
   `operator`, `profitRecipient`, `vault`, `paused`, `isAdapter`,
   `maxTradeSize`, `maxGasPrice`, `VERSION`, `MAX_STEPS`), errors, events.
-- `erc20`, `pool` (`token0`/`token1`), `univ3_quoter`,
+- `erc20`, `pool` (`token0`/`token1`), `cl_pool` (V3/Slipstream `fee()`,
+  `liquidity()`, `slot0` — only word 0 is trusted, the tuple layout differs
+  across the family; §0p), `univ3_quoter`,
   `slipstream_quoter`, `univ2_router`, `aerodrome_router`,
   `gas_oracle`, `chainlink`, `balancer_vault`, factories, `multicall3`.
 
@@ -1340,8 +1473,11 @@ against the live endpoint was not exercised (the mock test covers it).
 - Routes are enumerated once per asset at construction.
 - `scan_trigger` drops duplicate `(tx hash, log index)` events and duplicate
   flashblock hash sets.
-- Swap triggers below `max(min_swap_usd, $45)` USD notional return before any
-  quoting; non-swap logs are not size-filtered.
+- Swap triggers below the pool's **dynamic floor** (fee/depth read in one
+  cached 30 s Multicall3; `max(c·D/2, √(P·D))`, §0p), or below
+  `max(min_swap_usd, $45)` when floors are off or unreadable, return before
+  any quoting; non-swap logs are not size-filtered. `pool_floors()` / the
+  `floors` CLI expose the table.
 - Every `newHeads` tick advances the last-seen block marker; only a forward
   jump or a backwards head forces a full rescan.
 - Reads core `paused`, `maxGasPrice`, `maxTradeSize(asset)` — all in **one**
@@ -1857,6 +1993,8 @@ cargo run --example capture_pin                      # reprint the pinned tables
 cargo test --test local_math -- --ignored --nocapture # local vs venues::quote_step
 cargo test --test pinned_block -- --ignored --nocapture --test-threads=1
 cargo test --test fork_simcache -- --ignored --nocapture
+cargo test --test dynamic_floors -- --ignored --nocapture
+./target/debug/ryo-watch --manifest deployments/8453.anvil.json floors
 
 # Read-only checks against live Base (no RyoCore needed; real prices)
 RYO_LIVE_RPC="$BASE_HTTP_RPC" RYO_LIVE_MANIFEST=deployments/8453.example.json \
@@ -1955,8 +2093,13 @@ on chain with `realized_gain == simulated_profit`, plus three fixes: stderr log
 writer, `effective_cap`, `skipped` metric) and the live 42-minute websocket run
 audited against the same window's chain history (§0o — 1,500 real swaps, every
 $500+ event triggered, gaps of 3-19 bps versus a 90 bps bar, and three more
-fixes: log colour escapes, SIGTERM shutdown, `--metrics-every`) are finished and
-verified against real Base.
+fixes: log colour escapes, SIGTERM shutdown, `--metrics-every`) and the
+per-pool dynamic trigger floors (§0p — live fee/depth read in one cached
+multicall, `max(c·D/2, √(P·D))` floors, fail-open to the configured minimum;
+$300 thin-pool skews that the fixed floor dropped now yield ~$39 opportunities
+on a fork, live scans drop ~3.5× with unchanged per-scan latency, and a
+10,538-event replay shows zero skipped trades that could clear their own
+costs) are finished and verified against real Base.
 Next in value order: cache only
 profit-related reverts in the failed-sim cache and separate the `RyoCore` and
 adapter error namespaces, which currently both claim `ZeroAddress()`. Then CI,

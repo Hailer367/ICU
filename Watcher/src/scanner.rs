@@ -30,6 +30,16 @@ use crate::venues::{self, QuoteRequest};
 /// Reuse a gas snapshot and ETH/USD price for this long. Bursts of pool logs
 /// otherwise re-read the same chain state several times in a row.
 const GAS_CACHE_TTL: Duration = Duration::from_secs(2);
+/// Reuse the per-pool trigger floors for this long. Fees and depth move far
+/// slower than prices; the floors are a "should I bother quoting" hint, not a
+/// money number, so short staleness is safe and keeps the hot path at zero
+/// extra round-trips.
+const POOL_FLOORS_TTL: Duration = Duration::from_secs(30);
+/// Uniswap V2 pools on Base charge the classic 0.30 % (`amm.rs` hard-codes the
+/// same `997/1000` for local pricing). Not readable from the pool contract.
+const UNIV2_FEE_BPS: f64 = 30.0;
+/// 2^96: `sqrtPriceX96` is the pool price scaled by this.
+const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
 /// Identity of a simulation candidate: asset, input amount, and the pools
 /// forming the route. Its market state changes only when one of those pools
 /// trades.
@@ -245,6 +255,11 @@ struct CachedGas {
     eth_usd: f64,
 }
 
+struct CachedPoolFloors {
+    at: Instant,
+    floors: PoolFloors,
+}
+
 /// Skipping re-simulations of losing candidates while their market inputs are
 /// unchanged.
 ///
@@ -352,6 +367,8 @@ pub struct Scanner {
     /// Cycles are static for a given registry and hop limit, so enumerate once.
     routes: HashMap<Address, Vec<Route>>,
     gas_cache: Mutex<Option<CachedGas>>,
+    /// Per-pool trigger floors, refreshed when older than `POOL_FLOORS_TTL`.
+    pool_floors: Mutex<Option<CachedPoolFloors>>,
     /// Chainlink feed decimals are immutable, so each feed is read once and
     /// remembered for the life of the scanner.
     feed_decimals: Mutex<HashMap<Address, u8>>,
@@ -409,6 +426,7 @@ impl Scanner {
             assets,
             routes,
             gas_cache: Mutex::new(None),
+            pool_floors: Mutex::new(None),
             feed_decimals: Mutex::new(HashMap::new()),
             deduper: Mutex::new(Deduper::default()),
             sim_cache: Mutex::new(FailedSimCache::default()),
@@ -447,6 +465,235 @@ impl Scanner {
             });
         }
         Ok((snapshot, eth_usd))
+    }
+
+    /// Per-pool trigger floors for the current batch: cached dynamic floors
+    /// when enabled, otherwise the single configured floor. Reads happen at
+    /// most once per `POOL_FLOORS_TTL` and the state is advisory (fees and
+    /// depth), never a reported number — so `latest` here is fine even though
+    /// every *money* read stays pinned.
+    /// Public view of the per-pool trigger floors (audience: the `floors`
+    /// CLI command and integration tests). Cached like the hot path.
+    pub async fn pool_floors(&self) -> PoolFloors {
+        self.trigger_floors().await
+    }
+
+    async fn trigger_floors(&self) -> PoolFloors {
+        if !self.settings.dynamic_floors {
+            return PoolFloors::fixed(self.min_swap_usd(), self.registry.pools.len());
+        }
+        {
+            let cache = self.pool_floors.lock().expect("pool floors mutex poisoned");
+            if let Some(cached) = cache.as_ref()
+                && cached.at.elapsed() < POOL_FLOORS_TTL
+            {
+                return cached.floors.clone();
+            }
+        }
+        let floors = self.read_pool_floors().await;
+        for (index, pool) in self.registry.pools.iter().enumerate() {
+            match floors.per_pool.get(index).and_then(|floor| *floor) {
+                Some(floor) => debug!(
+                    pool = %pool.address,
+                    venue = ?pool.venue,
+                    floor_usd = format!("{floor:.0}"),
+                    "trigger floor"
+                ),
+                None => debug!(
+                    pool = %pool.address,
+                    venue = ?pool.venue,
+                    floor_usd = floors.fallback,
+                    "trigger floor unavailable; using configured minimum"
+                ),
+            }
+        }
+        *self.pool_floors.lock().expect("pool floors mutex poisoned") = Some(CachedPoolFloors {
+            at: Instant::now(),
+            floors: floors.clone(),
+        });
+        floors
+    }
+
+    /// One Multicall3 round-trip reads every pool's fee and depth: reserves
+    /// for constant-product pools (plus the Aerodrome factory fee), and
+    /// `fee()` + `slot0` + `liquidity` for the concentrated ones. A pool whose
+    /// reads fail — or whose answers are not usable — keeps the fallback
+    /// floor; a missing floor means "scan as before", never "skip".
+    async fn read_pool_floors(&self) -> PoolFloors {
+        use crate::abi::{aerodrome_factory, cl_pool, pool};
+        use alloy::sol_types::SolCall;
+
+        let fallback = self.min_swap_usd();
+        let n_pools = self.registry.pools.len();
+        let quote_decimals = self
+            .registry
+            .token(base::USDC)
+            .map(|token| token.decimals)
+            .unwrap_or(6);
+
+        struct Plan {
+            index: usize,
+            depth: usize,
+            fee: Option<usize>,
+            liquidity: Option<usize>,
+        }
+        let mut calls: Vec<(Address, Bytes)> = Vec::new();
+        let mut plans: Vec<Plan> = Vec::new();
+        for (index, cp_pool) in self.registry.pools.iter().enumerate() {
+            let mut plan = Plan {
+                index,
+                depth: calls.len(),
+                fee: None,
+                liquidity: None,
+            };
+            match cp_pool.venue {
+                Venue::UniV2 => {
+                    calls.push((
+                        cp_pool.address,
+                        pool::getReservesCall {}.abi_encode().into(),
+                    ));
+                }
+                Venue::Aerodrome { stable } => {
+                    calls.push((
+                        cp_pool.address,
+                        pool::getReservesCall {}.abi_encode().into(),
+                    ));
+                    plan.fee = Some(calls.len());
+                    calls.push((
+                        base::AERODROME_FACTORY,
+                        aerodrome_factory::getFeeCall {
+                            pool: cp_pool.address,
+                            stable,
+                        }
+                        .abi_encode()
+                        .into(),
+                    ));
+                }
+                Venue::UniV3 { .. } | Venue::Slipstream { .. } => {
+                    calls.push((cp_pool.address, cl_pool::slot0Call {}.abi_encode().into()));
+                    plan.fee = Some(calls.len());
+                    calls.push((cp_pool.address, cl_pool::feeCall {}.abi_encode().into()));
+                    plan.liquidity = Some(calls.len());
+                    calls.push((
+                        cp_pool.address,
+                        cl_pool::liquidityCall {}.abi_encode().into(),
+                    ));
+                }
+            }
+            plans.push(plan);
+        }
+
+        let results = chain::multicall_raw(&self.provider, &calls, BlockId::latest()).await;
+        let decoded = |idx: usize| -> Option<Bytes> {
+            results
+                .get(idx)
+                .and_then(|value| value.as_ref().ok())
+                .cloned()
+        };
+        let slot0_sqrt = |data: &Bytes| -> Option<f64> {
+            // Word 0 of slot0 is sqrtPriceX96 in every V3-family layout.
+            data.get(..32)
+                .map(|word| u256_to_f64(U256::from_be_slice(word)))
+        };
+
+        let mut fees: Vec<Option<f64>> = vec![None; n_pools];
+        let mut depths: Vec<Option<f64>> = vec![None; n_pools];
+        for plan in &plans {
+            let cp_pool = &self.registry.pools[plan.index];
+            match cp_pool.venue {
+                Venue::UniV2 | Venue::Aerodrome { .. } => {
+                    // Uniswap V2 charges the classic 0.30 % and exposes no fee
+                    // getter; Aerodrome's factory answer is already basis
+                    // points, bounded like in `cp_pools`.
+                    let fee = match cp_pool.venue {
+                        Venue::UniV2 => Some(UNIV2_FEE_BPS),
+                        _ => match plan.fee.and_then(decoded) {
+                            Some(data) => aerodrome_factory::getFeeCall::abi_decode_returns(&data)
+                                .ok()
+                                .filter(|fee| *fee <= AERO_FEE_MAX)
+                                .map(u256_to_f64),
+                            None => None,
+                        },
+                    };
+                    fees[plan.index] = fee;
+                    depths[plan.index] = decoded(plan.depth)
+                        .and_then(|data| pool::getReservesCall::abi_decode_returns(&data).ok())
+                        .and_then(|reserves| {
+                            let raw = if cp_pool.token0 == base::USDC {
+                                reserves.reserve0
+                            } else if cp_pool.token1 == base::USDC {
+                                reserves.reserve1
+                            } else {
+                                return None;
+                            };
+                            Some(gas::raw_to_f64(raw, quote_decimals))
+                        });
+                }
+                Venue::UniV3 { .. } | Venue::Slipstream { .. } => {
+                    fees[plan.index] = plan
+                        .fee
+                        .and_then(decoded)
+                        .and_then(|data| cl_pool::feeCall::abi_decode_returns(&data).ok())
+                        // Fee tiers are in millionths; basis points are 1/100
+                        // of that (833 raw = 8.33 bps).
+                        .map(|fee| f64::from(fee.to::<u32>()) / 100.0);
+                    let sqrt = decoded(plan.depth).as_ref().and_then(slot0_sqrt);
+                    depths[plan.index] = match (sqrt, plan.liquidity.and_then(decoded)) {
+                        (Some(sqrt), Some(liq_data)) => {
+                            cl_pool::liquidityCall::abi_decode_returns(&liq_data)
+                                .ok()
+                                .and_then(|liq| {
+                                    cl_depth_usd(sqrt, u256_to_f64(U256::from(liq)), quote_decimals)
+                                })
+                        }
+                        _ => None,
+                    };
+                }
+            }
+        }
+
+        // Cheapest partner fee across the *other* pools with a known fee.
+        let cheapest_excluding = |index: usize| -> Option<f64> {
+            fees.iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .filter_map(|(_, fee)| *fee)
+                .fold(None, |min: Option<f64>, fee| {
+                    Some(min.map_or(fee, |m| m.min(fee)))
+                })
+        };
+
+        let slippage = f64::from(self.settings.per_leg_slippage_bps);
+        let buffer = f64::from(self.settings.min_profit_buffer_bps);
+        let per_pool = (0..n_pools)
+            .map(|index| {
+                let (Some(depth), Some(fee_self)) = (depths[index], fees[index]) else {
+                    return None;
+                };
+                let fee_partner = cheapest_excluding(index).unwrap_or(fee_self);
+                let cost_frac = (fee_self + fee_partner + 2.0 * slippage + buffer) / 10_000.0;
+                trigger_floor_usd(depth, cost_frac, self.settings.min_net_profit_usd)
+            })
+            .collect::<Vec<Option<f64>>>();
+        let rows = self
+            .registry
+            .pools
+            .iter()
+            .enumerate()
+            .map(|(index, pool)| PoolFloorRow {
+                address: pool.address,
+                venue: pool.venue.label(),
+                fee_bps: fees[index],
+                depth_usd: depths[index],
+                floor_usd: per_pool[index].unwrap_or(fallback),
+                dynamic: per_pool[index].is_some(),
+            })
+            .collect();
+        PoolFloors {
+            per_pool,
+            fallback,
+            rows,
+        }
     }
 
     /// Read and cache the decimals for every configured asset's USD feed.
@@ -667,6 +914,11 @@ impl Scanner {
                 .expect("dedupe mutex poisoned")
                 .contains(key)
         };
+        // Cached per-pool floors (or the configured fixed floor when dynamic
+        // floors are off). Advisory only: a fetch failure leaves every pool on
+        // the configured floor inside `PoolFloors`.
+        let floors = self.trigger_floors().await;
+        let floor_of = |pool: Option<usize>| floors.floor_for(pool);
         // Scoped so the guard is dropped long before the evaluate await.
         let plan = {
             let mut last_block = self.last_block.lock().expect("last block mutex poisoned");
@@ -674,7 +926,7 @@ impl Scanner {
                 triggers,
                 &mut last_block,
                 &self.pool_index,
-                self.min_swap_usd(),
+                &floor_of,
                 &notional_of,
                 &is_seen,
             )
@@ -1885,6 +2137,100 @@ fn effective_min_swap_usd(configured: f64) -> f64 {
     configured.max(ABSOLUTE_MIN_SWAP_USD)
 }
 
+/// One row of the trigger-floor table: what the reader measured about a pool
+/// and the floor it produced (or the fallback it will use).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolFloorRow {
+    pub address: Address,
+    pub venue: String,
+    /// Swap fee in basis points, read from the pool/factory. `None` when the
+    /// read failed.
+    pub fee_bps: Option<f64>,
+    /// In-range USD depth. `None` when the read failed or is not usable.
+    pub depth_usd: Option<f64>,
+    /// The floor this pool actually uses (computed, or the fallback).
+    pub floor_usd: f64,
+    /// Whether `floor_usd` came from live fee/depth reads.
+    pub dynamic: bool,
+}
+
+/// Per-pool trigger floors for one registry cycle. `per_pool` is indexed by
+/// registry pool order; a `None` entry means the pool's fee or depth could
+/// not be read this cycle, and it falls back to the configured fixed floor.
+/// Floors only decide whether it is worth *quoting* a pool: they never
+/// participate in any reported money number.
+#[derive(Debug, Clone)]
+pub struct PoolFloors {
+    per_pool: Vec<Option<f64>>,
+    fallback: f64,
+    rows: Vec<PoolFloorRow>,
+}
+
+impl PoolFloors {
+    /// One fixed floor for every pool — dynamic floors disabled, or no
+    /// context could be read at all.
+    fn fixed(floor_usd: f64, pools: usize) -> Self {
+        Self {
+            per_pool: vec![None; pools],
+            fallback: floor_usd,
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn floor_for(&self, pool: Option<usize>) -> f64 {
+        pool.and_then(|index| self.per_pool.get(index))
+            .and_then(|floor| *floor)
+            .unwrap_or(self.fallback)
+    }
+
+    /// Audit view: one row per pool with the measured fee, depth, and floor.
+    pub fn rows(&self) -> &[PoolFloorRow] {
+        &self.rows
+    }
+}
+
+/// The smallest swap (USD) that could possibly make a pool worth scanning.
+///
+/// Model (§0f's edge estimate, made pool-specific): a swap of size `s` into
+/// a pool of USD depth `D` moves its price by about `m = 2s/D`. For any route
+/// touching that pool to clear the gates, the gap it leaves must at least pay
+/// the round-trip cost `c` (this pool's fee + the cheapest partner's fee +
+/// per-leg slippage + the profit buffer), so `s ≥ c·D/2`; and the closable
+/// edge `≈ ½·m·s = s²/D` must reach the profit target `P`, so `s ≥ √(P·D)`.
+/// Both are necessary conditions, hence the `max`. Every approximation here
+/// errs toward *overestimating* the achievable edge (an infinitely deep
+/// partner pool, constant-product behaviour on stable curves), so a
+/// borderline swap still scans: a floor must never skip a trade the gates
+/// would have taken.
+fn trigger_floor_usd(depth_usd: f64, cost_frac: f64, profit_usd: f64) -> Option<f64> {
+    if !depth_usd.is_finite()
+        || depth_usd <= 0.0
+        || !cost_frac.is_finite()
+        || cost_frac < 0.0
+        || !profit_usd.is_finite()
+        || profit_usd < 0.0
+    {
+        return None;
+    }
+    let fee_bound = cost_frac * depth_usd / 2.0;
+    let edge_bound = (profit_usd * depth_usd).sqrt();
+    Some(fee_bound.max(edge_bound).max(ABSOLUTE_MIN_SWAP_USD))
+}
+
+/// In-range USD depth of a V3-family pool from `slot0`'s first word
+/// (`sqrtPriceX96`) and `liquidity`: the virtual reserve on the quote side is
+/// `L·√P` in raw token units, identical in USD on either side of the pair.
+fn cl_depth_usd(sqrt_price_x96: f64, liquidity: f64, quote_decimals: u8) -> Option<f64> {
+    if !sqrt_price_x96.is_finite()
+        || sqrt_price_x96 <= 0.0
+        || !liquidity.is_finite()
+        || liquidity <= 0.0
+    {
+        return None;
+    }
+    Some(liquidity * (sqrt_price_x96 / Q96) / (10f64).powi(i32::from(quote_decimals)))
+}
+
 /// Tradable ceiling for an asset: `min(manifest cap, core cap)` — and **zero
 /// on either side disables the asset**. On-chain `maxTradeSize == 0` is the
 /// owner's "not tradable" switch (any `execute` reverts), not "unset"; the
@@ -1918,7 +2264,7 @@ fn plan_batch(
     triggers: &[Trigger],
     last_block: &mut Option<u64>,
     pool_index: &HashMap<Address, usize>,
-    min_swap_usd: f64,
+    floor_of: &dyn Fn(Option<usize>) -> f64,
     notional_of: &dyn Fn(&Log) -> Option<f64>,
     is_seen: &dyn Fn(&TriggerKey) -> bool,
 ) -> BatchPlan {
@@ -1955,21 +2301,23 @@ fn plan_batch(
             }
             Trigger::Reconnect => full_scan = true,
             Trigger::Log { log, preconfirmed } => {
-                if let Some(notional) = notional_of(log)
-                    && notional < min_swap_usd
-                {
-                    notes.dust(notional, min_swap_usd);
-                    // Never marked as seen: the later mined duplicate of the
-                    // same log must still be evaluated.
-                    if let Some(candidate) = &key {
-                        batch_keys.remove(candidate);
+                let pool = pool_index.get(&log.address()).copied();
+                if let Some(notional) = notional_of(log) {
+                    let floor = floor_of(pool);
+                    if notional < floor {
+                        notes.dust(notional, floor);
+                        // Never marked as seen: the later mined duplicate of the
+                        // same log must still be evaluated.
+                        if let Some(candidate) = &key {
+                            batch_keys.remove(candidate);
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 if *preconfirmed {
                     block = ScanBlock::Pending;
                 }
-                match pool_index.get(&log.address()).copied() {
+                match pool {
                     Some(index) => {
                         pools.insert(index);
                         if let Some(candidate) = key {
@@ -1993,7 +2341,7 @@ fn plan_batch(
                         continue;
                     };
                     if let Some(notional) = notional_of(log)
-                        && notional < min_swap_usd
+                        && notional < floor_of(Some(index))
                     {
                         continue;
                     }
@@ -2318,6 +2666,151 @@ mod tests {
         assert!(dust < floor, "dust {dust} should be below floor {floor}");
         let large = swap_notional_usd(&v3_swap(5_000_000_000), &pool, 6).expect("notional");
         assert!(large >= floor, "large {large} should pass floor {floor}");
+    }
+
+    #[test]
+    fn trigger_floor_model_is_pool_specific() {
+        // Same $0.25 target and cost fraction, different depth: a deep pool
+        // needs a monster swap to move price, a thin one barely needs any.
+        let cost = (5.0 + 0.8 + 2.0 * 20.0 + 50.0) / 10_000.0;
+        let deep = trigger_floor_usd(42_000_000.0, cost, 0.25).expect("deep");
+        let thin = trigger_floor_usd(2_500.0, cost, 0.25).expect("thin");
+        assert!(deep > 100_000.0, "deep floor {deep}");
+        assert!(thin < 100.0, "thin floor {thin}");
+        assert!(deep > thin);
+        // Monotone in depth and in cost.
+        assert!(trigger_floor_usd(84_000_000.0, cost, 0.25).unwrap() > deep);
+        assert!(trigger_floor_usd(42_000_000.0, cost * 2.0, 0.25).unwrap() > deep);
+        // A higher profit target raises the floor.
+        assert!(trigger_floor_usd(2_500.0, cost, 5.0).unwrap() > thin);
+    }
+
+    #[test]
+    fn trigger_floor_takes_the_wider_of_fee_and_edge_bounds() {
+        let cost = 90.0 / 10_000.0;
+        // Fee-bound dominated (deep pool): 0.009 * 1e8 / 2 = 450k >> sqrt(0.25*1e8)=5k.
+        assert!((trigger_floor_usd(1e8, cost, 0.25).unwrap() - 450_000.0).abs() < 1.0);
+        // Edge-bound dominated (thin pool): sqrt(0.25*1e4) = 50 >> 0.009*1e4/2=45.
+        assert!((trigger_floor_usd(1e4, cost, 0.25).unwrap() - 50.0).abs() < 0.1);
+        // Never below the hard floor, no matter how small the numbers.
+        assert_eq!(
+            trigger_floor_usd(1.0, 0.0, 0.0).unwrap(),
+            ABSOLUTE_MIN_SWAP_USD
+        );
+    }
+
+    #[test]
+    fn trigger_floor_rejects_unusable_inputs() {
+        // A missing/absurd depth or cost yields `None`, which the caller turns
+        // into the configured fallback floor — never into "skip everything".
+        assert!(trigger_floor_usd(0.0, 0.01, 0.25).is_none());
+        assert!(trigger_floor_usd(-5.0, 0.01, 0.25).is_none());
+        assert!(trigger_floor_usd(f64::NAN, 0.01, 0.25).is_none());
+        assert!(trigger_floor_usd(f64::INFINITY, 0.01, 0.25).is_none());
+        assert!(trigger_floor_usd(1e6, -0.01, 0.25).is_none());
+        assert!(trigger_floor_usd(1e6, 0.01, f64::NAN).is_none());
+    }
+
+    #[test]
+    fn cl_depth_formula_matches_pinned_chain_reads() {
+        // slot0 word 0 (sqrtPriceX96) and liquidity of the live UniV3 0.05%
+        // USDC/WETH pool, captured 2026-11-02 from Base mainnet. The derived
+        // in-range depth is $42.39M at that moment; the assertion only checks
+        // the formula, and the range absorbs a few percent of price drift
+        // between capture and run (the numbers themselves are never recomputed
+        // from a formula the test re-states — they come off the chain).
+        let sqrt_raw = 0x000000000000000000000000000000000000000000031fcb609245c1e477ce4e_u128;
+        let liquidity = 0x0000000000000000000000000000000000000000000c5c4f5211f9991a_u128;
+        let depth = cl_depth_usd(sqrt_raw as f64, liquidity as f64, 6).expect("depth");
+        // Recomputed at read time the answer was $42,392,143; the raw price
+        // ratio moves slowly, so the formula output lands in this band for
+        // the captured pair of words — this is a formula pin, not a market pin.
+        assert!(
+            depth > 41.0e6 && depth < 44.0e6,
+            "depth {depth} outside the pinned band"
+        );
+    }
+
+    #[test]
+    fn cl_depth_scales_with_sqrt_price_and_declines_on_garbage() {
+        // At sqrtPriceX96 = 2^96 (raw price 1.0), depth is L in raw quote
+        // units: 2e12 raw USDC at 6 decimals = $2,000,000.
+        let q96 = 2f64.powi(96);
+        assert!(
+            (cl_depth_usd(q96, 2e12, 6).unwrap() - 2_000_000.0).abs() < 1.0,
+            "unit price must reduce to the raw quote reserve"
+        );
+        // Double the sqrt price quadruples raw price but only doubles depth.
+        assert!((cl_depth_usd(2.0 * q96, 2e12, 6).unwrap() - 4_000_000.0).abs() < 1.0);
+        assert!(cl_depth_usd(0.0, 2e12, 6).is_none());
+        assert!(cl_depth_usd(q96, 0.0, 6).is_none());
+        assert!(cl_depth_usd(q96, f64::NAN, 6).is_none());
+    }
+
+    #[test]
+    fn pool_floors_fall_back_per_pool() {
+        let floors = PoolFloors {
+            per_pool: vec![Some(10_000.0), None, Some(200.0)],
+            fallback: 500.0,
+            rows: Vec::new(),
+        };
+        assert_eq!(floors.floor_for(Some(0)), 10_000.0);
+        // A pool without a computed floor behaves exactly like the old filter.
+        assert_eq!(floors.floor_for(Some(1)), 500.0);
+        assert_eq!(floors.floor_for(Some(2)), 200.0);
+        // Unknown pools use the fallback too.
+        assert_eq!(floors.floor_for(None), 500.0);
+        // Out-of-range indices cannot panic.
+        assert_eq!(floors.floor_for(Some(99)), 500.0);
+        let fixed = PoolFloors::fixed(700.0, 3);
+        assert_eq!(fixed.floor_for(Some(0)), 700.0);
+        assert_eq!(fixed.floor_for(Some(2)), 700.0);
+    }
+
+    #[test]
+    fn dynamic_floors_are_per_pool_not_per_batch() {
+        // Same $300 swap, two pools, two floors: the thin pool scans, the
+        // deep pool's noise does not. With the old fixed filter both answers
+        // would have been identical.
+        let (a, b) = test_pools(); // a -> index 1, b -> index 0
+        let floors = PoolFloors {
+            per_pool: vec![Some(200.0), Some(50_000.0)],
+            fallback: 500.0,
+            rows: Vec::new(),
+        };
+        let floor_of = |pool: Option<usize>| floors.floor_for(pool);
+        let notional = |_: &Log| Some(300.0);
+        let thin = vec![log_trigger(b, 1, 0, false)]; // pool index 0, floor 200
+        let deep = vec![log_trigger(a, 2, 0, false)]; // pool index 1, floor 50k
+        let plan = plan_batch(
+            &thin,
+            &mut None,
+            &test_pool_index(),
+            &floor_of,
+            &notional,
+            &never_seen,
+        );
+        assert!(plan.scan, "thin-pool $300 swap clears its $200 floor");
+        assert_eq!(plan.affected, Some(vec![0]));
+        let plan = plan_batch(
+            &deep,
+            &mut None,
+            &test_pool_index(),
+            &floor_of,
+            &notional,
+            &never_seen,
+        );
+        assert!(
+            !plan.scan,
+            "deep-pool $300 swap is noise under a $50k floor"
+        );
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("$300") && n.contains("50000")),
+            "the skip must name the pool-specific floor: {:?}",
+            plan.notes
+        );
     }
 
     #[test]
@@ -2787,7 +3280,7 @@ mod tests {
             triggers,
             &mut None,
             &test_pool_index(),
-            500.0,
+            &|_: Option<usize>| 500.0,
             &not_a_swap,
             &never_seen,
         )
@@ -2841,7 +3334,7 @@ mod tests {
             &triggers,
             &mut last,
             &test_pool_index(),
-            500.0,
+            &|_: Option<usize>| 500.0,
             &not_a_swap,
             &|_| true,
         );
@@ -2877,7 +3370,7 @@ mod tests {
             &triggers,
             &mut last,
             &test_pool_index(),
-            500.0,
+            &|_: Option<usize>| 500.0,
             &|_| Some(100.0), // every log reads as a $100 swap
             &never_seen,
         );
@@ -2903,7 +3396,7 @@ mod tests {
             &triggers,
             &mut last,
             &test_pool_index(),
-            500.0,
+            &|_: Option<usize>| 500.0,
             &|_| {
                 let n = seen.replace(seen.get() + 1);
                 if n == 0 { Some(100.0) } else { None }
@@ -2923,7 +3416,7 @@ mod tests {
             &triggers,
             &mut last,
             &test_pool_index(),
-            500.0,
+            &|_: Option<usize>| 500.0,
             &not_a_swap,
             &never_seen,
         );
@@ -2940,7 +3433,7 @@ mod tests {
             &triggers,
             &mut last,
             &test_pool_index(),
-            500.0,
+            &|_: Option<usize>| 500.0,
             &not_a_swap,
             &never_seen,
         );

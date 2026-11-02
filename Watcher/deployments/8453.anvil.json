@@ -1,8 +1,8 @@
 {
   "chainId": 8453,
   "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-  "blockNumber": "53381435",
-  "timestamp": "1793552217",
+  "blockNumber": "53424807",
+  "timestamp": "1793638961",
   "core": "0x7Be6E341624D7f730f91CAa7867416D63DbEA219",
   "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
   "owner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",

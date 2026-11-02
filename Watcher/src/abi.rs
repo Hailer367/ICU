@@ -83,6 +83,19 @@ pub mod erc20 {
     }
 }
 
+/// Getters shared by Uniswap V3 and Aerodrome Slipstream pools.
+pub mod cl_pool {
+    alloy::sol! {
+        function fee() external view returns (uint24);
+        function liquidity() external view returns (uint128);
+        // V3-family pools all lead with the `sqrtPriceX96` word but differ in
+        // how many fields follow it, so callers read the raw first word rather
+        // than trusting a full tuple layout. Return types never affect the
+        // selector.
+        function slot0() external view returns (uint160 sqrtPriceX96);
+    }
+}
+
 pub mod univ3_quoter {
     alloy::sol! {
         struct QuoteExactInputSingleParams {

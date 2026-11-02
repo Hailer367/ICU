@@ -185,6 +185,10 @@ enum Command {
         /// when no opportunity was found.
         #[arg(long)]
         no_freshness: bool,
+        /// Use the fixed `--min-swap-usd` floor for every pool instead of
+        /// per-pool floors derived from live fee and depth.
+        #[arg(long)]
+        no_dynamic_floors: bool,
     },
     /// Subscribe to Base events and scan on each trigger.
     Watch {
@@ -212,6 +216,16 @@ enum Command {
         /// when no opportunity was found.
         #[arg(long)]
         no_freshness: bool,
+        /// Use the fixed `--min-swap-usd` floor for every pool instead of
+        /// per-pool floors derived from live fee and depth.
+        #[arg(long)]
+        no_dynamic_floors: bool,
+    },
+    /// Print the per-pool trigger floors (live fee, depth, and the minimum
+    /// swap USD the watcher will react to for each pool).
+    Floors {
+        #[arg(long)]
+        json: bool,
     },
     /// Download historical swap logs for the registry pools as JSONL.
     History {
@@ -293,9 +307,11 @@ async fn run() -> Result<()> {
             pending,
             json,
             no_freshness,
+            no_dynamic_floors,
         } => {
             let mut settings = settings;
             settings.freshness = !no_freshness;
+            settings.dynamic_floors = !no_dynamic_floors;
             scan_command(&settings, &pools, pending, json).await
         }
         Command::Watch {
@@ -306,9 +322,11 @@ async fn run() -> Result<()> {
             metrics_every,
             coalesce_ms,
             no_freshness,
+            no_dynamic_floors,
         } => {
             let mut settings = settings;
             settings.freshness = !no_freshness;
+            settings.dynamic_floors = !no_dynamic_floors;
             watch_command(
                 &settings,
                 cli.source,
@@ -322,6 +340,7 @@ async fn run() -> Result<()> {
             .await
         }
         Command::Decode { data } => decode_command(&data),
+        Command::Floors { json } => floors_command(&settings, json).await,
         Command::History {
             blocks,
             from_block,
@@ -351,6 +370,7 @@ fn settings_from_cli(cli: &Cli) -> Settings {
         fallback_gas: cli.fallback_gas,
         probe_amounts_usd: cli.probe_usd.clone(),
         min_swap_usd: cli.min_swap_usd,
+        dynamic_floors: true,
         freshness: true,
     }
 }
@@ -715,6 +735,64 @@ async fn plan_command(
     match scanner.plan(&route, amount).await? {
         Some(opportunity) => print_opportunity(&opportunity),
         None => println!("route is not profitable after gas"),
+    }
+    Ok(())
+}
+
+async fn floors_command(settings: &Settings, json: bool) -> Result<()> {
+    let manifest = load_manifest(settings)?;
+    let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
+    let mut floor_settings = settings.clone();
+    // The table only exists in dynamic mode; this command reads it regardless
+    // of how the watch invocation is configured.
+    floor_settings.dynamic_floors = true;
+    let scanner = Scanner::new(provider, manifest, floor_settings)?;
+    let floors = scanner.pool_floors().await;
+    if json {
+        let rows: Vec<serde_json::Value> = floors
+            .rows()
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "pool": row.address,
+                    "venue": row.venue,
+                    "feeBps": row.fee_bps,
+                    "depthUsd": row.depth_usd,
+                    "floorUsd": row.floor_usd,
+                    "dynamic": row.dynamic,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "fallbackFloorUsd": floors.floor_for(None),
+                "pools": rows,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "{:<4} {:<18} {:>9} {:>16} {:>14}",
+        "idx", "venue", "fee bps", "depth USD", "floor USD"
+    );
+    for (index, row) in floors.rows().iter().enumerate() {
+        println!(
+            "{index:<4} {:<18} {:>9} {:>16} {:>14}{}",
+            row.venue,
+            row.fee_bps
+                .map(|fee| format!("{fee:.1}"))
+                .unwrap_or_else(|| "-".to_string()),
+            row.depth_usd
+                .map(|depth| format!("{depth:.0}"))
+                .unwrap_or_else(|| "unavailable".to_string()),
+            format!("{:.0}", row.floor_usd),
+            if row.dynamic {
+                ""
+            } else {
+                "  (configured fallback)"
+            }
+        );
     }
     Ok(())
 }
