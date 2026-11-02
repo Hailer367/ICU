@@ -569,7 +569,7 @@ impl Scanner {
                         .into(),
                     ));
                 }
-                Venue::UniV3 { .. } | Venue::Slipstream { .. } => {
+                Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. } => {
                     calls.push((cp_pool.address, cl_pool::slot0Call {}.abi_encode().into()));
                     plan.fee = Some(calls.len());
                     calls.push((cp_pool.address, cl_pool::feeCall {}.abi_encode().into()));
@@ -629,7 +629,7 @@ impl Scanner {
                             Some(gas::raw_to_f64(raw, quote_decimals))
                         });
                 }
-                Venue::UniV3 { .. } | Venue::Slipstream { .. } => {
+                Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. } => {
                     fees[plan.index] = plan
                         .fee
                         .and_then(decoded)
@@ -1365,7 +1365,9 @@ impl Scanner {
                         Curve::AerodromeVolatile
                     }
                 }
-                Venue::UniV3 { .. } | Venue::Slipstream { .. } => continue,
+                Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. } => {
+                    continue
+                }
             };
             let reserve_idx = calls.len();
             calls.push((
@@ -2473,7 +2475,10 @@ fn elapsed_millis(started: Instant) -> u64 {
 }
 
 fn swap_notional_usd(log: &Log, pool: &crate::routes::Pool, usdc_decimals: u8) -> Option<f64> {
-    let concentrated = matches!(pool.venue, Venue::UniV3 { .. } | Venue::Slipstream { .. });
+    let concentrated = matches!(
+        pool.venue,
+        Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. }
+    );
     let (amount0, amount1) = history::swap_deltas(log, concentrated)?;
     let usdc = if pool.token0 == base::USDC {
         amount0
@@ -3059,7 +3064,8 @@ mod tests {
                     .any(|step| affected.contains(&step.pool_index))
             })
             .collect();
-        assert_eq!(filtered.len(), 22);
+        // A pool appears in 2n-2 two-hop cycles: n as the first leg, n-1 as the second.
+        assert_eq!(filtered.len(), 2 * registry.pools.len() - 2);
     }
 
     #[test]

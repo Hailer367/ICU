@@ -13,6 +13,9 @@ pub enum Venue {
     UniV3 { fee: u32 },
     Aerodrome { stable: bool },
     Slipstream { tick_spacing: i32 },
+    /// PancakeSwap V3. `fee` is one of Pancake's own tiers (100/500/2500/10000); Uniswap's 3000
+    /// tier does not exist there.
+    PancakeV3 { fee: u32 },
 }
 
 impl Venue {
@@ -22,6 +25,7 @@ impl Venue {
             Self::UniV3 { .. } => "univ3",
             Self::Aerodrome { .. } => "aerodrome",
             Self::Slipstream { .. } => "slipstream",
+            Self::PancakeV3 { .. } => "pancake",
         }
     }
 
@@ -37,6 +41,7 @@ impl Venue {
                 }
             }
             Self::Slipstream { tick_spacing } => format!("slipstream:{tick_spacing}"),
+            Self::PancakeV3 { fee } => format!("pancake:{fee}"),
         }
     }
 
@@ -56,6 +61,10 @@ impl Venue {
                 let word = I256::try_from(*tick_spacing as i64)
                     .expect("tick spacing fits in i256")
                     .to_be_bytes::<32>();
+                Bytes::copy_from_slice(&word)
+            }
+            Self::PancakeV3 { fee } => {
+                let word = U256::from(*fee).to_be_bytes::<32>();
                 Bytes::copy_from_slice(&word)
             }
         }
@@ -119,6 +128,12 @@ impl std::str::FromStr for Venue {
                     format!("slipstream tick spacing must be a number, got {detail:?}")
                 })?;
                 Ok(Self::Slipstream { tick_spacing })
+            }
+            "pancake" | "pcake" => {
+                let fee: u32 = detail
+                    .parse()
+                    .map_err(|_| format!("pancake fee must be a number, got {detail:?}"))?;
+                Ok(Self::PancakeV3 { fee })
             }
             other => Err(format!("unknown venue {other:?}")),
         }
@@ -305,6 +320,33 @@ impl Registry {
             Pool {
                 address: address!("148bc43946a902258916e580b0e6d92aaa74746f"),
                 venue: Venue::Slipstream { tick_spacing: 200 },
+                token0: weth,
+                token1: usdc,
+            },
+            // PancakeSwap V3. Checked with `pancakeV3Factory.getPool(WETH, USDC, fee)`; the
+            // 3000-tier that Uniswap has does not exist on Pancake, and Pancake's 2500 tier has
+            // no Uniswap counterpart.
+            Pool {
+                address: address!("72ab388e2e2f6facef59e3c3fa2c4e29011c2d38"),
+                venue: Venue::PancakeV3 { fee: 100 },
+                token0: weth,
+                token1: usdc,
+            },
+            Pool {
+                address: address!("b775272e537cc670c65dc852908ad47015244eaf"),
+                venue: Venue::PancakeV3 { fee: 500 },
+                token0: weth,
+                token1: usdc,
+            },
+            Pool {
+                address: address!("e9d76696f8a35e2e2520e3125875c3af23f1e69c"),
+                venue: Venue::PancakeV3 { fee: 2500 },
+                token0: weth,
+                token1: usdc,
+            },
+            Pool {
+                address: address!("118efef7db0712f03e067122b8f89e7a4b79262f"),
+                venue: Venue::PancakeV3 { fee: 10000 },
                 token0: weth,
                 token1: usdc,
             },
@@ -501,8 +543,22 @@ mod tests {
     #[test]
     fn usdc_weth_registry_has_expected_pools() {
         let registry = Registry::base_usdc_weth().unwrap();
-        assert_eq!(registry.pools.len(), 12);
-        assert_eq!(registry.edges.len(), 24);
+        assert_eq!(registry.pools.len(), 16);
+        assert_eq!(registry.edges.len(), 32);
+        // Every venue must be represented, otherwise a whole adapter sits unused.
+        for venue in [
+            Venue::UniV2,
+            Venue::UniV3 { fee: 100 },
+            Venue::Aerodrome { stable: false },
+            Venue::Slipstream { tick_spacing: 1 },
+            Venue::PancakeV3 { fee: 100 },
+        ] {
+            assert!(
+                registry.pools.iter().any(|p| p.venue == venue),
+                "registry is missing {}",
+                venue.label()
+            );
+        }
     }
 
     #[test]
@@ -510,8 +566,8 @@ mod tests {
         let registry = Registry::base_usdc_weth().unwrap();
         let asset = crate::config::base::USDC;
         let routes = enumerate_cycles(&registry, asset, 2);
-        // 12 ordered first legs, 11 remaining second legs (no pool reuse).
-        assert_eq!(routes.len(), 12 * 11);
+        // 16 ordered first legs, 15 remaining second legs (no pool reuse).
+        assert_eq!(routes.len(), 16 * 15);
         for route in &routes {
             assert_eq!(route.steps.len(), 2);
             assert_eq!(route.steps[0].token_in, asset);
@@ -523,6 +579,15 @@ mod tests {
     #[test]
     fn parses_venue_labels() {
         assert_eq!("univ2".parse::<Venue>().unwrap(), Venue::UniV2);
+        assert_eq!(
+            "pancake:2500".parse::<Venue>().unwrap(),
+            Venue::PancakeV3 { fee: 2500 }
+        );
+        assert_eq!(Venue::PancakeV3 { fee: 2500 }.adapter_name(), "pancake");
+        assert_eq!(
+            Venue::PancakeV3 { fee: 2500 }.data(),
+            Venue::UniV3 { fee: 2500 }.data()
+        );
         assert_eq!(
             "univ3:500".parse::<Venue>().unwrap(),
             Venue::UniV3 { fee: 500 }

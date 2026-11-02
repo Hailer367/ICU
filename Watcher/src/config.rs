@@ -307,6 +307,11 @@ pub mod base {
     pub const SLIPSTREAM_FACTORY: Address = address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
     pub const UNIV3_QUOTER: Address = address!("3d4e44Eb1374240CE5F1B871ab261CD16335B76a");
     pub const SLIPSTREAM_QUOTER: Address = address!("254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0");
+    // PancakeSwap V3. Its QuoterV2 is ABI-identical to Uniswap's; its SwapRouter is not (see
+    // IPancakeSwapRouter: the params struct keeps a `deadline`).
+    pub const PCAKE_V3_ROUTER: Address = address!("1b81D678ffb9C0263b24A97847620C99d213eB14");
+    pub const PCAKE_V3_FACTORY: Address = address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865");
+    pub const PCAKE_V3_QUOTER: Address = address!("B048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997");
 
     pub const WETH: Address = address!("4200000000000000000000000000000000000006");
     pub const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");

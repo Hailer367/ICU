@@ -70,6 +70,20 @@ pub fn encode_quote_call(
             };
             (base::SLIPSTREAM_QUOTER, call.abi_encode())
         }
+        Venue::PancakeV3 { fee } => {
+            // Pancake's QuoterV2 shares Uniswap's exact params layout, only the address differs.
+            let call = univ3_quoter::quoteExactInputSingleCall {
+                params: univ3_quoter::QuoteExactInputSingleParams {
+                    tokenIn: step.token_in,
+                    tokenOut: step.token_out,
+                    amountIn: amount_in,
+                    fee: alloy::primitives::aliases::U24::try_from(fee)
+                        .context("fee does not fit in uint24")?,
+                    sqrtPriceLimitX96: alloy::primitives::aliases::U160::ZERO,
+                },
+            };
+            (base::PCAKE_V3_QUOTER, call.abi_encode())
+        }
     };
     Ok((target, Bytes::from(data)))
 }
@@ -83,7 +97,7 @@ pub fn decode_quote_result(venue: Venue, data: &[u8]) -> Result<U256> {
                 .last()
                 .context("quote returned an empty amount array")?
         }
-        Venue::UniV3 { .. } => {
+        Venue::UniV3 { .. } | Venue::PancakeV3 { .. } => {
             let decoded = univ3_quoter::quoteExactInputSingleCall::abi_decode_returns(data)
                 .context("failed to decode UniV3 quote")?;
             decoded.amountOut

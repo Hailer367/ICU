@@ -1946,6 +1946,75 @@ those two.
 
 ---
 
+### 0q. PancakeSwap V3 as a fifth venue (2026-11-02)
+
+All facts below were read from live Base at block ~53.42M plus the upstream
+sources (`pancakeswap/pancake-v3-contracts` @ 9868479, `pancake-document`
+@ 7af8352, `infinity-core` @ 3c5ef1b).
+
+**Addresses (Base 8453).** Factory `0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865`,
+SwapRouter `0x1b81D678ffb9C0263b24A97847620C99d213eB14`, QuoterV2
+`0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997`. The router is *not* Uniswap's:
+`deployer()` on it returns Pancake's pool deployer
+`0x41ff9AA7e16B8B1a8a8dc4f0eFacd93D02d071c9`, and Uniswap's router at
+`0x2626664c…` has no `deployer()`.
+
+**Fee tiers are Pancake's own.** Live `feeAmountTickSpacing` gives
+`100→1, 500→10, 2500→50, 10000→200`; Uniswap's `3000` tier returns 0, and
+`60000`/dynamic returns 0 — there is no dynamic-fee V3 pool on this factory.
+`Venue::PancakeV3 { fee }` therefore takes the fee, exactly like `UniV3`, but
+the valid set differs; encoding `3000` reverts at swap time (covered by
+`test_fork_pancake_rejects_uniswap_only_tier`).
+
+**Router ABI differs.** Pancake's `ExactInputSingleParams` keeps a `deadline`
+field, so the selector is `0x414bf389`, not Uniswap's `0x04e45aaf`. Verified by
+probe: the Pancake router answers `0x414bf389` with its own `STF` revert (it
+reached `transferFrom`) and returns a bare revert for the Uniswap selector.
+`PancakeV3Adapter` therefore mirrors `UniV3Adapter` but binds
+`deadline = block.timestamp`. Output still goes straight to `params.recipient`
+(the core), so the adapter's "input consumed / output retained" invariants hold
+unchanged.
+
+**Quoting is drop-in.** Pancake's QuoterV2 is ABI-identical to Uniswap's
+(`quoteExactInputSingle((address,address,uint256,uint24,uint160))` → 0.1 WETH
+quoted 224.963696 USDC against a 2250.17 spot), so `venues.rs` reuses
+`univ3_quoter` with a different target address.
+
+**Event topic differs.** Pancake V3's `Swap` event appends
+`uint128 protocolFeesToken0, uint128 protocolFeesToken1`. The first five data
+words are unchanged, so `history::swap_deltas` reads the same offsets; only
+`is_swap_topic` and the log filter needed the second signature.
+
+**Fork results** (`forge test --match-path test/fork/PancakeFork.t.sol`, 6/6):
+one WETH through the real adapter → 2249.99 USDC for ~507k gas; a 2-hop
+`pancake:100 → univ3:500` cycle after a 4M USDC skew simulated +32.34 USDC on a
+100k loan and executed for **~3.00M gas** end to end.
+
+**Pool depth.** `getPool` over the 5 tracked assets × 4 tiers returns 32 live
+pools; 21 of them carry non-zero in-range liquidity. WETH/USDC Pancake depth is
+comparable to the Uniswap 0.01% pool, and the fee=100 tier is deep enough that
+1.5M USDC of one-way flow moves it only ~2 bps. Only the four WETH/USDC pools
+are in the registry so far, because those are the assets the core currently
+trades.
+
+**Pancake V2 is not worth wiring.** Its Base pairs are dust: WETH/USDC holds
+0.165 WETH + 373 USDC, WETH/cbBTC and USDC/cbBTC are effectively empty.
+
+**Pancake Infinity is a much larger job.** It is deployed on Base (Vault
+`0x238a358808379702088667322f80aC48bAd5e6c4`, CLPoolManager
+`0xa0FfB9c1CE1Fe56963B0321B32E7A0302114058b`), but it has no `unlock`/
+`SwapReceipt`: swaps must run inside `Vault.lock(...)` + `lockAcquired` and
+settle every delta (`settle`/`take` are `isLocked`-gated, one lock per tx), so
+an Infinity adapter is a callback state machine rather than a `step()`
+implementation. Pool state is read per-`PoolId` (`getSlot0`/`getLiquidity`,
+where `PoolId = keccak256` of the 6-slot `PoolKey` with `parameters` packing
+`tickSpacing << 16 | hook bitmap`), and a hook can override the LP fee and take
+a delta, so raw-state quoting is only valid for `hooks = 0` pools. Protocol fee
+is deducted from the input (`fee = pf + lp - pf*lp/1e6`, capped 0.4%), which the
+off-chain curve must model. Defer.
+
+---
+
 ## 8. Key protocol facts / gotchas
 
 - `RyoCore.simulate` **always reverts**. Success is
@@ -2099,8 +2168,13 @@ multicall, `max(c·D/2, √(P·D))` floors, fail-open to the configured minimum;
 $300 thin-pool skews that the fixed floor dropped now yield ~$39 opportunities
 on a fork, live scans drop ~3.5× with unchanged per-scan latency, and a
 10,538-event replay shows zero skipped trades that could clear their own
-costs) are finished and verified against real Base.
-Next in value order: cache only
+costs) and the PancakeSwap V3 venue (§0q — adapter, quoting, log topics and 16
+pool registry, 6/6 fork tests green) are finished and verified against real
+Base.
+Next in value order: measure the scan-latency cost of the larger registry
+(12→16 pools takes the two-hop cycle set from 132 to 240, so the probe/refine
+rounds nearly double), and deploy `PancakeV3Adapter` on mainnet before that
+venue can be executed for real. Then cache only
 profit-related reverts in the failed-sim cache and separate the `RyoCore` and
 adapter error namespaces, which currently both claim `ZeroAddress()`. Then CI,
 because every behavioural proof above is `#[ignore]`d and needs a live fork.

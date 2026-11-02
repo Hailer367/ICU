@@ -123,7 +123,11 @@ univ2
 univ3:100  univ3:500  univ3:3000  univ3:10000
 aerodrome:stable  aerodrome:volatile
 slipstream:1  slipstream:10  slipstream:50  slipstream:100  slipstream:200
+pancake:100  pancake:500  pancake:2500  pancake:10000
 ```
+
+Pancake's fee tiers are its own set: `3000` does not exist there and `2500`
+does not exist on Uniswap, so a `pancake:3000` label never resolves to a pool.
 
 `history` only reads logs and writes them under `data/` (git-ignored). The
 default `mainnet.base.org` endpoint rejects `eth_getLogs` with

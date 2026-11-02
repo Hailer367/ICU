@@ -79,7 +79,7 @@ fn curve_of(venue: Venue) -> Option<Curve> {
         Venue::UniV2 => Some(Curve::UniV2),
         Venue::Aerodrome { stable: false } => Some(Curve::AerodromeVolatile),
         Venue::Aerodrome { stable: true } => Some(Curve::AerodromeStable),
-        Venue::UniV3 { .. } | Venue::Slipstream { .. } => None,
+        Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. } => None,
     }
 }
 

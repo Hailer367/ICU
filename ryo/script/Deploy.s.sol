@@ -9,9 +9,10 @@ import { AerodromeClassicAdapter } from "../src/adapters/AerodromeClassicAdapter
 import { SlipstreamAdapter } from "../src/adapters/SlipstreamAdapter.sol";
 import { UniV2Adapter } from "../src/adapters/UniV2Adapter.sol";
 import { UniV3Adapter } from "../src/adapters/UniV3Adapter.sol";
+import { PancakeV3Adapter } from "../src/adapters/PancakeV3Adapter.sol";
 import { IBalancerVault } from "../src/interfaces/IBalancerVault.sol";
 
-/// @notice Deploys Ryo on Base: one core, four venue adapters, all whitelisted.
+/// @notice Deploys Ryo on Base: one core, five venue adapters, all whitelisted.
 /// @dev Every trade cap starts at zero (disabled). The owner must explicitly enable an asset and
 ///      set a size before the contract can trade. If OWNER differs from the deployer, ownership is
 ///      handed off at the end and the new owner must call `acceptOwnership()` afterwards.
@@ -41,6 +42,7 @@ contract Deploy is Script {
     address public constant UNIV2_ROUTER = 0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24;
     address public constant AERO_ROUTER = 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43;
     address public constant SLIP_ROUTER = 0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5;
+    address public constant PCAKE_V3_ROUTER = 0x1b81D678ffb9C0263b24A97847620C99d213eB14;
 
     address public constant WETH = 0x4200000000000000000000000000000000000006;
     address public constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
@@ -56,6 +58,7 @@ contract Deploy is Script {
         address uniV2;
         address aerodrome;
         address slipstream;
+        address pancake;
         address deployer;
         address owner;
         address operator;
@@ -94,11 +97,13 @@ contract Deploy is Script {
         UniV2Adapter uniV2 = new UniV2Adapter(address(core), UNIV2_ROUTER);
         AerodromeClassicAdapter aerodrome = new AerodromeClassicAdapter(address(core), AERO_ROUTER);
         SlipstreamAdapter slipstream = new SlipstreamAdapter(address(core), SLIP_ROUTER);
+        PancakeV3Adapter pancake = new PancakeV3Adapter(address(core), PCAKE_V3_ROUTER);
 
         core.setAdapter(address(uniV3), true);
         core.setAdapter(address(uniV2), true);
         core.setAdapter(address(aerodrome), true);
         core.setAdapter(address(slipstream), true);
+        core.setAdapter(address(pancake), true);
 
         if (maxGasPrice != 0) core.setMaxGasPrice(maxGasPrice);
         _setCapIfConfigured(core, WETH, capWeth);
@@ -117,6 +122,7 @@ contract Deploy is Script {
             uniV2: address(uniV2),
             aerodrome: address(aerodrome),
             slipstream: address(slipstream),
+            pancake: address(pancake),
             deployer: deployer,
             owner: owner,
             operator: operator,
@@ -137,6 +143,7 @@ contract Deploy is Script {
         console2.log("UniV2Adapter:       ", address(uniV2));
         console2.log("AerodromeAdapter:   ", address(aerodrome));
         console2.log("SlipstreamAdapter:  ", address(slipstream));
+        console2.log("PancakeV3Adapter:   ", address(pancake));
         console2.log("deployer:           ", deployer);
         console2.log("owner:              ", owner);
         console2.log("operator:           ", operator);
@@ -228,6 +235,9 @@ contract Deploy is Script {
             '",\n',
             '    "slipstream": "',
             _str(d.slipstream),
+            '",\n',
+            '    "pancake": "',
+            _str(d.pancake),
             '"\n',
             "  },\n"
         );
@@ -247,6 +257,9 @@ contract Deploy is Script {
             '",\n',
             '    "slipstream": "',
             _str(SLIP_ROUTER),
+            '",\n',
+            '    "pancake": "',
+            _str(PCAKE_V3_ROUTER),
             '"\n',
             "  },\n"
         );

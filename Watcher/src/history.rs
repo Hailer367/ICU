@@ -26,6 +26,10 @@ use crate::chain::ChainProvider;
 use crate::routes::{Pool, Registry, Venue};
 
 const SWAP_V3_SIG: &str = "Swap(address,address,int256,int256,uint160,uint128,int24)";
+/// Pancake V3 copies Uniswap's event but appends two protocol-fee words, so the topic differs
+/// while the first five data words are identical.
+const SWAP_PANCAKE_V3_SIG: &str =
+    "Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)";
 const SWAP_V2_SIG: &str = "Swap(address,uint256,uint256,uint256,uint256,address)";
 const SWAP_SOLIDLY_SIG: &str = "Swap(address,address,uint256,uint256,uint256,uint256)";
 
@@ -76,13 +80,18 @@ fn groups(registry: &Registry) -> Vec<Group> {
     let mut constant_product = Vec::new();
     for pool in &registry.pools {
         match pool.venue {
-            Venue::UniV3 { .. } | Venue::Slipstream { .. } => concentrated.push(pool.address),
+            Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. } => {
+                concentrated.push(pool.address)
+            }
             Venue::UniV2 | Venue::Aerodrome { .. } => constant_product.push(pool.address),
         }
     }
     vec![
         Group {
-            topics: vec![keccak256(SWAP_V3_SIG.as_bytes())],
+            topics: vec![
+                keccak256(SWAP_V3_SIG.as_bytes()),
+                keccak256(SWAP_PANCAKE_V3_SIG.as_bytes()),
+            ],
             addresses: concentrated,
             concentrated: true,
         },
@@ -125,7 +134,7 @@ fn is_swap_topic(log: &Log, concentrated: bool) -> bool {
         return false;
     };
     if concentrated {
-        *topic == signature_topic(SWAP_V3_SIG)
+        *topic == signature_topic(SWAP_V3_SIG) || *topic == signature_topic(SWAP_PANCAKE_V3_SIG)
     } else {
         *topic == signature_topic(SWAP_V2_SIG) || *topic == signature_topic(SWAP_SOLIDLY_SIG)
     }
