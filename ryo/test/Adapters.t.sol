@@ -91,7 +91,7 @@ contract AdaptersTest is Test {
     }
 
     function test_uniV3_zero_amount_reverts() public {
-        vm.expectRevert(AdapterBase.ZeroAmount.selector);
+        vm.expectRevert(AdapterBase.AdapterZeroAmount.selector);
         uniV3.step(address(tokenA), address(tokenB), 0, MIN_OUT, abi.encode(uint24(500)));
     }
 
@@ -316,22 +316,22 @@ contract AdaptersTest is Test {
     // ---------------------------------------------------------------------------------------------
 
     function test_adapter_constructor_rejects_zero_core() public {
-        vm.expectRevert(AdapterBase.ZeroAddress.selector);
+        vm.expectRevert(AdapterBase.AdapterZeroAddress.selector);
         new UniV3Adapter(address(0), address(v3Router));
     }
 
     function test_adapter_constructor_rejects_zero_router() public {
-        vm.expectRevert(AdapterBase.ZeroAddress.selector);
+        vm.expectRevert(AdapterBase.AdapterZeroAddress.selector);
         new UniV3Adapter(address(this), address(0));
     }
 
     function test_adapter_constructor_rejects_eoa_core() public {
-        vm.expectRevert(abi.encodeWithSelector(AdapterBase.NotContract.selector, stranger));
+        vm.expectRevert(abi.encodeWithSelector(AdapterBase.AdapterNotContract.selector, stranger));
         new UniV3Adapter(stranger, address(v3Router));
     }
 
     function test_adapter_constructor_rejects_eoa_router() public {
-        vm.expectRevert(abi.encodeWithSelector(AdapterBase.NotContract.selector, stranger));
+        vm.expectRevert(abi.encodeWithSelector(AdapterBase.AdapterNotContract.selector, stranger));
         new UniV3Adapter(address(this), stranger);
     }
 }

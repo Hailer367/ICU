@@ -2194,14 +2194,15 @@ on a fork, live scans drop ~3.5× with unchanged per-scan latency, and a
 10,538-event replay shows zero skipped trades that could clear their own
 costs) and the PancakeSwap V3 venue (§0q — adapter, quoting, log topics and 16
 pool registry, 6/6 fork tests green) are finished and verified against real
-Base.
+Base. The `RyoCore` / adapter error-namespace collision is fixed: `AdapterBase`
+now declares `AdapterZeroAddress`, `AdapterZeroAmount` and
+`AdapterNotContract(address)`. Before this, `errors.rs` matched the core branch
+first, so an adapter revert decoded as a core bug and the three adapter
+selectors were dead code; `core_and_adapter_namespaces_do_not_collide` pins it.
 Next in value order: measure the scan-latency cost of the larger registry
-(12→16 pools takes the two-hop cycle set from 132 to 240, so the probe/refine
-rounds nearly double), and deploy `PancakeV3Adapter` on mainnet before that
-venue can be executed for real. Then cache only
-profit-related reverts in the failed-sim cache and separate the `RyoCore` and
-adapter error namespaces, which currently both claim `ZeroAddress()`. Then CI,
-because every behavioural proof above is `#[ignore]`d and needs a live fork.
+(done, see §0q: ~3 % of probe time), deploy `PancakeV3Adapter` on mainnet, and
+cache only profit-related reverts in the failed-sim cache. Then CI, because
+every behavioural proof above is `#[ignore]`d and needs a live fork.
 Everything else that can be verified without a mainnet deployment is done: live
 Alchemy events (use `--source pending-logs` or `both`), full scan loop on a
 deployed fork, and the 24h dataset for replay.

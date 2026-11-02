@@ -124,9 +124,9 @@ pub enum CoreError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterError {
     Unauthorized,
-    ZeroAddress,
-    NotContract(Address),
-    ZeroAmount,
+    AdapterZeroAddress,
+    AdapterNotContract(Address),
+    AdapterZeroAmount,
     InvalidTokenPair,
     InvalidMinAmountOut,
     InvalidDataLength,
@@ -293,12 +293,12 @@ pub fn decode(data: &[u8]) -> DecodedError {
     // --- Adapters -------------------------------------------------------------------------
     let adapter = if sel == selector("Unauthorized()") {
         Some(AdapterError::Unauthorized)
-    } else if sel == selector("ZeroAddress()") {
-        Some(AdapterError::ZeroAddress)
-    } else if sel == selector("NotContract(address)") {
-        Some(AdapterError::NotContract(address_at(data, 0)))
-    } else if sel == selector("ZeroAmount()") {
-        Some(AdapterError::ZeroAmount)
+    } else if sel == selector("AdapterZeroAddress()") {
+        Some(AdapterError::AdapterZeroAddress)
+    } else if sel == selector("AdapterNotContract(address)") {
+        Some(AdapterError::AdapterNotContract(address_at(data, 0)))
+    } else if sel == selector("AdapterZeroAmount()") {
+        Some(AdapterError::AdapterZeroAmount)
     } else if sel == selector("InvalidTokenPair()") {
         Some(AdapterError::InvalidTokenPair)
     } else if sel == selector("InvalidMinAmountOut()") {
@@ -476,5 +476,30 @@ mod tests {
             }
             other => panic!("expected unknown, got {other:?}"),
         }
+    }
+
+    /// @dev The core and the adapters used to declare identically-named errors, so the core
+    /// branch matched first and an adapter revert was reported as a core bug. The adapter names
+    /// are now prefixed; this pins that the two namespaces stay separable.
+    #[test]
+    fn core_and_adapter_namespaces_do_not_collide() {
+        for (core, adapter) in [
+            ("ZeroAddress()", "AdapterZeroAddress()"),
+            ("ZeroAmount()", "AdapterZeroAmount()"),
+            ("NotContract(address)", "AdapterNotContract(address)"),
+        ] {
+            assert_ne!(selector(core), selector(adapter), "{core} vs {adapter}");
+        }
+
+        let from_core = decode(&selector("ZeroAddress()").to_vec());
+        assert!(matches!(
+            from_core,
+            DecodedError::Core(CoreError::ZeroAddress)
+        ));
+        let from_adapter = decode(&selector("AdapterZeroAddress()").to_vec());
+        assert!(matches!(
+            from_adapter,
+            DecodedError::Adapter(AdapterError::AdapterZeroAddress)
+        ));
     }
 }

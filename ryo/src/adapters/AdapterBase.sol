@@ -15,9 +15,9 @@ abstract contract AdapterBase {
     address public immutable router;
 
     error Unauthorized();
-    error ZeroAddress();
-    error NotContract(address target);
-    error ZeroAmount();
+    error AdapterZeroAddress();
+    error AdapterNotContract(address target);
+    error AdapterZeroAmount();
     error InvalidTokenPair();
     error InvalidMinAmountOut();
     error InvalidDataLength();
@@ -29,9 +29,9 @@ abstract contract AdapterBase {
     }
 
     constructor(address core_, address router_) {
-        if (core_ == address(0) || router_ == address(0)) revert ZeroAddress();
-        if (core_.code.length == 0) revert NotContract(core_);
-        if (router_.code.length == 0) revert NotContract(router_);
+        if (core_ == address(0) || router_ == address(0)) revert AdapterZeroAddress();
+        if (core_.code.length == 0) revert AdapterNotContract(core_);
+        if (router_.code.length == 0) revert AdapterNotContract(router_);
         core = core_;
         router = router_;
     }
@@ -40,9 +40,9 @@ abstract contract AdapterBase {
         internal
         pure
     {
-        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
+        if (tokenIn == address(0) || tokenOut == address(0)) revert AdapterZeroAddress();
         if (tokenIn == tokenOut) revert InvalidTokenPair();
-        if (amountIn == 0) revert ZeroAmount();
+        if (amountIn == 0) revert AdapterZeroAmount();
         if (minAmountOut == 0) revert InvalidMinAmountOut();
     }
 
