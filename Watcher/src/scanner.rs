@@ -111,8 +111,8 @@ pub struct Opportunity {
 }
 
 impl Opportunity {
-    pub fn venues(&self) -> Vec<String> {
-        self.route.venues()
+    pub fn labels(&self, registry: &crate::routes::Registry) -> Vec<String> {
+        self.route.labels(registry)
     }
 }
 
@@ -369,6 +369,10 @@ pub struct Scanner {
     gas_cache: Mutex<Option<CachedGas>>,
     /// Per-pool trigger floors, refreshed when older than `POOL_FLOORS_TTL`.
     pool_floors: Mutex<Option<CachedPoolFloors>>,
+    /// USD prices backing the floors and the dust screen, refreshed in the
+    /// same `POOL_FLOORS_TTL` round. Only feed-resolved assets appear; USDC
+    /// is constant and added on read (see `usd_price_map`).
+    trigger_prices: Mutex<HashMap<Address, f64>>,
     /// Chainlink feed decimals are immutable, so each feed is read once and
     /// remembered for the life of the scanner.
     feed_decimals: Mutex<HashMap<Address, u8>>,
@@ -381,7 +385,7 @@ pub struct Scanner {
 
 impl Scanner {
     pub fn new(provider: ChainProvider, manifest: Manifest, settings: Settings) -> Result<Self> {
-        let registry = Registry::base_usdc_weth()?;
+        let registry = Registry::base_curated()?;
         let mut pool_index = HashMap::new();
         for (index, pool) in registry.pools.iter().enumerate() {
             pool_index.insert(pool.address, index);
@@ -427,6 +431,7 @@ impl Scanner {
             routes,
             gas_cache: Mutex::new(None),
             pool_floors: Mutex::new(None),
+            trigger_prices: Mutex::new(HashMap::new()),
             feed_decimals: Mutex::new(HashMap::new()),
             deduper: Mutex::new(Deduper::default()),
             sim_cache: Mutex::new(FailedSimCache::default()),
@@ -478,6 +483,86 @@ impl Scanner {
         self.trigger_floors().await
     }
 
+    /// Feed the WETH/cbBTC/EURC legs of the trigger path with fresh USD
+    /// prices (one pin + one multicall per `POOL_FLOORS_TTL` round). A feed
+    /// that fails or goes stale keeps its previous answer out of the map
+    /// instead of poisoning a notional with a dead price; only USDC is ever
+    /// assumed ($1, the §0f premise).
+    async fn refresh_trigger_prices(&self) -> HashMap<Address, (f64, u8)> {
+        let requests: Vec<(Address, Address, u64)> = [base::WETH, base::CBBTC, base::EURC]
+            .into_iter()
+            .filter_map(|asset| {
+                gas::usd_feed_for_asset(asset).map(|(feed, age)| (asset, feed, age))
+            })
+            .collect();
+        let pin = match chain::Pin::resolve_latest(&self.provider).await {
+            Ok(pin) => pin,
+            Err(err) => {
+                warn!(error = %err, "trigger prices: could not resolve a pin; reusing cache");
+                return self.usd_price_map();
+            }
+        };
+        let feeds: Vec<Address> = requests.iter().map(|(_, feed, _)| *feed).collect();
+        self.ensure_feed_decimals(&feeds, pin.id()).await;
+        let decimals = self
+            .feed_decimals
+            .lock()
+            .expect("feed decimals mutex poisoned")
+            .clone();
+        let resolved = gas::feed_prices(
+            &self.provider,
+            &requests
+                .iter()
+                .map(|(_, feed, age)| (*feed, *age))
+                .collect::<Vec<_>>(),
+            &pin,
+            &decimals,
+        )
+        .await;
+        let mut fresh: HashMap<Address, f64> = HashMap::new();
+        for (asset, feed, _age) in &requests {
+            let asset = *asset;
+            match resolved.get(feed) {
+                Some(Ok(price)) if *price > 0.0 => {
+                    fresh.insert(asset, *price);
+                }
+                other => {
+                    debug!(
+                        asset = %self.registry.symbol(asset),
+                        reason = ?other,
+                        "trigger price unavailable for this round"
+                    );
+                }
+            }
+        }
+        *self
+            .trigger_prices
+            .lock()
+            .expect("trigger prices mutex poisoned") = fresh;
+        self.usd_price_map()
+    }
+
+    /// `(address -> (USD price, decimals))` for every token the trigger path
+    /// can price: USDC is constant, the rest ride the cached feed round. An
+    /// asset missing from the cache is left unpriced — the dust screen and
+    /// the depth math then fall back exactly as they did pre-§0s.
+    fn usd_price_map(&self) -> HashMap<Address, (f64, u8)> {
+        let mut out = HashMap::new();
+        if let Some(usdc) = self.registry.token(base::USDC) {
+            out.insert(base::USDC, (1.0, usdc.decimals));
+        }
+        let cache = self
+            .trigger_prices
+            .lock()
+            .expect("trigger prices mutex poisoned");
+        for (asset, price) in cache.iter() {
+            if let Some(token) = self.registry.token(*asset) {
+                out.insert(*asset, (*price, token.decimals));
+            }
+        }
+        out
+    }
+
     async fn trigger_floors(&self) -> PoolFloors {
         if !self.settings.dynamic_floors {
             return PoolFloors::fixed(self.min_swap_usd(), self.registry.pools.len());
@@ -490,7 +575,8 @@ impl Scanner {
                 return cached.floors.clone();
             }
         }
-        let floors = self.read_pool_floors().await;
+        let prices = self.refresh_trigger_prices().await;
+        let floors = self.read_pool_floors(&prices).await;
         for (index, pool) in self.registry.pools.iter().enumerate() {
             match floors.per_pool.get(index).and_then(|floor| *floor) {
                 Some(floor) => debug!(
@@ -519,17 +605,12 @@ impl Scanner {
     /// `fee()` + `slot0` + `liquidity` for the concentrated ones. A pool whose
     /// reads fail — or whose answers are not usable — keeps the fallback
     /// floor; a missing floor means "scan as before", never "skip".
-    async fn read_pool_floors(&self) -> PoolFloors {
+    async fn read_pool_floors(&self, prices: &HashMap<Address, (f64, u8)>) -> PoolFloors {
         use crate::abi::{aerodrome_factory, cl_pool, pool};
         use alloy::sol_types::SolCall;
 
         let fallback = self.min_swap_usd();
         let n_pools = self.registry.pools.len();
-        let quote_decimals = self
-            .registry
-            .token(base::USDC)
-            .map(|token| token.decimals)
-            .unwrap_or(6);
 
         struct Plan {
             index: usize,
@@ -616,17 +697,17 @@ impl Scanner {
                         },
                     };
                     fees[plan.index] = fee;
+                    // USD depth of a constant-product pool: the smaller
+                    // priced side. With only USDC priced this is exactly the
+                    // §0f USDC-side reserve.
                     depths[plan.index] = decoded(plan.depth)
                         .and_then(|data| pool::getReservesCall::abi_decode_returns(&data).ok())
                         .and_then(|reserves| {
-                            let raw = if cp_pool.token0 == base::USDC {
-                                reserves.reserve0
-                            } else if cp_pool.token1 == base::USDC {
-                                reserves.reserve1
-                            } else {
-                                return None;
-                            };
-                            Some(gas::raw_to_f64(raw, quote_decimals))
+                            let sides = [
+                                (cp_pool.token0, reserves.reserve0),
+                                (cp_pool.token1, reserves.reserve1),
+                            ];
+                            side_min_usd(&sides, prices)
                         });
                 }
                 Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. } => {
@@ -643,7 +724,12 @@ impl Scanner {
                             cl_pool::liquidityCall::abi_decode_returns(&liq_data)
                                 .ok()
                                 .and_then(|liq| {
-                                    cl_depth_usd(sqrt, u256_to_f64(U256::from(liq)), quote_decimals)
+                                    cl_depth_usd(
+                                        sqrt,
+                                        u256_to_f64(U256::from(liq)),
+                                        prices.get(&cp_pool.token0).copied(),
+                                        prices.get(&cp_pool.token1).copied(),
+                                    )
                                 })
                         }
                         _ => None,
@@ -680,13 +766,27 @@ impl Scanner {
             .pools
             .iter()
             .enumerate()
-            .map(|(index, pool)| PoolFloorRow {
-                address: pool.address,
-                venue: pool.venue.label(),
-                fee_bps: fees[index],
-                depth_usd: depths[index],
-                floor_usd: per_pool[index].unwrap_or(fallback),
-                dynamic: per_pool[index].is_some(),
+            .map(|(index, pool)| {
+                // The bare venue label is no longer unique across pairs;
+                // annotate non-legacy pools with the pair they sit on.
+                let venue = if pool.is_usdc_weth() {
+                    pool.venue.label()
+                } else {
+                    format!(
+                        "{} ({}/{})",
+                        pool.venue.label(),
+                        self.registry.symbol(pool.token0),
+                        self.registry.symbol(pool.token1)
+                    )
+                };
+                PoolFloorRow {
+                    address: pool.address,
+                    venue,
+                    fee_bps: fees[index],
+                    depth_usd: depths[index],
+                    floor_usd: per_pool[index].unwrap_or(fallback),
+                    dynamic: per_pool[index].is_some(),
+                }
             })
             .collect();
         PoolFloors {
@@ -808,17 +908,14 @@ impl Scanner {
         effective_min_swap_usd(self.settings.min_swap_usd)
     }
 
-    /// USD notional of a swap log, read from its USDC leg (USDC ≈ $1).
-    /// `None` when the log is not a swap or the pool is unknown; those logs are
-    /// left unfiltered rather than silently dropped.
+    /// USD notional of a swap log: the larger priced side (both sides are
+    /// near-equal by the pool invariant; the max errs toward scanning).
+    /// `None` when the log is not a swap, the pool is unknown, or no side has
+    /// a usable price — those logs are left unfiltered rather than silently
+    /// dropped.
     fn swap_notional_usd(&self, log: &Log) -> Option<f64> {
         let pool = self.registry.pool(*self.pool_index.get(&log.address())?);
-        let decimals = self
-            .registry
-            .token(base::USDC)
-            .map(|token| token.decimals)
-            .unwrap_or(6);
-        swap_notional_usd(log, pool, decimals)
+        swap_notional_usd(log, pool, &self.usd_price_map())
     }
 
     pub async fn scan_once(&self) -> Result<ScanReport> {
@@ -874,6 +971,7 @@ impl Scanner {
         };
         Ok(simulate_route(
             &self.provider,
+            &self.registry,
             &self.manifest,
             &self.settings,
             &symbol,
@@ -1246,6 +1344,7 @@ impl Scanner {
             // exactly the steps it returns as calldata.
             let (refreshed, definitive_loss) = simulate_route(
                 &self.provider,
+                &self.registry,
                 &self.manifest,
                 &self.settings,
                 &opportunity.asset_symbol,
@@ -1366,7 +1465,7 @@ impl Scanner {
                     }
                 }
                 Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. } => {
-                    continue
+                    continue;
                 }
             };
             let reserve_idx = calls.len();
@@ -1698,6 +1797,7 @@ impl Scanner {
                     .cloned()
                     .unwrap_or((U256::ZERO, Vec::new(), U256::ZERO));
             let provider = self.provider.clone();
+            let registry = self.registry.clone();
             let manifest = self.manifest.clone();
             let settings = self.settings.clone();
             let symbol = symbol.clone();
@@ -1707,6 +1807,7 @@ impl Scanner {
                 }
                 simulate_route(
                     &provider,
+                    &registry,
                     &manifest,
                     &settings,
                     &symbol,
@@ -1749,7 +1850,7 @@ impl Scanner {
                     net_usd = opportunity.net_usd,
                     profit_usd = opportunity.profit_usd,
                     gas_usd = opportunity.cost.total_fee_usd,
-                    venues = ?opportunity.venues(),
+                    route = ?opportunity.labels(&self.registry),
                     "opportunity"
                 );
                 report.opportunities.push(opportunity);
@@ -1911,6 +2012,7 @@ impl Scanner {
 #[allow(clippy::too_many_arguments)]
 async fn simulate_route(
     provider: &ChainProvider,
+    registry: &crate::routes::Registry,
     manifest: &Manifest,
     settings: &Settings,
     symbol: &str,
@@ -1952,7 +2054,7 @@ async fn simulate_route(
     {
         Ok(simulation) => simulation,
         Err(SimulateError::Revert { decoded, .. }) => {
-            debug!(route = ?route.venues(), %decoded, "simulation reverted");
+            debug!(route = ?route.labels(registry), %decoded, "simulation reverted");
             return (None, true);
         }
         Err(SimulateError::Transport(message)) => {
@@ -2020,7 +2122,7 @@ async fn simulate_route(
     let profit_usd = gas::profit_usd(profit_raw, decimals, asset_usd);
     let net_usd = profit_usd - cost.total_fee_usd;
     debug!(
-        route = ?route.venues(),
+        route = ?route.labels(registry),
         amount = %amount,
         profit_raw = %profit_raw,
         profit_usd,
@@ -2220,9 +2322,18 @@ fn trigger_floor_usd(depth_usd: f64, cost_frac: f64, profit_usd: f64) -> Option<
 }
 
 /// In-range USD depth of a V3-family pool from `slot0`'s first word
-/// (`sqrtPriceX96`) and `liquidity`: the virtual reserve on the quote side is
-/// `L·√P` in raw token units, identical in USD on either side of the pair.
-fn cl_depth_usd(sqrt_price_x96: f64, liquidity: f64, quote_decimals: u8) -> Option<f64> {
+/// (`sqrtPriceX96`) and `liquidity`: the two virtual reserves are
+/// `L·2^96/√P` of token0 and `L·√P/2^96` of token1 (raw units). Either side
+/// alone is the pool's USD depth (they are equal by construction, up to
+/// range), so the answer is the **smaller priced side** — if one side has no
+/// price, the other prices the pool; with no priced side there is no depth
+/// and the pool falls back to the configured floor.
+fn cl_depth_usd(
+    sqrt_price_x96: f64,
+    liquidity: f64,
+    token0: Option<(f64, u8)>,
+    token1: Option<(f64, u8)>,
+) -> Option<f64> {
     if !sqrt_price_x96.is_finite()
         || sqrt_price_x96 <= 0.0
         || !liquidity.is_finite()
@@ -2230,7 +2341,34 @@ fn cl_depth_usd(sqrt_price_x96: f64, liquidity: f64, quote_decimals: u8) -> Opti
     {
         return None;
     }
-    Some(liquidity * (sqrt_price_x96 / Q96) / (10f64).powi(i32::from(quote_decimals)))
+    let scaled = |raw: f64, (price, decimals): (f64, u8)| -> Option<f64> {
+        let usd = raw / 10f64.powi(i32::from(decimals)) * price;
+        (usd.is_finite() && usd > 0.0).then_some(usd)
+    };
+    let side0 = token0.and_then(|p| scaled(liquidity * Q96 / sqrt_price_x96, p));
+    let side1 = token1.and_then(|p| scaled(liquidity * sqrt_price_x96 / Q96, p));
+    match (side0, side1) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
+/// USD depth of a constant-product pool: the smaller priced side of
+/// `(token, raw reserve)` pairs. `None` only when no side has a price.
+fn side_min_usd(sides: &[(Address, U256)], prices: &HashMap<Address, (f64, u8)>) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for (token, raw) in sides {
+        let Some((price, decimals)) = prices.get(token) else {
+            continue;
+        };
+        let usd = gas::raw_to_f64(*raw, *decimals) * price;
+        if !usd.is_finite() || usd <= 0.0 {
+            continue;
+        }
+        best = Some(best.map_or(usd, |b| b.min(usd)));
+    }
+    best
 }
 
 /// Tradable ceiling for an asset: `min(manifest cap, core cap)` — and **zero
@@ -2474,20 +2612,27 @@ fn elapsed_millis(started: Instant) -> u64 {
     started.elapsed().as_millis() as u64
 }
 
-fn swap_notional_usd(log: &Log, pool: &crate::routes::Pool, usdc_decimals: u8) -> Option<f64> {
+fn swap_notional_usd(
+    log: &Log,
+    pool: &crate::routes::Pool,
+    prices: &HashMap<Address, (f64, u8)>,
+) -> Option<f64> {
     let concentrated = matches!(
         pool.venue,
         Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. }
     );
     let (amount0, amount1) = history::swap_deltas(log, concentrated)?;
-    let usdc = if pool.token0 == base::USDC {
-        amount0
-    } else if pool.token1 == base::USDC {
-        amount1
-    } else {
-        return None;
-    };
-    Some(gas::raw_to_f64(usdc.unsigned_abs(), usdc_decimals))
+    let mut best: Option<f64> = None;
+    for (token, amount) in [(pool.token0, amount0), (pool.token1, amount1)] {
+        let Some((price, decimals)) = prices.get(&token) else {
+            continue;
+        };
+        let usd = gas::raw_to_f64(amount.unsigned_abs(), *decimals) * price;
+        if usd.is_finite() {
+            best = Some(best.map_or(usd, |b| b.max(usd)));
+        }
+    }
+    best
 }
 
 /// Return the reason gas is too expensive, or `None` when both ceilings pass.
@@ -2595,6 +2740,11 @@ mod tests {
         }
     }
 
+    /// The pre-§0s pricing: only USDC is priced at its constant $1.
+    fn usdc_prices() -> HashMap<Address, (f64, u8)> {
+        HashMap::from([(base::USDC, (1.0, 6))])
+    }
+
     /// Concentrated swap with `usdc` (6-decimal units) as the token1 leg.
     fn v3_swap(usdc: i64) -> Log {
         let data = format!(
@@ -2639,12 +2789,72 @@ mod tests {
         let pool = weth_usdc_pool(Venue::UniV3 { fee: 500 });
         // Direction does not matter for size: +750 and -750 are both $750.
         assert_eq!(
-            swap_notional_usd(&v3_swap(750_000_000), &pool, 6),
+            swap_notional_usd(&v3_swap(750_000_000), &pool, &usdc_prices()),
             Some(750.0)
         );
         assert_eq!(
-            swap_notional_usd(&v3_swap(-750_000_000), &pool, 6),
+            swap_notional_usd(&v3_swap(-750_000_000), &pool, &usdc_prices()),
             Some(750.0)
+        );
+    }
+
+    #[test]
+    fn notional_prices_a_cb_btc_leg_when_usdc_is_absent() {
+        // The §0s expansion: WETH/cbBTC pools had no USDC leg and were left
+        // unfiltered. With the BTC feed cached, the cbBTC leg now has a size.
+        let pool = Pool {
+            address: base::CBBTC,
+            venue: Venue::UniV3 { fee: 500 },
+            token0: base::WETH,
+            token1: base::CBBTC,
+        };
+        let prices = HashMap::from([(base::CBBTC, (77_000.0f64, 8u8))]);
+        // 0.05 cbBTC (5e6 raw sats) into the pool.
+        let notional = swap_notional_usd(&v3_swap(5_000_000), &pool, &prices).expect("notional");
+        assert!((notional - 3_850.0).abs() < 1e-6, "notional {notional}");
+        // Still unpriced when the feed never landed: unfiltered, not zero.
+        assert!(
+            swap_notional_usd(&v3_swap(5_000_000), &pool, &usdc_prices()).is_none(),
+            "a pool without a priced leg must stay unfiltered"
+        );
+    }
+
+    #[test]
+    fn notional_takes_the_larger_priced_side() {
+        // Both sides of a swap carry roughly the same USD; rounding and fees
+        // make them differ slightly. Taking the max errs toward scanning —
+        // the side a floor must never skip a trade on.
+        let pool = weth_usdc_pool(Venue::UniV3 { fee: 500 });
+        let data = format!(
+            "0x{}{}{}{}{}",
+            // token0 (WETH) out: 0.350877 ETH, and token1 (USDC) in: $750.
+            signed_word(-350_877_192_982_456_140),
+            signed_word(750_000_000),
+            hex_word("0"),
+            hex_word("0"),
+            hex_word("0")
+        );
+        let log = log_from_json(json!({
+            "address": base::WETH.to_string(),
+            "topics": [format!("{:#x}", keccak256(SWAP_V3_SIG.as_bytes()))],
+            "data": data,
+            "blockNumber": "0x1",
+            "transactionIndex": "0x0",
+            "logIndex": "0x0"
+        }));
+        assert_eq!(
+            swap_notional_usd(&log, &pool, &usdc_prices()),
+            Some(750.0),
+            "USDC-only pricing is the §0f behaviour"
+        );
+        let prices_both = HashMap::from([
+            (base::USDC, (1.0f64, 6u8)),
+            (base::WETH, (2_280.0f64, 18u8)),
+        ]);
+        let both = swap_notional_usd(&log, &pool, &prices_both).expect("notional");
+        assert!(
+            (both - 800.0).abs() < 0.1,
+            "the WETH side (0.350877 * 2280 ≈ $800) must beat the USDC side, got {both}"
         );
     }
 
@@ -2653,12 +2863,12 @@ mod tests {
         let pool = weth_usdc_pool(Venue::Aerodrome { stable: false });
         // 2,000 USDC into the pool: positive token1 delta.
         assert_eq!(
-            swap_notional_usd(&solidly_swap(2_000_000_000, 0), &pool, 6),
+            swap_notional_usd(&solidly_swap(2_000_000_000, 0), &pool, &usdc_prices()),
             Some(2_000.0)
         );
         // 500 USDC out and no USDC in: negative delta, same size.
         assert_eq!(
-            swap_notional_usd(&solidly_swap(0, 500_000_000), &pool, 6),
+            swap_notional_usd(&solidly_swap(0, 500_000_000), &pool, &usdc_prices()),
             Some(500.0)
         );
     }
@@ -2667,9 +2877,11 @@ mod tests {
     fn dust_swaps_fall_below_the_default_floor() {
         let pool = weth_usdc_pool(Venue::UniV3 { fee: 500 });
         let floor = effective_min_swap_usd(Settings::default().min_swap_usd);
-        let dust = swap_notional_usd(&v3_swap(30_000_000), &pool, 6).expect("notional");
+        let dust =
+            swap_notional_usd(&v3_swap(30_000_000), &pool, &usdc_prices()).expect("notional");
         assert!(dust < floor, "dust {dust} should be below floor {floor}");
-        let large = swap_notional_usd(&v3_swap(5_000_000_000), &pool, 6).expect("notional");
+        let large =
+            swap_notional_usd(&v3_swap(5_000_000_000), &pool, &usdc_prices()).expect("notional");
         assert!(large >= floor, "large {large} should pass floor {floor}");
     }
 
@@ -2726,7 +2938,8 @@ mod tests {
         // from a formula the test re-states — they come off the chain).
         let sqrt_raw = 0x000000000000000000000000000000000000000000031fcb609245c1e477ce4e_u128;
         let liquidity = 0x0000000000000000000000000000000000000000000c5c4f5211f9991a_u128;
-        let depth = cl_depth_usd(sqrt_raw as f64, liquidity as f64, 6).expect("depth");
+        let depth =
+            cl_depth_usd(sqrt_raw as f64, liquidity as f64, None, Some((1.0, 6))).expect("depth");
         // Recomputed at read time the answer was $42,392,143; the raw price
         // ratio moves slowly, so the formula output lands in this band for
         // the captured pair of words — this is a formula pin, not a market pin.
@@ -2742,14 +2955,56 @@ mod tests {
         // units: 2e12 raw USDC at 6 decimals = $2,000,000.
         let q96 = 2f64.powi(96);
         assert!(
-            (cl_depth_usd(q96, 2e12, 6).unwrap() - 2_000_000.0).abs() < 1.0,
+            (cl_depth_usd(q96, 2e12, None, Some((1.0, 6))).unwrap() - 2_000_000.0).abs() < 1.0,
             "unit price must reduce to the raw quote reserve"
         );
         // Double the sqrt price quadruples raw price but only doubles depth.
-        assert!((cl_depth_usd(2.0 * q96, 2e12, 6).unwrap() - 4_000_000.0).abs() < 1.0);
-        assert!(cl_depth_usd(0.0, 2e12, 6).is_none());
-        assert!(cl_depth_usd(q96, 0.0, 6).is_none());
-        assert!(cl_depth_usd(q96, f64::NAN, 6).is_none());
+        assert!(
+            (cl_depth_usd(2.0 * q96, 2e12, None, Some((1.0, 6))).unwrap() - 4_000_000.0).abs()
+                < 1.0
+        );
+        assert!(cl_depth_usd(0.0, 2e12, None, Some((1.0, 6))).is_none());
+        assert!(cl_depth_usd(q96, 0.0, None, Some((1.0, 6))).is_none());
+        assert!(cl_depth_usd(q96, f64::NAN, None, Some((1.0, 6))).is_none());
+    }
+
+    #[test]
+    fn cl_depth_prices_either_side_and_takes_the_min() {
+        // §0s generalization: USDC is not always token1. At raw price 1 with
+        // L = 1e11, the token0 side holds 1e11 raw token0 and the token1 side
+        // 1e11 raw token1. Token0 = USDC (6 dp) -> $100,000. Token1 = cbBTC
+        // (8 dp, $77k) -> 1000 BTC-units * 77,000 = $77,000,000. The depth is
+        // the *smaller* priced side, and each side alone is enough.
+        let q96 = 2f64.powi(96);
+        let usdc_side = Some((1.0f64, 6u8));
+        let cbbtc_side = Some((77_000.0f64, 8u8));
+        assert!((cl_depth_usd(q96, 1e11, usdc_side, cbbtc_side).unwrap() - 100_000.0).abs() < 1.0);
+        assert!(
+            (cl_depth_usd(q96, 1e11, usdc_side, None).unwrap() - 100_000.0).abs() < 1.0,
+            "one priced side prices the pool"
+        );
+        assert!(
+            (cl_depth_usd(q96, 1e11, None, cbbtc_side).unwrap() - 77_000_000.0).abs() < 1_000.0,
+            "the other side alone works too (token order independence)"
+        );
+        assert!(cl_depth_usd(q96, 1e11, None, None).is_none());
+    }
+
+    #[test]
+    fn constant_product_depth_uses_priced_sides() {
+        let usdc = base::USDC;
+        let weth = base::WETH;
+        let prices = HashMap::from([(usdc, (1.0f64, 6u8)), (weth, (2_000.0f64, 18u8))]);
+        // 10,000 WETH ($20M) and 1M USDC: the smaller priced side is $1M.
+        let sides = [
+            (weth, U256::from(10_000_000_000_000_000_000_000u128)),
+            (usdc, U256::from(1_000_000_000_000u128)),
+        ];
+        assert!((side_min_usd(&sides, &prices).unwrap() - 1_000_000.0).abs() < 1.0);
+        // Only the WETH side priced: it becomes the answer, not None.
+        let weth_only = HashMap::from([(weth, (2_000.0f64, 18u8))]);
+        assert!((side_min_usd(&sides, &weth_only).unwrap() - 20_000_000.0).abs() < 1.0);
+        assert!(side_min_usd(&sides, &HashMap::new()).is_none());
     }
 
     #[test]
@@ -2826,7 +3081,7 @@ mod tests {
             token0: base::WETH,
             token1: base::EURC,
         };
-        assert!(swap_notional_usd(&v3_swap(750_000_000), &pool, 6).is_none());
+        assert!(swap_notional_usd(&v3_swap(750_000_000), &pool, &usdc_prices()).is_none());
     }
 
     #[test]
@@ -2843,7 +3098,7 @@ mod tests {
             "transactionIndex": "0x0",
             "logIndex": "0x0"
         }));
-        assert!(swap_notional_usd(&log, &pool, 6).is_none());
+        assert!(swap_notional_usd(&log, &pool, &usdc_prices()).is_none());
     }
 
     #[test]
@@ -3052,7 +3307,7 @@ mod tests {
 
     #[test]
     fn affected_filter_selects_routes() {
-        let registry = Registry::base_usdc_weth().unwrap();
+        let registry = Registry::base_curated().unwrap();
         let routes = enumerate_cycles(&registry, base::USDC, 2);
         let affected = HashSet::from([0usize]);
         let filtered: Vec<_> = routes
@@ -3064,8 +3319,16 @@ mod tests {
                     .any(|step| affected.contains(&step.pool_index))
             })
             .collect();
-        // A pool appears in 2n-2 two-hop cycles: n as the first leg, n-1 as the second.
-        assert_eq!(filtered.len(), 2 * registry.pools.len() - 2);
+        // A pool appears in 2n-2 two-hop cycles *of its own pair*: n as the
+        // first leg, n-1 as the second. Pool 0 is WETH/USDC, which has 16
+        // pools; cross-pair pools no longer share those cycles.
+        let pair_size = registry
+            .pools
+            .iter()
+            .filter(|p| p.token0 == registry.pool(0).token0 && p.token1 == registry.pool(0).token1)
+            .count();
+        assert_eq!(pair_size, 16);
+        assert_eq!(filtered.len(), 2 * pair_size - 2);
     }
 
     #[test]

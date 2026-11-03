@@ -1,7 +1,8 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-11-02 (per-pool dynamic trigger floors shipped and
-audited against live Base, a fork, and a 10k-event replay; see §0p)
+Last updated: 2026-11-03 (Tier-1 pair expansion shipped: cbBTC + EURC as
+intermediate legs, registry 33 pools, executed on forks and watched live;
+see §0s)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -2172,6 +2173,173 @@ Infinity deferred (§0q).
 
 ---
 
+### 0s. Tier-1 pair expansion shipped: cbBTC and EURC (2026-11-03)
+
+The §0r handoff was picked up and completed. The registry grows 16 → **33
+pools** across four tokens (USDC, WETH, cbBTC 8 dp, EURC 6 dp); borrow assets
+stay USDC/WETH, so cbBTC/EURC enter only as *intermediate* legs and their core
+caps stay 0 (asserted as an invariant in the Foundry suite). All five §0r
+design questions were answered with measurements, not assumptions.
+
+**Verification of §0r's data first.** Every address in §0r was re-checked
+against live Base (~block 53,469,965): 39/39 factory claims confirmed. Two
+corrections the doc itself warned about: the Aerodrome cbBTC/WETH pool §0r
+marked dead was **alive** ($72k depth) and is now registered — the "dead"
+flags are a momentary liquidity observation, never a permanent fact; and the
+UniV2 `getPair` §0r left unchecked exists for cbBTC/USDC and cbBTC/WETH but
+holds ~$1.6k — correctly skipped, along with every pool under ~$50k USD depth.
+Token0/token1 order was read from each pool (`token0()`), not derived: cbBTC
+pools have USDC as token0 (0x8335 < 0xcbB7) and EURC pools have EURC as
+token0 — the "WETH is always token0" comment in the registry only ever held
+for the original sixteen pools and is now scoped as such.
+
+**The five §0r questions, answered:**
+
+1. **Cycle count.** USDC 2-hop: 240 → 272; 3-hop adds 1,600 triangles (total
+   1,872; WETH 1,896). Measured like §0q (Anvil fork of live Base, redeployed
+   core, three warm full sweeps): 2-hop full scan ~950 ms probe (was ~292 ms
+   at 16 pools — the growth is linear in quotes, ~3,400 leg quotes per scan);
+   3-hop full scan 6.2 s (manual path only); 3-hop **trigger-targeted** scan
+   (one cbBTC hub pool affected) 836 ms warm-fork / ~730 ms live probe.
+   Default `max_hops` stays 2 — the conservative-default rule — but `--max-hops 3`
+   is now proven safe to run live: the 250 s live A/B below measured avg scan
+   153 ms (hops 2) vs 399 ms (hops 3) with failed=0, both inside the 2 s
+   block window with `pendingLogs`' ~1.2 s lead.
+2. **Registry restructure.** `Registry::base_usdc_weth()` → `Registry::base_curated()`
+   everywhere (7 call sites). New pools are **appended**: indices 0–15 keep
+   their meaning, which `--pools` and the older fork tests address pools by.
+   A unit test pins it (`registry.pools[..16].all(is_usdc_weth)`).
+3. **Non-USDC quote legs.** Both screens were generalized, fail-open:
+   - `swap_notional_usd` now prices **any leg with a USD price** and takes the
+     max (the max errs toward scanning; USDC stays constant $1 per §0f).
+     WETH/cbBTC/EURC prices come from their Chainlink feeds, refreshed once
+     per 30 s alongside the pool floors (one pin + one multicall). A pool with
+     no priced leg behaves exactly as before: unfiltered, never zeroed.
+   - `read_pool_floors` computes USD depth from the **smaller priced side**
+     instead of the USDC reserve — required because cbBTC pools list USDC as
+     token0 and cbBTC/WETH has no USDC side at all. `cl_depth_usd` gained the
+     second virtual reserve (`L·2^96/√P` for token0, `L·√P/2^96` for token1)
+     and takes the min of priced sides; the old pinned-value test passes with
+     the token1-side call shape unchanged, proving the rewrite is equivalent
+     on the legacy pools.
+4. **USD feeds.** `gas::usd_feed_for_asset` already walked BTC/USD (2 h stale)
+   and EUR/USD (24 h) — the floors' 30 s price refresh simply uses it. Live
+   floors table: **33/33 pools dynamic** on Alchemy (three consecutive runs;
+   one cold run showed 24/33 during a transient feed failure — the fail-open
+   worked exactly as designed: nine pools fell back to `$--min-swap-usd`, none
+   to a wrong price).
+5. **Caps.** cbBTC/EURC are never flash-loaned, so `maxTradeSize` is never
+   consulted for them; `Deploy.s.sol`'s `MAX_TRADE_CBBTC`/`MAX_TRADE_EURC`
+   env knobs write caps that stay 0 by default. The Foundry suite asserts
+   `maxTradeSize[cbBTC] == 0` as the "intermediate-only" invariant.
+
+**Route labels needed a grammar (new, not in §0r).** With `univ3:500` living
+on three pairs, a bare label is ambiguous. Labels now accept an optional exit
+token: `univ3:500:cbbtc` = "the 0.05% pool that swaps *into* cbBTC". Bare
+labels keep working — ambiguity resolves to the legacy USDC/WETH pool when one
+candidate is legacy; otherwise the parser errors and lists the suffixed
+options. `Route::labels(registry)` replaces `Route::venues()` everywhere
+(printing, JSON, debug logs) and round-trips through `parse_route` (unit
+tested on seven specs including triangles and the aerodrome 8-decimal leg).
+The `floors` table now annotates non-legacy pools with their pair
+(`univ3:500 (USDC/cbBTC)`).
+
+**Execution model: zero contract changes.** The adapters were already
+token-generic (balance-delta accounting, per-step approve/reset). The new
+paths needed only off-chain work — verified by execution on forks, which is
+the only proof that matters:
+
+- Rust fork suite `tests/tier1_expansion.rs` (4 tests, all green with
+  `RYO_FORK_EXECUTE=1`): cbBTC/USDC two-venue cycle executed — recipient
+  gained `6,950,641` USDC wei, exactly the simulated profit; EURC/USDC cycle
+  executed the same way (`13,443,639,577` wei = simulated); the **three-hop
+  triangle** `slipstream:100 > pancake:500:eurc > univ3:500` was found among
+  16 opportunities after a 60k USDC skew, executed and paid exactly its
+  simulation; registry coverage test asserts ≥6/7/2/1 pools per new pair.
+- Foundry `test/fork/Tier1Fork.t.sol` (6 tests, all green on live Base):
+  `USDC → cbBTC → USDC` through the real Balancer vault (+1,375.66 USDC
+  simulated = realized), the `USDC → WETH → cbBTC → USDC` triangle
+  (+584.01 USDC, 1.24M gas executed), EURC/USDC cycle, the shallow Aerodrome
+  cbBTC/WETH pool traded **in the correct direction** (buy cheap on Pancake,
+  sell into the skewed pool — the first draft had it backwards and simulated
+  a loss, which is exactly how a wrong-direction bug should fail), and
+  the intermediate-only cap invariant.
+- Two Foundry lessons cost real time: a manufactured 400k-USDC skew looks
+  huge until a 200k loan slips *more than the gap earns* (simulated −838
+  USDC); at 50k loan it clears. And a 1%+ price-impact swap on a
+  concentrated pool crosses many uninitialized ticks — measured **2.1M
+  gas**, so the fork tests' hard-coded 500k gas cap was out-of-gas-reverting
+  the EURC skew (status=false looks identical to a contract revert). Caps
+  raised to 3M with the reasoning inlined.
+- One latent bug fixed by re-reading my own new code: zipping `[WETH, CBBTC,
+  EURC]` against a `filter_map`'ed feed list would misattribute prices if a
+  feed mapping were ever removed; the pairs are now built atomically.
+- Regression after the change: **112 lib + 2 bin + mock-WS tests**, every
+  pre-existing fork suite (`fork_opportunity` with execute, `fork_simcache`,
+  `freshness_pass`, `pinned_block` ×4, `dynamic_floors`, `local_math`) green
+  on a fresh fork; full Foundry suite green.
+- `fork_simcache` needed one honest amendment: its "scan #2 must simulate
+  *fewer*" assertion encoded a 16-pool artifact. With a bigger candidate set
+  the simulation slots are refilled by the next-ranked routes when cached
+  losers are skipped (scan #1: sims 10 → scan #2: sims 8, cached 2 — the
+  cache fires, every winner reappears). The test now asserts the two real
+  invariants (cache fired; no winner disappeared) and its `assert!`s became
+  `bail!`s — the old file still had the §0n flaw: an assert panic unwinds
+  past `evm_revert` and poisons the fork for every later suite (observed
+  again during this session's first batch).
+- `dynamic_floors` expected "12 computed floors"; the correct expectation is
+  every registry pool dynamic (33/33), now derived from the registry.
+
+**Live watch campaign on the real websocket** (Alchemy WS + fork HTTP, the
+§0g configuration, 250 s each):
+
+| run | events | scans | skipped | failed | avg_scan_ms | avg_probe_ms | routes avg |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| hops=2 (default) | 1,211 | 46 | 353 | 0 | 153 | 289 | 56 |
+| hops=3 | 1,204 | 29 | 382 | 0 | 399 | 730 | 303 |
+
+Nine of the seventeen new pools produced triggers inside the 250 s window —
+`pancake:100 (USDC/cbBTC)` alone fired 150 times, `univ3:500 (USDC/cbBTC)` 48,
+`pancake:100 (WETH/cbBTC)` 56, plus slipstream/univ3-3000/pancake-500-500/
+weth-eurc pools — **traffic the 16-pool registry was blind to by construction**.
+174 swaps were skipped by per-pool floors that named their own pool's minimum
+(`swap ~$963 below the $304,642 minimum` — the live cbBTC/USDC 0.05% floor),
+and one Aerodrome stable-side leg legitimately reported `unpriced` (thin-pool
+quoter panic, same §0n behaviour). No head gaps, no reconnects, SIGTERM
+shutdown clean, key redacted in every line (`wss://base-mainnet.g.alchemy.com/<redacted>`).
+
+**Live mainnet round-trip sanity:** `quote --asset USDC --amount 2000 --route
+univ3:500:cbbtc,pancake:100:usdc` → 0.02582063 cbBTC → 1,997.99 USDC
+(−0.10%): 8-decimal scaling and cross-venue routing priced honestly on real
+state. Live `floors`: univ3:500 (cbbtc/usdc) depth $63.6M floor $304,809;
+univ3:500 (cbbtc/weth) $433M floor $2.07M; pancake:500 (weth/eurc) $456k floor
+$2,187; every legacy pool's floor unchanged from §0p within fee-drift noise
+— evidence the depth rewrite is neutral on the old pools.
+
+**Files touched:** `src/routes.rs` (registry, label grammar, `labels()`),
+`src/scanner.rs` (trigger prices, notional/depth generalization, labels in
+logs), `src/main.rs` (labels threaded through prints/JSON; floors pair
+annotation), `tests/tier1_expansion.rs` (new), `tests/fork_simcache.rs`,
+`tests/dynamic_floors.rs` (expectations amended), `ryo/test/fork/Tier1Fork.t.sol`
+(new), README (label grammar, 33-pool language, floors generalization).
+`deployments/8453.anvil.json` regenerated (5 adapters, block 53,466,7xx).
+
+**Environment notes this session:** Foundry 1.9.0 (new lint pass flags
+RyoCore's intentional per-step external calls — pre-existing, not errors);
+the node's anvil had the standard dev keys this time (§0r's funded-address
+gotcha did not recur); Alchemy serves 79-call `aggregate3` floor batches
+without complaint at normal rates.
+
+**Open threads left for the next session:** Pancake Infinity stays deferred
+(unchanged §0q verdict); Uniswap V4 support remains the biggest venue gap
+(~$11.5M/day unwatched); the second-order pairs from §0r (WETH/AERO,
+USDT/USDC, tokenized equity pools) were deliberately *not* added — same
+regime, same five questions apply; `--max-hops 3` as default is a judgment
+call the live A/B above now supports; and the mainnet deployment (core + 5
+adapters) is still the gating item for everything.
+
+---
+
 ## 8. Key protocol facts / gotchas
 
 - `RyoCore.simulate` **always reverts**. Success is
@@ -2310,33 +2478,12 @@ for you.
 
 ## 11. Next move (one line)
 
-#1 (local constant-product math, §0j), #2 (one pinned block per scan plus
-simulate-what-you-propose, §0k), the fail-closed cost reads (§0l — the L1
-fee upper bound is read per candidate at its real tx size and can no longer
-default to zero), the freshness pass (§0m — finalists re-priced at a new
-pin, all-or-nothing), the end-to-end campaign (§0n — every venue executed
-on chain with `realized_gain == simulated_profit`, plus three fixes: stderr log
-writer, `effective_cap`, `skipped` metric) and the live 42-minute websocket run
-audited against the same window's chain history (§0o — 1,500 real swaps, every
-$500+ event triggered, gaps of 3-19 bps versus a 90 bps bar, and three more
-fixes: log colour escapes, SIGTERM shutdown, `--metrics-every`) and the
-per-pool dynamic trigger floors (§0p — live fee/depth read in one cached
-multicall, `max(c·D/2, √(P·D))` floors, fail-open to the configured minimum;
-$300 thin-pool skews that the fixed floor dropped now yield ~$39 opportunities
-on a fork, live scans drop ~3.5× with unchanged per-scan latency, and a
-10,538-event replay shows zero skipped trades that could clear their own
-costs) and the PancakeSwap V3 venue (§0q — adapter, quoting, log topics and 16
-pool registry, 6/6 fork tests green) are finished and verified against real
-Base. The `RyoCore` / adapter error-namespace collision is fixed: `AdapterBase`
-now declares `AdapterZeroAddress`, `AdapterZeroAmount` and
-`AdapterNotContract(address)`. Before this, `errors.rs` matched the core branch
-first, so an adapter revert decoded as a core bug and the three adapter
-selectors were dead code; `core_and_adapter_namespaces_do_not_collide` pins it.
-Next in value order: deploy `PancakeV3Adapter` on mainnet, then pick up the
-Tier 1 pair expansion from §0r, which has the measured pool addresses, the five
-open design questions and the test plan written down. Then cache only
-profit-related reverts in the failed-sim cache. Then CI, because
-every behavioural proof above is `#[ignore]`d and needs a live fork.
-Everything else that can be verified without a mainnet deployment is done: live
-Alchemy events (use `--source pending-logs` or `both`), full scan loop on a
-deployed fork, and the 24h dataset for replay.
+The Tier-1 pair expansion (§0s) is finished and verified: registry at 33
+pools across USDC/WETH/cbBTC/EURC, executed two-venue cycles and triangles on
+forks (realized == simulated byte-for-byte), and nine of seventeen new pools
+triggering on the live websocket within a 4-minute window. Next in value
+order: deploy the core + five adapters on Base mainnet (the gating item for
+everything), then decide `--max-hops 3` as the default (the §0s live A/B —
+153 ms vs 399 ms avg scan — supports it), then Uniswap V4 (the largest venue
+gap), then cache only profit-related reverts in the failed-sim cache, then CI,
+because every behavioural proof above is `#[ignore]`d and needs a live fork.

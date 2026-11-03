@@ -490,7 +490,7 @@ async fn validate(settings: &Settings) -> Result<()> {
         require_code(&provider, address, name).await?;
     }
 
-    let registry = Registry::base_usdc_weth()?;
+    let registry = Registry::base_curated()?;
     for pool in &registry.pools {
         require_code(
             &provider,
@@ -585,7 +585,7 @@ async fn print_gas(settings: &Settings) -> Result<()> {
 }
 
 fn list_routes(settings: &Settings, asset_symbol: &str) -> Result<()> {
-    let registry = Registry::base_usdc_weth()?;
+    let registry = Registry::base_curated()?;
     let asset = match asset_symbol {
         "USDC" => base::USDC,
         "WETH" => base::WETH,
@@ -601,7 +601,7 @@ fn list_routes(settings: &Settings, asset_symbol: &str) -> Result<()> {
             .collect();
         println!(
             "{index:3} {}  [{}]",
-            route.venues().join(" > "),
+            route.labels(&registry).join(" > "),
             pools.join(", ")
         );
     }
@@ -615,7 +615,7 @@ async fn quote_command(
     route_spec: &str,
 ) -> Result<()> {
     let manifest = load_manifest(settings)?;
-    let registry = Registry::base_usdc_weth()?;
+    let registry = Registry::base_curated()?;
     let asset = resolve_asset(&manifest, &registry, asset_symbol)?;
     let decimals = registry
         .token(asset)
@@ -626,7 +626,7 @@ async fn quote_command(
     let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let quotes =
         venues::quote_route(&provider, &manifest, &route, amount, BlockId::latest()).await?;
-    println!("route: {}", route.venues().join(" > "));
+    println!("route: {}", route.labels(&registry).join(" > "));
     println!(
         "input: {} {}",
         format_amount(amount, decimals),
@@ -666,7 +666,7 @@ async fn simulate_command(
     route_spec: &str,
 ) -> Result<()> {
     let manifest = load_manifest(settings)?;
-    let registry = Registry::base_usdc_weth()?;
+    let registry = Registry::base_curated()?;
     let asset = resolve_asset(&manifest, &registry, asset_symbol)?;
     let decimals = registry
         .token(asset)
@@ -678,7 +678,7 @@ async fn simulate_command(
     let steps = simulate::discovery_steps(&route, &manifest)?;
     let pin = chain::Pin::resolve_latest(&provider).await?;
     println!("core:  {}", manifest.core);
-    println!("route: {}", route.venues().join(" > "));
+    println!("route: {}", route.labels(&registry).join(" > "));
     match simulate::simulate(&provider, manifest.core, asset, amount, steps, pin.id()).await {
         Ok(simulation) => {
             if simulation.profit <= alloy::primitives::I256::ZERO {
@@ -722,7 +722,7 @@ async fn plan_command(
     route_spec: &str,
 ) -> Result<()> {
     let manifest = load_manifest(settings)?;
-    let registry = Registry::base_usdc_weth()?;
+    let registry = Registry::base_curated()?;
     let asset = resolve_asset(&manifest, &registry, asset_symbol)?;
     let decimals = registry
         .token(asset)
@@ -733,7 +733,7 @@ async fn plan_command(
     let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
     let scanner = Scanner::new(provider, manifest, settings.clone())?;
     match scanner.plan(&route, amount).await? {
-        Some(opportunity) => print_opportunity(&opportunity),
+        Some(opportunity) => print_opportunity(&opportunity, scanner.registry()),
         None => println!("route is not profitable after gas"),
     }
     Ok(())
@@ -773,7 +773,7 @@ async fn floors_command(settings: &Settings, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<4} {:<18} {:>9} {:>16} {:>14}",
+        "{:<4} {:<24} {:>9} {:>16} {:>14}",
         "idx", "venue", "fee bps", "depth USD", "floor USD"
     );
     for (index, row) in floors.rows().iter().enumerate() {
@@ -827,9 +827,12 @@ async fn scan_command(
         scanner.evaluate(Some(pools.to_vec()), block).await?
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report_json(&report, scanner.registry()))?
+        );
     } else {
-        print_report(&report);
+        print_report(&report, scanner.registry());
     }
     Ok(())
 }
@@ -1071,9 +1074,12 @@ async fn watch_command(
         let millis = started.elapsed().as_millis();
         metrics.record(&report, millis);
         if json {
-            println!("{}", serde_json::to_string(&report_json(&report))?);
+            println!(
+                "{}",
+                serde_json::to_string(&report_json(&report, scanner.registry()))?
+            );
         } else if show_empty || !report.opportunities.is_empty() {
-            print_report(&report);
+            print_report(&report, scanner.registry());
         } else {
             debug!(
                 block = report.block,
@@ -1106,7 +1112,7 @@ async fn history_command(
     chunk: u64,
 ) -> Result<()> {
     let provider = chain::connect_auto(&settings.http_rpc, settings.ws_rpc.as_deref()).await?;
-    let registry = Registry::base_usdc_weth()?;
+    let registry = Registry::base_curated()?;
     let to_block = match to_block {
         Some(block) => block,
         None => chain::block_number(&provider).await?,
@@ -1150,7 +1156,7 @@ fn decode_command(data: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_report(report: &ScanReport) {
+fn print_report(report: &ScanReport, registry: &Registry) {
     println!(
         "block {} (drift {}) | routes {} | quotes {} | unpriced {} | simulations {} | sims cached {} | opportunities {}",
         report.block,
@@ -1191,7 +1197,7 @@ fn print_report(report: &ScanReport) {
                 token_decimals(&opportunity.asset_symbol)
             ),
             opportunity.asset_symbol,
-            opportunity.venues().join(" > ")
+            opportunity.labels(registry).join(" > ")
         );
         println!(
             "    amount={} profit_raw={} floors={:?} gas={} gasPrice={} block={} preconfirmed={}",
@@ -1207,13 +1213,13 @@ fn print_report(report: &ScanReport) {
     }
 }
 
-fn print_opportunity(opportunity: &Opportunity) {
+fn print_opportunity(opportunity: &Opportunity, registry: &Registry) {
     println!(
         "asset:      {} ({})",
         opportunity.asset_symbol, opportunity.asset
     );
     println!("amount:     {} raw", opportunity.amount);
-    println!("route:      {}", opportunity.venues().join(" > "));
+    println!("route:      {}", opportunity.labels(registry).join(" > "));
     println!("quotes:     {:?}", opportunity.quotes);
     println!("profit:     {} raw", opportunity.simulated_profit);
     println!("profit USD: ${:.4}", opportunity.profit_usd);
@@ -1227,7 +1233,7 @@ fn print_opportunity(opportunity: &Opportunity) {
     println!("calldata:   {}", opportunity.calldata);
 }
 
-fn report_json(report: &ScanReport) -> serde_json::Value {
+fn report_json(report: &ScanReport, registry: &Registry) -> serde_json::Value {
     serde_json::json!({
         "block": report.block,
         "pinHash": report.pin_hash.map(|hash| hash.to_string()),
@@ -1248,16 +1254,16 @@ fn report_json(report: &ScanReport) -> serde_json::Value {
             "simulate": report.simulate_ms,
             "fresh": report.fresh_ms,
         },
-        "opportunities": report.opportunities.iter().map(opportunity_json).collect::<Vec<_>>(),
+        "opportunities": report.opportunities.iter().map(|o| opportunity_json(o, registry)).collect::<Vec<_>>(),
     })
 }
 
-fn opportunity_json(opportunity: &Opportunity) -> serde_json::Value {
+fn opportunity_json(opportunity: &Opportunity, registry: &Registry) -> serde_json::Value {
     serde_json::json!({
         "asset": opportunity.asset.to_string(),
         "assetSymbol": opportunity.asset_symbol,
         "amount": opportunity.amount.to_string(),
-        "venues": opportunity.venues(),
+        "venues": opportunity.labels(registry),
         "quotes": opportunity.quotes.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "simulatedProfit": opportunity.simulated_profit.to_string(),
         "profitUsd": opportunity.profit_usd,

@@ -235,9 +235,13 @@ async fn run(provider: &ChainProvider) -> Result<()> {
     // ---- Claim 1: the floor table ------------------------------------------------
     let floors = dynamic.pool_floors().await;
     let rows = floors.rows();
-    if rows.len() != 12 || !rows.iter().all(|row| row.dynamic) {
+    // §0s grew the registry to 33 pools and made every priced side feed the
+    // floor math, so all pools — including the ones with no USDC leg — must
+    // now compute a dynamic floor.
+    let pool_count = dynamic.registry().pools.len();
+    if rows.len() != pool_count || !rows.iter().all(|row| row.dynamic) {
         bail!(
-            "expected 12 computed floors, got {} dynamic of {}",
+            "expected {pool_count} computed floors, got {} dynamic of {}",
             rows.iter().filter(|r| r.dynamic).count(),
             rows.len()
         );

@@ -241,7 +241,7 @@ async fn run(provider: &ChainProvider, rpc: &str, manifest_path: &str) -> Result
     eprintln!(
         "best: asset={} route={:?} amount={} profit_usd={:.4} net_usd={:.4} gas={}",
         opportunity.asset_symbol,
-        opportunity.venues(),
+        opportunity.labels(scanner.registry()),
         opportunity.amount,
         opportunity.profit_usd,
         opportunity.net_usd,

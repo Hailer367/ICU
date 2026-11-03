@@ -491,12 +491,12 @@ mod tests {
             assert_ne!(selector(core), selector(adapter), "{core} vs {adapter}");
         }
 
-        let from_core = decode(&selector("ZeroAddress()").to_vec());
+        let from_core = decode(selector("ZeroAddress()").as_ref());
         assert!(matches!(
             from_core,
             DecodedError::Core(CoreError::ZeroAddress)
         ));
-        let from_adapter = decode(&selector("AdapterZeroAddress()").to_vec());
+        let from_adapter = decode(selector("AdapterZeroAddress()").as_ref());
         assert!(matches!(
             from_adapter,
             DecodedError::Adapter(AdapterError::AdapterZeroAddress)

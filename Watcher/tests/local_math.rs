@@ -10,7 +10,7 @@
 //!
 //! Built so it cannot pass by accident:
 //!   * the pool set, token order and decimals come from the scanner's own
-//!     `Registry::base_usdc_weth()` — the same registry the watcher prices from;
+//!     `Registry::base_curated()` — the same registry the watcher prices from;
 //!   * the remote side is `venues::quote_step` itself (the crate's real
 //!     encode -> `eth_call` -> decode -> reject-zero path), not a copy of it;
 //!   * the local side is fed reserves and fees read back through the crate's own
@@ -203,7 +203,7 @@ fn remote_declined(error: &str) -> bool {
 
 async fn run(provider: &ChainProvider) -> Result<()> {
     let manifest = quote_only_manifest(&manifest_path())?;
-    let registry = Registry::base_usdc_weth()?;
+    let registry = Registry::base_curated()?;
 
     let head = chain::block_number(provider).await?;
     // Pin two blocks back so the head cannot advance out from under the sweep.

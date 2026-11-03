@@ -34,6 +34,7 @@ use anyhow::{Context, Result, bail};
 use ryo_watch::chain::{self, ChainProvider};
 use ryo_watch::config::{Manifest, Settings, base};
 use ryo_watch::events::Trigger;
+use ryo_watch::routes::Registry;
 use ryo_watch::scanner::{Opportunity, ScanReport, Scanner};
 use serde_json::Value;
 
@@ -196,11 +197,11 @@ fn build_settings(rpc: &str, manifest: &str) -> Settings {
     }
 }
 
-fn fingerprint(opportunity: &Opportunity) -> (String, U256, String) {
+fn fingerprint(opportunity: &Opportunity, registry: &Registry) -> (String, U256, String) {
     (
         opportunity.asset_symbol.clone(),
         opportunity.amount,
-        format!("{:?}", opportunity.venues()),
+        format!("{:?}", opportunity.labels(registry)),
     )
 }
 
@@ -240,36 +241,47 @@ async fn run(provider: &ChainProvider) -> Result<()> {
         .context("second full scan failed")?;
     log("scan #2", &second);
 
-    assert!(
-        first.simulations > 0,
-        "first scan simulated nothing even after the skew (routes={}, quotes={}); \
-         the fork produced no finalist, so the cache cannot be exercised",
-        first.routes_considered,
-        first.quotes
-    );
-    assert!(
-        second.sims_cached > 0,
-        "second full scan re-simulated everything (simulations={}, sims_cached={}); \
-         the failed-sim cache never fired on an unchanged chain",
-        second.simulations,
-        second.sims_cached
-    );
-    assert!(
-        second.simulations < first.simulations,
-        "cached losses did not reduce the simulation count: {} vs {}",
-        second.simulations,
-        first.simulations
+    if first.simulations == 0 {
+        // bail, not assert: a panic would unwind past evm_revert and leave
+        // the fork skewed for every later suite (§0n lesson).
+        bail!(
+            "first scan simulated nothing even after the skew (routes={}, quotes={}); \
+             the fork produced no finalist, so the cache cannot be exercised",
+            first.routes_considered,
+            first.quotes
+        );
+    }
+    if second.sims_cached == 0 {
+        bail!(
+            "second full scan re-simulated everything (simulations={}, sims_cached={}); \
+             the failed-sim cache never fired on an unchanged chain",
+            second.simulations,
+            second.sims_cached
+        );
+    }
+    // §0s: with the multi-pair registry the candidate set is larger than the
+    // per-scan simulation cap, so skipping cached losers just lets the
+    // next-ranked candidates into the freed slots. A lower total count is no
+    // longer guaranteed — and was never the point. The invariants that must
+    // hold are the two this suite checks: the cache fired (above) and no
+    // winner disappeared (below).
+    eprintln!(
+        "sim count: scan #1 {} -> scan #2 {} (cached {})",
+        first.simulations, second.simulations, second.sims_cached
     );
 
     // The cache must never hide a winner: every opportunity from scan #1 has
     // to reappear in scan #2 on the unchanged chain.
-    let second_keys: Vec<_> = second.opportunities.iter().map(fingerprint).collect();
+    let second_keys: Vec<_> = second
+        .opportunities
+        .iter()
+        .map(|o| fingerprint(o, scanner.registry()))
+        .collect();
     for opportunity in &first.opportunities {
-        let key = fingerprint(opportunity);
-        assert!(
-            second_keys.contains(&key),
-            "scan #2 lost an opportunity scan #1 found: {key:?}"
-        );
+        let key = fingerprint(opportunity, scanner.registry());
+        if !second_keys.contains(&key) {
+            bail!("scan #2 lost an opportunity scan #1 found: {key:?}");
+        }
     }
     Ok(())
 }

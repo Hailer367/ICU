@@ -57,7 +57,8 @@ src/errors.rs    revert decoding (RyoCore, adapters, OZ; routers/Balancer are no
 src/history.rs   historical Swap dataset for replay
 src/main.rs      CLI
 tests/           mock-WebSocket test, local-vs-onchain differential, ignored Anvil fork tests
-                 (opportunity, failed-sim cache, freshness pass)
+                 (opportunity, failed-sim cache, freshness pass, pinned block,
+                 dynamic floors, Tier-1 pair expansion)
 examples/        capture_pin.rs — regenerates the ground-truth tables pinned in src/amm.rs
 deployments/     machine-readable manifests written by ryo/script/Deploy.s.sol
 ```
@@ -105,7 +106,7 @@ The script writes the manifest in the exact shape this crate expects
 | `scan [--pools 0,1] [--pending] [--json] [--no-freshness] [--no-dynamic-floors]` | One scan (all pools, or only affected ones) |
 | `watch [--show-empty] [--no-scan] [--metrics-every N] [--coalesce-ms N] [--json] [--no-freshness] [--no-dynamic-floors]` | Event loop |
 | `floors [--json]` | Per-pool trigger table: live fee, USD depth, and the minimum swap the watcher reacts to |
-| `history [--blocks 43200] [--chunk 500] [--out data/swaps.jsonl]` | Downloads historical swap logs for the 12 pools as JSONL |
+| `history [--blocks 43200] [--chunk 500] [--out data/swaps.jsonl]` | Downloads historical swap logs for the 33 registry pools as JSONL |
 | `decode 0x...` | Decodes revert data |
 
 `--pools` uses the indices printed by `routes` / `validate`.
@@ -115,8 +116,8 @@ opportunity lines all go to stderr, so `scan --json | jq` never has to strip a
 prefix. Anything that consumes the watcher programmatically should rely on that
 separation.
 
-Route specs use `venue[:param]` labels, comma separated, starting and ending at
-`--asset`:
+Route specs use `venue[:param][:token]` labels, comma separated, starting and
+ending at `--asset`:
 
 ```
 univ2
@@ -126,8 +127,24 @@ slipstream:1  slipstream:10  slipstream:50  slipstream:100  slipstream:200
 pancake:100  pancake:500  pancake:2500  pancake:10000
 ```
 
+The optional `:token` names the leg's **exit** token and disambiguates a venue
+parameter that exists on several trading pairs: the registry now spans
+USDC, WETH, cbBTC and EURC, so `univ3:500:cbbtc` means "the 0.05% Uniswap V3
+pool that swaps into cbBTC". A bare label keeps working: when several pools
+match, it resolves to the USDC/WETH one (the legacy default every pre-expansion
+route string meant); when the candidates belong to no legacy pair the CLI
+errors out and lists the suffixed options to choose from. Route listings print
+exactly the strings that parse back to the same pools.
+
 Pancake's fee tiers are its own set: `3000` does not exist there and `2500`
 does not exist on Uniswap, so a `pancake:3000` label never resolves to a pool.
+
+Borrow assets are USDC and WETH only (the Balancer vault's deep holdings);
+cbBTC and EURC appear as *intermediate* legs, never as the flash-loaned asset
+— their `maxTradeSize` is deliberately 0 on the core. `--max-hops 3` unlocks
+cross-pair triangles (USDC → cbBTC → WETH → USDC and friends): full scans then
+enumerate ~1,900 routes per asset instead of ~280, so keep it for the
+trigger-driven path or budget for it.
 
 `history` only reads logs and writes them under `data/` (git-ignored). The
 default `mainnet.base.org` endpoint rejects `eth_getLogs` with
@@ -161,7 +178,7 @@ Opportunities must pass **all** gates: core not paused, watcher gas ceiling,
 core `maxGasPrice`, positive simulated profit, and net USD ≥
 `min-net-profit-usd`. Trade size is capped by `min(manifest cap, core cap)`.
 
-In `watch`, a swap in one of the 12 pools is the trigger. Swaps are ignored
+In `watch`, a swap in one of the 33 registry pools is the trigger. Swaps are ignored
 before any quoting when they are smaller than the pool's **dynamic trigger
 floor** (on by default; `--no-dynamic-floors` restores the fixed
 `--min-swap-usd`). One Multicall3 round-trip every 30 s reads each pool's live
@@ -170,6 +187,9 @@ move that pool enough to clear its own round-trip cost plus the configured
 buffers: a $500 swap moves the $40M UniV3 0.05% pool ~1 bp (skipped), while a
 $50 swap can clear a shallow pool (scanned). Every term of the model errs
 toward scanning; a floor must never skip a trade the gates would have taken.
+Depth and swap notional are priced in USD on **either** leg: USDC is constant,
+WETH/cbBTC/EURC ride their Chainlink feeds (30 s cache shared with the floor
+reads), so pools without a USDC side (cbBTC/WETH, WETH/EURC) are filtered too.
 Fail-open: any pool whose fee/depth cannot be read falls back to
 `--min-swap-usd`, and the $45 absolute floor applies in every mode. A skipped
 swap is never marked seen, so the two-phase dedupe semantics are unchanged.

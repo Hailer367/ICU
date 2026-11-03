@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn decodes_v3_swap() {
-        let registry = Registry::base_usdc_weth().unwrap();
+        let registry = Registry::base_curated().unwrap();
         // amount0=-1000, amount1=2000, sqrtPrice=5, liquidity=10, tick=-5
         let negative = format!("{:064x}", I256::from_raw(U256::MAX - U256::from(999u64)));
         let data = format!(
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn decodes_v2_swap() {
-        let registry = Registry::base_usdc_weth().unwrap();
+        let registry = Registry::base_curated().unwrap();
         // UniV2 pool address from the registry.
         let pool = registry
             .pools
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn constant_product_group_covers_v2_and_solidly_topics() {
-        let registry = Registry::base_usdc_weth().unwrap();
+        let registry = Registry::base_curated().unwrap();
         let groups = groups(&registry);
         assert_eq!(groups.len(), 2);
         let constant = groups
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn ignores_unknown_pool_and_short_data() {
-        let registry = Registry::base_usdc_weth().unwrap();
+        let registry = Registry::base_curated().unwrap();
         let log = log_from_json(json!({
             "address": "0x0000000000000000000000000000000000000001",
             "topics": [format!("{:#x}", keccak256(SWAP_V3_SIG.as_bytes()))],
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn rejects_non_swap_events() {
-        let registry = Registry::base_usdc_weth().unwrap();
+        let registry = Registry::base_curated().unwrap();
         // A V3 Mint has five data words, enough to look like a swap payload,
         // but its topic0 identifies a different event.
         let data = format!(

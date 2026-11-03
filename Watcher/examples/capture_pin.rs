@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "deployments/8453.anvil.json".to_string());
     let provider = chain::connect_http(&rpc).await?;
     let manifest = Manifest::load(&manifest_path)?;
-    let registry = Registry::base_usdc_weth()?;
+    let registry = Registry::base_curated()?;
     let head = chain::block_number(&provider).await?;
     let block = BlockId::from(head - 2);
     println!("PIN_BLOCK={head} pinned={}", head - 2);
