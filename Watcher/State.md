@@ -1,8 +1,8 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-11-03 (latency: scans pin from the socket's delivered
-head and candidate cost probes are batched — §0t; Tier-1 pair expansion
-shipped the same day — §0s)
+Last updated: 2026-11-03 (§0u scopes the one remaining big latency item —
+local swap math for the 29 concentrated pools; §0s shipped the Tier-1 pairs,
+§0t the socket-head pins and batched cost probes)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -2435,6 +2435,101 @@ read that correct behaviour as a failure.
 
 ---
 
+### 0u. The remaining big latency item: local swap math for the concentrated pools — scoped, NOT started (2026-11-03)
+
+This is the whole handoff for the next task; a fresh session needs nothing
+from the conversation that produced it.
+
+**What and why.** §0j priced only the constant-product pools locally (4 of
+the registry's 33: UniV2, both Aerodrome classic pools, aero cbBTC/WETH).
+The other **29 concentrated-liquidity pools** (UniV3 ×8 tiers, Slipstream ×7
+incl. cbBTC, Pancake V3 ×11 + the four new EURC/cbBTC tiers) are still
+quoted on chain via QuoterV2 `eth_call` batches. That quoting is now the
+dominant scan cost by every measurement taken this week: live `probe_ms`
+p50 = 314 ms (hops 2) / 730 ms (hops 3) vs core 50 ms and gas ~1 ms; warm
+fork full scan = ~1.0 s of which probe is ~95 %. §0t removed the pins and
+the per-candidate waves; the probe is what stands between this watcher and
+sub-100 ms reaction times. The bots that win cross-venue races keep pool
+state in RAM and compute quotes locally in microseconds.
+
+**The shape of the solution.** `amm.rs` already proves the pattern; the CL
+version needs one more piece: per-pool tick state, maintained incrementally
+from the Swap events the watcher *already receives* on its socket.
+
+1. Port the V3 swap-step math bit-for-bit: `SwapMath.computeSwapStep` +
+   `SqrtPriceMath` (direction-dependent rounding is part of the contract —
+   a "close enough" port will disagree with the quoter at the last wei and
+   fail the differential). Reference: `uniswap-v3-sdk` on docs.rs (a
+   feature-complete Rust port with the official unit tests),
+   `aleexeyy/clmm-swap-math` (in-memory V3Pool simulator), and the
+   computeSwapStep walkthroughs at uniswapv3book.com. Verify the choice
+   against upstream `v3-core` source, not a crate README.
+2. Per-pool cache: `slot0` (sqrtPriceX96, tick, liquidity) + initialized
+   ticks with their gross liquidity. Bootstrap per pool (tick bitmap walk,
+   batched through Multicall3, bounded to the tick range a probe size can
+   realistically cross), then apply each live Swap event's own
+   `sqrtPriceX96/liquidity/tick` words — the event carries the *answer*, so
+   steady-state maintenance is free. Reconnect and §0t's re-org-void path
+   force a re-bootstrap; staleness beyond a few blocks must degrade to
+   remote quoting, never to a wrong price.
+3. Fees: `fee()` is per-pool static state (already read for floors every
+   30 s); Slipstream fees do **not** follow tick spacing (§0p measured:
+   ts=10 and ts=50 charge 5 bps, ts=100 charges 8.33, ts=1 charges 0.8).
+   Pancake uses the same math with its own tier set (§0q); its Swap event's
+   extra `protocolFeesToken{0,1}` words do not affect quote math.
+4. The §0j rules bind again, non-negotiable: every operator `checked_*`
+   (U256's `+ - *` wrap silently); a local refusal means *quote it on
+   chain*, never *this route is unprofitable* (`price_leg`'s
+   `LegPrice::{Local, Onchain}` already has the right shape); and
+   `examples/capture_pin.rs`-style pinned ground truth generated from a
+   fork, not hand-written constants.
+
+**Decisions to make early (they shape everything else).**
+- *Pinned-state honesty.* Quotes computed from a cache updated by live
+  events describe "the chain as the socket saw it", not "one pinned block".
+  That is already how floors work (advisory, §0p), but quotes feed money
+  numbers: the opportunity path (`plan`, simulate-what-you-propose) must
+  keep quoting at the pin. The safe split — and probably the right one —
+  is local math for the PROBE/REFINE search (candidate selection, already
+  advisory: finalists are always re-simulated on chain at the pin by
+  `simulate_route`, so a stale quote can only mis-rank, never mis-pay) and
+  quoter calls for the finalists. Write this choice down in the code
+  before porting a single function.
+- *Where the cache lives*: the Scanner (it owns the event stream and the
+  dedupe/reconnect lifecycle) with a `HashMap<pool_index, ClPoolState>` +
+  tick cursors; not a global.
+- *Tick discovery bound*: cap ticks walked per direction per bootstrap
+  (probe sizes are ≤ $8k; the cheapest deep pools need tens of ticks,
+  thin ones hundreds — refuse and go remote past the cap).
+
+**Test plan.** Extend `tests/local_math.rs` (it already diffs local vs
+`venues::quote_step` itself, the scanner's real encode→eth_call→decode→
+reject-zero path, bail-style) with concentrated pools: amounts that (a) stay
+inside one tick, (b) cross initialized ticks, (c) cross initialized-and-
+zero-liquidity ranges, (d) large one-sided flows on the thin Slipstream
+pools — in both directions, per pool family. `amm.rs`-style adversarial
+sweeps for overflow discipline. A fork differential run + live Base run
+must both show exact-match counts (not tolerance) or consistent refusal.
+Then the §0p-style live A/B on the Alchemy socket: probe_ms p50 before/after
+over matched windows (this file's §0s/§0t tables are the template), and
+`fork_opportunity`/`tier1_expansion` execute runs to prove
+realized == simulated is untouched.
+
+**Measured baseline to beat** (2026-11-03, live Alchemy, unified endpoint,
+§0s/§0t builds): probe p50 314 ms / p95 334 ms (hops 2), 641/811 (hops 3);
+avg scan 153/399 ms; full warm-fork scan ~1.0 s / 6.2 s.
+
+**Related-but-separate leftovers** from the same review: `eth_simulateV1`
+would fold the execute gas estimate into §0t's batch (verified available on
+Alchemy Base — hash-pinnable, per-call `gasUsed`, revert capture — currently
+blocked: Anvil 1.9.0 returns a parse error for it, and every behavioural
+proof here runs on a fork); the freshness pass could consume socket heads
+instead of re-resolving once single-flight ordering is revisited; and
+`--max-hops 3` as the default (the §0s A/B supports it, and the local math
+makes 3-hop probes cheap too).
+
+---
+
 ## 8. Key protocol facts / gotchas
 
 - `RyoCore.simulate` **always reverts**. Success is
@@ -2573,15 +2668,13 @@ for you.
 
 ## 11. Next move (one line)
 
-The Tier-1 pair expansion (§0s) and the first two latency steps (§0t:
-socket-head pins, batched simulate+L1 probes, joined post-scan reads) are
-finished and verified. Next in value order: local tick-math pricing for the
-30 concentrated-liquidity pools (the remaining big latency item: probe p50
-314 ms live today; reference math in `uniswap-v3-sdk`, verification pattern
-already exists from §0j's differential), then `eth_simulateV1` candidate
-batches (works on Alchemy — hash-pinnable with per-call gas — blocked by
-Anvil support for the fork proofs), then decide `--max-hops 3` as the
-default (the §0s live A/B — 153 ms vs 399 ms avg scan — supports it), then
-deploy the core + five adapters on Base mainnet (the gating item for
-everything), then Uniswap V4 (largest venue gap), then cache only
-profit-related reverts in the failed-sim cache, then CI.
+Pick up **§0u: local swap math for the 29 concentrated pools** — it is the
+full handoff (scope, references, pinned decisions, test plan, and the
+measured baseline to beat). Everything before it is done and verified:
+Tier-1 pairs (§0s), socket-head pins and batched candidate probes (§0t).
+After §0u, in value order: decide `--max-hops 3` as the default (the §0s
+live A/B — 153 ms vs 399 ms — supports it), `eth_simulateV1` candidate
+batches once Anvil supports fork proofs of it (it works on Alchemy today),
+deploy the core + five adapters on Base mainnet (the gating item for going
+live), Uniswap V4 (largest venue gap), profit-only failed-sim caching,
+and CI.
