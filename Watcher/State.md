@@ -1,8 +1,8 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-11-03 (Tier-1 pair expansion shipped: cbBTC + EURC as
-intermediate legs, registry 33 pools, executed on forks and watched live;
-see §0s)
+Last updated: 2026-11-03 (latency: scans pin from the socket's delivered
+head and candidate cost probes are batched — §0t; Tier-1 pair expansion
+shipped the same day — §0s)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -2340,6 +2340,101 @@ adapters) is still the gating item for everything.
 
 ---
 
+### 0t. Latency: socket-head pins and batched candidate costs (2026-11-03)
+
+Two round-trip-elimination changes, requested as the speed follow-up to §0s.
+Both were scoped by first re-reading what already exists (the §0s review
+showed `chain::Pin::from_header` was sitting there unused, and recon proved
+`newHeads` was subscribed **only** for the `flashblocks` source).
+
+**#2 — the scan pins from the delivered header, not from a `latest` RPC.**
+- `newHeads` is now subscribed for every live source (`logs`,
+  `pending-logs`, `both` as well as `flashblocks`).
+- `parse_head` reads the full header shape (number, **hash**, timestamp,
+  baseFeePerGas); a zero hash (the `pending` pathology of §0k) or a missing
+  timestamp drops the head instead of pinning garbage. `Trigger::Head` now
+  carries `HeadInfo` (unit-tested parsing + an in-process WS fixture).
+- `Scanner` keeps the newest head as a `chain::Pin`; `evaluate` uses it with
+  **zero round-trips**. The freshness pass deliberately keeps
+  `Pin::resolve_latest`: the socket's heads are consumed in the batch
+  *before* the scan (single-flight), so during a scan the cached pin cannot
+  know about a newer block — resolving is the only honest way to find one.
+  The pinned-by-hash and
+  re-org guarantees are untouched: the pin carries the head's own hash, and
+  the post-scan header re-read still voids discarded blocks.
+- Trust rule: the head may only pin reads when the subscription and the
+  reads are the **same endpoint** (`chain::same_endpoint`, the §0i rule — a
+  head from Alchemy names a block a local fork has never seen and vice
+  versa). Split endpoints (the §0g test configuration) keep the old
+  `resolve_latest` behaviour exactly. `Reconnect` drops the cached head
+  until a fresh one lands.
+- New timing `pin_ms` (`timingsMs.pin`, `avg_pin_ms`): the pin RTT was the
+  one phase no metric admitted to (`head_started` began *after* resolving
+  it); now its elimination is visible as `avg_pin_ms=0`.
+- The post-scan re-org check and the drift read run concurrently
+  (`tokio::join!`) — one RTT where there were two.
+- Proof (fork, deterministic): `tests/pinned_block.rs::
+  scans_pin_from_delivered_head` pins the scanner to block `head-1` via a
+  synthetic head; the scan **must** report `head-1` (an RPC resolve can only
+  return the head), the hash must match, and a split-endpoint scanner must
+  ignore the same head. Reconnect restores the resolve path.
+
+**#3 — one batched cost probe per candidate.** `simulate_route` now issues
+`RyoCore.simulate` **and** `getL1FeeUpperBound` in a single pinned
+`aggregate3` (`chain::multicall3_outcomes`, which keeps raw revert payloads
+— `multicall_raw` collapses them to strings, and `simulate` answers through
+its revert). The L1 input is derived from the simulate calldata length:
+execute is the same encoding plus exactly one 32-byte `minProfit` word
+(`simulate::execute_calldata_len`, unit-pinned for every step count
+2..8 and every `data` width, and value-independent). The caller still
+asserts the real execute calldata matches that length — ABI drift becomes a
+loud inconclusive skip instead of a subtly mispriced fee. Classification is
+byte-identical to before: revert payload → definitive loss (cached);
+success-return, oracle failure, batch/transport error → inconclusive (never
+cached). The freshness pass (a sequential per-finalist loop) inherits the
+same batching.
+
+**What was considered and rejected:** `eth_simulateV1` works on Alchemy
+(hash-pinnable, per-call gasUsed, revert capture — all verified live) and
+would additionally let the execute dry-run itself report real gas. It is
+**unsupported by Anvil 1.9.0**, and every behavioural proof in this project
+runs on a fork, so it stays out until that changes.
+
+Measured (loopback + `tc netem 25 ms` one-way ≈ 50 ms RTT, matched
+workload: 5 scans, 300 routes, 80 simulations, 80 opportunities each side):
+
+| | old (a314e17) | new |
+| --- | --- | --- |
+| avg_scan_ms | 4331 | **3522** |
+| avg_simulate_ms | 1943 | **1422** |
+| avg_fresh_ms | 2236 | **1755** |
+| avg_probe_ms | 618 | 604 (unchanged — control) |
+| avg_core_ms / avg_gas_ms | 50 / 294 | 50 / 294 (controls) |
+| avg_pin_ms | (invisible, ≈1 RTT) | **0** |
+
+The deltas land exactly where RTTs were removed: one wave per candidate
+(sim+l1 merged: 80 sims over 5 scans × ~50 ms), one sequential RTT per
+freshness finalist, one pin RTT and one post-scan RTT per scan. Phase sums
+can exceed the wall-time delta (§0h overlap caveat). On the public endpoints
+measured today (RTT 35–65 ms from this box) the same structure removes
+~2 RTT per scan outright and halves the candidate-path waves. Live watch
+sanity on the Alchemy socket (unified endpoints): heads parse, no failed
+scans, split-config §0s numbers unaffected.
+
+Environment notes: `tc netem` needs the delay *off* before fork runs
+(foundry's fork provider fails its initial balance fetch under it, with a
+misleading "lack of funds"); `anvil_setStorageAt` seeding needs the real
+Base-USDC balances slot (9 on this implementation — slot 2 silently wrote a
+different mapping); the Balancer vault on the fork holds little USDC
+(~66k at fork base, drained by repeated skews — re-seed between A/B
+series). One test-design trap hit here: the head-pin proof must run with
+`freshness: false` — the freshness pass re-pins to the newer head **by
+design** (§0m), so a scan on a fork with live opportunities legitimately
+reports the fresh block, not the pinned one; the first draft of the test
+read that correct behaviour as a failure.
+
+---
+
 ## 8. Key protocol facts / gotchas
 
 - `RyoCore.simulate` **always reverts**. Success is
@@ -2478,12 +2573,15 @@ for you.
 
 ## 11. Next move (one line)
 
-The Tier-1 pair expansion (§0s) is finished and verified: registry at 33
-pools across USDC/WETH/cbBTC/EURC, executed two-venue cycles and triangles on
-forks (realized == simulated byte-for-byte), and nine of seventeen new pools
-triggering on the live websocket within a 4-minute window. Next in value
-order: deploy the core + five adapters on Base mainnet (the gating item for
-everything), then decide `--max-hops 3` as the default (the §0s live A/B —
-153 ms vs 399 ms avg scan — supports it), then Uniswap V4 (the largest venue
-gap), then cache only profit-related reverts in the failed-sim cache, then CI,
-because every behavioural proof above is `#[ignore]`d and needs a live fork.
+The Tier-1 pair expansion (§0s) and the first two latency steps (§0t:
+socket-head pins, batched simulate+L1 probes, joined post-scan reads) are
+finished and verified. Next in value order: local tick-math pricing for the
+30 concentrated-liquidity pools (the remaining big latency item: probe p50
+314 ms live today; reference math in `uniswap-v3-sdk`, verification pattern
+already exists from §0j's differential), then `eth_simulateV1` candidate
+batches (works on Alchemy — hash-pinnable with per-call gas — blocked by
+Anvil support for the fork proofs), then decide `--max-hops 3` as the
+default (the §0s live A/B — 153 ms vs 399 ms avg scan — supports it), then
+deploy the core + five adapters on Base mainnet (the gating item for
+everything), then Uniswap V4 (largest venue gap), then cache only
+profit-related reverts in the failed-sim cache, then CI.

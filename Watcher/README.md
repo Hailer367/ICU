@@ -21,6 +21,15 @@ WebSocket trigger ─► affected pools ─► quote routes touching them
 
 There is no "is there a trade yet?" polling loop. Fresh quotes and gas prices
 are fetched only after an event. `scan` exists for manual checks and tests.
+In `watch` the scan's pinned block comes from the `newHeads` header the same
+socket already delivers — zero round-trips — and it is only trusted when
+subscriptions and reads share one endpoint (a head from one chain cannot pin
+reads on another; `Reconnect` drops it). CLI paths resolve `latest` normally.
+
+Per simulated candidate, `RyoCore.simulate` and the L1 fee bound arrive in
+one pinned `aggregate3`; the execute calldata is exactly one word longer
+than the simulate one (`minProfit`), so the fee is priced for the real
+transaction without a second round-trip.
 
 Every scan reads **one pinned block**. It resolves the newest confirmed block
 (by hash) at the start and uses that same state for reserves, quotes, the price

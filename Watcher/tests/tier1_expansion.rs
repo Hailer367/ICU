@@ -477,11 +477,10 @@ async fn three_hop_triangle_through_eurc_is_found_and_executed() {
                     base::USDC,
                     "univ3:500,pancake:500:eurc,univ3:500:usdc",
                 )?;
-                let planned = scanner
+                scanner
                     .plan(&route, U256::from(1_000_000_000u64))
                     .await?
-                    .context("plan: the triangle is not profitable at $1,000")?;
-                planned
+                    .context("plan: the triangle is not profitable at $1,000")?
             } else {
                 candidates
                     .into_iter()

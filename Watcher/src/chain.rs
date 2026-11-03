@@ -375,6 +375,55 @@ pub async fn erc20_symbol(provider: &ChainProvider, token: Address) -> Result<St
 /// A whole-batch failure (transport, decode, short result) marks *every* entry
 /// as `Err` so callers can distinguish "no data" from "this one call reverted".
 /// Individual reverts are labelled with the decoded revert reason.
+/// One `aggregate3` round-trip that preserves raw revert payloads.
+///
+/// [`multicall_raw`] collapses a failed inner call into a `String` — fine for
+/// reads, useless for `RyoCore.simulate`, whose *success* answer arrives as a
+/// revert payload (`SimulationResult(int256)`). This variant returns the
+/// untouched `(success, returnData)` pairs so the caller classifies them;
+/// `allowFailure = true` guarantees the batch itself never reverts, so any
+/// error here is transport/decode level and applies to the whole batch.
+pub async fn multicall3_outcomes(
+    provider: &ChainProvider,
+    calls: &[(Address, Bytes)],
+    block: BlockId,
+) -> std::result::Result<Vec<crate::abi::multicall3::Result3>, String> {
+    use crate::abi::multicall3;
+    use alloy::sol_types::SolCall;
+
+    let aggregate = multicall3::aggregate3Call {
+        calls: calls
+            .iter()
+            .map(|(target, data)| multicall3::Call3 {
+                target: *target,
+                allowFailure: true,
+                callData: data.clone(),
+            })
+            .collect(),
+    };
+    let bytes = match eth_call(
+        provider,
+        crate::config::base::MULTICALL3,
+        aggregate.abi_encode().into(),
+        block,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => return Err(format!("multicall failed: {err}")),
+    };
+    let decoded = multicall3::aggregate3Call::abi_decode_returns(&bytes)
+        .map_err(|err| format!("failed to decode multicall result: {err}"))?;
+    if decoded.len() != calls.len() {
+        return Err(format!(
+            "multicall returned {} results for {} calls",
+            decoded.len(),
+            calls.len()
+        ));
+    }
+    Ok(decoded)
+}
+
 pub async fn multicall_raw(
     provider: &ChainProvider,
     calls: &[(Address, Bytes)],

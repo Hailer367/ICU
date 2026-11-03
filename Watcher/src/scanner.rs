@@ -20,7 +20,7 @@ use crate::abi::ryo;
 use crate::amm::{ConstantProductPool, Curve, ten_pow};
 use crate::chain::{self, ChainProvider};
 use crate::config::{Manifest, Settings, base};
-use crate::events::Trigger;
+use crate::events::{HeadInfo, Trigger};
 use crate::gas::{self, GasSnapshot, TradeCost};
 use crate::history;
 use crate::routes::{Registry, Route, RouteStep, Venue, enumerate_cycles};
@@ -166,6 +166,12 @@ pub struct ScanReport {
     pub sims_cached: usize,
     pub opportunities: Vec<Opportunity>,
     pub notes: Vec<String>,
+    /// Wall time of resolving the block this scan pinned. Normally zero:
+    /// §0t serves the pin from the socket's delivered head. Non-zero means
+    /// the fallback RPC resolve ran (CLI path, split endpoints, or no head
+    /// yet), and its round-trip is visible here for the first time — before
+    /// §0t the pin cost was the one phase no metric admitted to.
+    pub pin_ms: u64,
     /// Per-phase wall time in milliseconds, summed across assets. `core_ms`
     /// covers the head block number plus the core state reads.
     pub core_ms: u64,
@@ -373,6 +379,18 @@ pub struct Scanner {
     /// same `POOL_FLOORS_TTL` round. Only feed-resolved assets appear; USDC
     /// is constant and added on read (see `usd_price_map`).
     trigger_prices: Mutex<HashMap<Address, f64>>,
+    /// The newest block header the WebSocket has delivered (§0t). When it is
+    /// present, scans pin from it instead of paying a `latest` round-trip;
+    /// the pinned-by-hash guarantee is identical because the pin carries the
+    /// head's own hash, and the post-scan re-read still detects re-orgs.
+    /// `None` (CLI paths, before the first head, after a reconnect) falls
+    /// back to `Pin::resolve_latest`.
+    head_pin: Mutex<Option<chain::Pin>>,
+    /// Whether the head pin may be trusted at all: only when the subscription
+    /// and the reads share one endpoint. A head from Alchemy names a block
+    /// the local fork has never seen — and vice versa — so a split setup
+    /// (§0g's test configuration) must keep resolving over the read provider.
+    head_pinning: bool,
     /// Chainlink feed decimals are immutable, so each feed is read once and
     /// remembered for the life of the scanner.
     feed_decimals: Mutex<HashMap<Address, u8>>,
@@ -385,6 +403,12 @@ pub struct Scanner {
 
 impl Scanner {
     pub fn new(provider: ChainProvider, manifest: Manifest, settings: Settings) -> Result<Self> {
+        // Only trust socket-delivered heads when subscriptions and reads
+        // share one endpoint (same rule `connect_auto` merges them by).
+        let head_pinning = settings
+            .ws_rpc
+            .as_deref()
+            .is_some_and(|ws| chain::same_endpoint(&settings.http_rpc, ws));
         let registry = Registry::base_curated()?;
         let mut pool_index = HashMap::new();
         for (index, pool) in registry.pools.iter().enumerate() {
@@ -432,6 +456,8 @@ impl Scanner {
             gas_cache: Mutex::new(None),
             pool_floors: Mutex::new(None),
             trigger_prices: Mutex::new(HashMap::new()),
+            head_pin: Mutex::new(None),
+            head_pinning,
             feed_decimals: Mutex::new(HashMap::new()),
             deduper: Mutex::new(Deduper::default()),
             sim_cache: Mutex::new(FailedSimCache::default()),
@@ -918,6 +944,58 @@ impl Scanner {
         swap_notional_usd(log, pool, &self.usd_price_map())
     }
 
+    /// Record a delivered head as the pin for upcoming scans, keeping the
+    /// highest number seen (Base heads arrive in order, but a batch may be
+    /// processed out of sequence after coalescing).
+    pub fn note_head(&self, head: &HeadInfo) {
+        let pin = chain::Pin::from_header(
+            head.number,
+            Some(head.hash),
+            head.timestamp,
+            head.base_fee_per_gas,
+        );
+        let mut cached = self.head_pin.lock().expect("head pin mutex poisoned");
+        if cached
+            .as_ref()
+            .is_none_or(|current| pin.number >= current.number)
+        {
+            *cached = Some(pin);
+        }
+    }
+
+    /// Drop the head pin: after a reconnect the socket may be seconds behind,
+    /// and the next scan should resolve `latest` until a fresh head lands.
+    pub fn forget_head(&self) {
+        *self.head_pin.lock().expect("head pin mutex poisoned") = None;
+    }
+
+    /// Whether socket-head pinning is active for this scanner (test and CLI
+    /// diagnostic): true only when subscriptions and reads share one endpoint.
+    pub fn head_pinning(&self) -> bool {
+        self.head_pinning
+    }
+
+    pub fn cached_pin(&self) -> Option<chain::Pin> {
+        let cached = self.head_pin.lock().expect("head pin mutex poisoned");
+        cached.as_ref().copied()
+    }
+
+    /// The pin for a scan: the socket's newest head when one is known, else
+    /// one round-trip behind the node. CLI paths (no subscription) always
+    /// resolve; watch paths normally never do.
+    async fn scan_pin(&self) -> Result<chain::Pin> {
+        match self.cached_pin() {
+            Some(pin) if self.head_pinning => {
+                debug!(
+                    block = pin.number,
+                    "pinned from the socket head (no round-trip)"
+                );
+                Ok(pin)
+            }
+            _ => chain::Pin::resolve_latest(&self.provider).await,
+        }
+    }
+
     pub async fn scan_once(&self) -> Result<ScanReport> {
         self.evaluate(None, ScanBlock::Latest).await
     }
@@ -1005,6 +1083,17 @@ impl Scanner {
     /// the two-phase dedupe guarantee: a transient failure never suppresses
     /// the later mined duplicate of the same log.
     pub async fn scan_triggers(&self, triggers: &[Trigger]) -> Result<ScanReport> {
+        // Feed the head-pin cache from this batch before anything reads the
+        // chain. A Reconnect clears it: the socket may have missed heads, and
+        // until a fresh one lands the scan resolves `latest` instead of
+        // trusting a pin that could be minutes old.
+        for trigger in triggers {
+            match trigger {
+                Trigger::Head { head } => self.note_head(head),
+                Trigger::Reconnect => self.forget_head(),
+                _ => {}
+            }
+        }
         let notional_of = |log: &Log| self.swap_notional_usd(log);
         let is_seen = |key: &TriggerKey| {
             self.deduper
@@ -1059,7 +1148,8 @@ impl Scanner {
     ) -> Result<ScanReport> {
         // One block for the whole scan. Every read below, and the contract's
         // own simulation, use this pinned state; nothing re-reads "latest".
-        let mut pin = match chain::Pin::resolve_latest(&self.provider).await {
+        let pin_started = Instant::now();
+        let mut pin = match self.scan_pin().await {
             Ok(pin) => pin,
             Err(err) => {
                 // A failed pin is "unknown", not "no opportunity": say so.
@@ -1067,6 +1157,7 @@ impl Scanner {
                 return Err(err);
             }
         };
+        let pin_ms = elapsed_millis(pin_started);
         let block_id = pin.id();
         let head_started = Instant::now();
         let block_number = pin.number;
@@ -1080,6 +1171,7 @@ impl Scanner {
         let mut report = ScanReport {
             block: block_number,
             pin_hash: pin.hash,
+            pin_ms,
             core_ms: elapsed_millis(head_started),
             ..Default::default()
         };
@@ -1227,8 +1319,15 @@ impl Scanner {
         // safer than assuming: re-read the header at our own number and check
         // its hash. Reads can still succeed against a discarded block, so
         // without this a re-org would produce confident numbers about nothing.
+        // The two post-scan reads are independent (has the pin been replaced?
+        // where is head now?) — run them concurrently so the check §0k pays
+        // for re-org detection costs one round-trip, not two.
+        let reorg_check = chain::header_hash(&self.provider, pin.number);
+        let head_now = chain::block_number(&self.provider);
+        let (reorg_check, head_now) = tokio::join!(reorg_check, head_now);
+
         if pin.hash.is_some() {
-            match chain::header_hash(&self.provider, pin.number).await {
+            match reorg_check {
                 Ok(current) if pin.is_superseded_by(current) => {
                     report.reorged = true;
                     report.notes.push(format!(
@@ -1248,7 +1347,7 @@ impl Scanner {
         if let Some(note) = scan_health_note(report.quotes, report.quote_failures) {
             report.notes.push(note);
         }
-        if let Ok(head_now) = chain::block_number(&self.provider).await {
+        if let Ok(head_now) = head_now {
             report.head_drift = pin.blocks_behind(head_now);
             if report.head_drift > 0 {
                 report.notes.push(format!(
@@ -2042,7 +2141,9 @@ async fn simulate_route(
         }
     };
 
-    let simulation = match simulate::simulate(
+    // One pinned batch carries both probes: the simulation and the L1 bound
+    // for the execute transaction these same steps will produce (§0t).
+    let costs = match simulate::simulate_with_l1_fee(
         provider,
         manifest.core,
         asset,
@@ -2052,20 +2153,24 @@ async fn simulate_route(
     )
     .await
     {
-        Ok(simulation) => simulation,
-        Err(SimulateError::Revert { decoded, .. }) => {
+        Ok(costs) => costs,
+        Err(simulate::SimCostError::Definitive(SimulateError::Revert { decoded, .. })) => {
             debug!(route = ?route.labels(registry), %decoded, "simulation reverted");
             return (None, true);
         }
-        Err(SimulateError::Transport(message)) => {
-            warn!(error = %message, "simulation transport failure");
+        // A simulate that returns successfully (or a zero-floor step) means
+        // ABI/contract mismatch, not a market verdict: inconclusive, never a
+        // cached loss — the same classification the separate calls used.
+        Err(simulate::SimCostError::Definitive(other)) => {
+            warn!(error = %other, "simulate batch produced a non-market verdict");
             return (None, false);
         }
-        Err(SimulateError::UnexpectedSuccess(_)) => {
-            warn!("simulate unexpectedly succeeded; check the ABI");
+        Err(simulate::SimCostError::Inconclusive(message)) => {
+            warn!(error = %message, "simulation batch transport/decode failure");
             return (None, false);
         }
     };
+    let simulation = costs.simulation;
 
     if simulation.profit <= I256::ZERO {
         return (None, true);
@@ -2085,19 +2190,21 @@ async fn simulate_route(
     };
     let calldata = Bytes::from(call.abi_encode());
 
-    // Price the L1 leg at the candidate's *actual* tx size, and fail closed:
-    // a missing read skips this candidate as inconclusive (the failed-sim
-    // cache stays clean), it never defaults to zero, which would invent
-    // profit. Read before `estimate_gas` — the cheaper round-trip gates first.
-    let l1_fee =
-        match gas::l1_fee_upper_bound(provider, gas::unsigned_tx_size(calldata.len()), block).await
-        {
-            Ok(fee) => fee,
-            Err(err) => {
-                warn!(error = %err, "L1 fee upper bound unavailable; candidate skipped");
-                return (None, false);
-            }
-        };
+    // The batch priced the L1 leg at the size predicted from the simulate
+    // calldata (`execute_calldata_len`: one extra word for `minProfit`). If
+    // the real encode ever disagrees, the prediction priced the wrong fee —
+    // skip inconclusively rather than carry it. An ABI change shows up here
+    // loudly instead of as a subtly wrong `net_usd`. Fail-closed semantics
+    // are unchanged: a missing or mismatched cost never defaults to zero.
+    if calldata.len() != costs.expected_execute_len {
+        warn!(
+            actual = calldata.len(),
+            predicted = costs.expected_execute_len,
+            "execute calldata length diverged from the L1 bound priced in the batch; candidate skipped"
+        );
+        return (None, false);
+    }
+    let l1_fee = costs.l1_fee;
 
     let Ok(route_hash) = route.route_hash(manifest, &floors) else {
         return (None, false);
@@ -2426,17 +2533,18 @@ fn plan_batch(
         }
 
         match trigger {
-            Trigger::Head { number } => {
+            Trigger::Head { head } => {
+                let number = head.number;
                 let previous = *last_block;
                 // Heads are liveness markers. Advance the marker on every
                 // head so idle stretches do not look like gaps; only a real
                 // jump or a backwards head triggers the full rescan.
-                *last_block = Some(*number);
-                if head_requires_rescan(previous, *number) {
+                *last_block = Some(number);
+                if head_requires_rescan(previous, number) {
                     gap_rescan = true;
                     full_scan = true;
                 } else {
-                    notes.head_tick(*number);
+                    notes.head_tick(number);
                 }
             }
             Trigger::Reconnect => full_scan = true,
@@ -2709,6 +2817,15 @@ mod tests {
     use crate::routes::{Pool, Registry};
     use alloy::primitives::keccak256;
     use serde_json::json;
+
+    fn head_at(number: u64) -> crate::events::HeadInfo {
+        crate::events::HeadInfo {
+            number,
+            hash: B256::repeat_byte(number as u8),
+            timestamp: 1_700_000_000 + number,
+            base_fee_per_gas: Some(1_000_000),
+        }
+    }
 
     const SWAP_V3_SIG: &str = "Swap(address,address,int256,int256,uint160,uint128,int24)";
     const SWAP_SOLIDLY_SIG: &str = "Swap(address,address,uint256,uint256,uint256,uint256)";
@@ -3679,7 +3796,10 @@ mod tests {
 
     #[test]
     fn consecutive_heads_do_not_scan_and_move_the_marker() {
-        let triggers = vec![Trigger::Head { number: 11 }, Trigger::Head { number: 12 }];
+        let triggers = vec![
+            Trigger::Head { head: head_at(11) },
+            Trigger::Head { head: head_at(12) },
+        ];
         let mut last = Some(10);
         let plan = plan_batch(
             &triggers,
@@ -3696,7 +3816,7 @@ mod tests {
 
     #[test]
     fn head_gap_in_a_batch_forces_one_full_rescan() {
-        let triggers = vec![Trigger::Head { number: 20 }];
+        let triggers = vec![Trigger::Head { head: head_at(20) }];
         let mut last = Some(12); // 8 blocks skipped
         let plan = plan_batch(
             &triggers,
@@ -3748,7 +3868,7 @@ mod tests {
         let plan = plan_of(&[
             log_trigger(a, 1, 0, false),
             log_trigger(stranger, 2, 0, true),
-            Trigger::Head { number: 5 },
+            Trigger::Head { head: head_at(5) },
         ]);
         assert!(plan.scan);
         assert_eq!(

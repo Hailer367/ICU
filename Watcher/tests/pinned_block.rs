@@ -629,3 +629,137 @@ async fn mine_value_tx(
     }
     bail!("value transaction {hash} was not mined within 5s");
 }
+
+/// §0t: a head delivered by the socket replaces the per-scan `latest`
+/// round-trip. The proof is deliberately un-fakeable: pin the scanner to a
+/// block *behind* the fork head. An RPC-resolved scan can only report the
+/// head; a scan that reports the older block must have read the socket pin.
+/// Then show `Reconnect` forgets the head and the next scan re-resolves.
+#[tokio::test]
+#[ignore = "needs a local Anvil Base fork with RyoCore deployed"]
+async fn scans_pin_from_delivered_head() {
+    let outcome: anyhow::Result<()> = async {
+        let provider = connect(&fork_rpc()).await?;
+        let _: Value = raw(&provider, "anvil_nodeInfo", serde_json::json!([]))
+            .await
+            .context("RYO_FORK_RPC must point at a local Anvil Base fork")?;
+        let manifest = Manifest::load(manifest_path())?;
+        let rpc = fork_rpc();
+        let pin_settings = Settings {
+            ws_rpc: Some(rpc.replace("http", "ws")),
+            ..Settings {
+                http_rpc: rpc.clone(),
+                manifest_path: manifest_path().into(),
+                max_gas_price_gwei: 5.0,
+                // The freshness pass re-pins to a newer block on purpose;
+                // this test asserts about the *scan's* pin, so it is off.
+                freshness: false,
+                ..Settings::default()
+            }
+        };
+        let scanner = Scanner::new(provider.clone(), manifest, pin_settings)?;
+        if !scanner.head_pinning() {
+            bail!("the unified-endpoint gate must enable head pinning here");
+        }
+
+        let head = Pin::resolve_latest(&provider).await?;
+        let parent = raw::<Value>(
+            &provider,
+            "eth_getBlockByNumber",
+            serde_json::json!([format!("0x{:x}", head.number - 1), false]),
+        )
+        .await?;
+        let parent_hash: B256 = parent["hash"]
+            .as_str()
+            .context("fork returned a parent block without a hash")?
+            .parse()?;
+
+        // A head-tick pins the scanner without triggering any scan work.
+        scanner
+            .scan_triggers(&[ryo_watch::events::Trigger::Head {
+                head: ryo_watch::events::HeadInfo {
+                    number: head.number - 1,
+                    hash: parent_hash,
+                    timestamp: parent["timestamp"]
+                        .as_str()
+                        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                        .unwrap_or(head.timestamp.saturating_sub(2)),
+                    base_fee_per_gas: Some(1_000_000_000),
+                },
+            }])
+            .await?;
+        let pinned = scanner
+            .cached_pin()
+            .context("head tick did not pin the scanner")?;
+        if pinned.number != head.number - 1 || pinned.hash != Some(parent_hash) {
+            bail!("cached pin does not name the delivered head: {pinned:?}");
+        }
+
+        // The scan must describe the PIN, not the node's latest.
+        let report = scanner.scan_once().await?;
+        if report.block != head.number - 1 {
+            bail!(
+                "scan reported block {} while the socket pinned {}; the pin was ignored",
+                report.block,
+                head.number - 1
+            );
+        }
+        if report.pin_hash != Some(parent_hash) {
+            bail!("scan pin hash does not match the delivered head");
+        }
+
+        // The split-endpoint gate: the same stale head must be IGNORED when
+        // subscriptions and reads point at different providers — a head from
+        // one chain cannot pin reads on another. No `ws_rpc` on this scanner:
+        // the pin must resolve over the read provider instead.
+        let mut untrusted_settings = Settings {
+            http_rpc: fork_rpc(),
+            manifest_path: manifest_path().into(),
+            max_gas_price_gwei: 5.0,
+            freshness: false,
+            ..Settings::default()
+        };
+        untrusted_settings.ws_rpc = None;
+        let untrusted = Scanner::new(provider.clone(), Manifest::load(manifest_path())?, untrusted_settings)?;
+        untrusted.note_head(&ryo_watch::events::HeadInfo {
+            number: head.number - 1,
+            hash: parent_hash,
+            timestamp: head.timestamp,
+            base_fee_per_gas: Some(1_000_000_000),
+        });
+        let report = untrusted.scan_once().await?;
+        if report.block != head.number {
+            bail!(
+                "split-endpoint gate failed: scan pinned {} from a head its read provider does not share",
+                report.block
+            );
+        }
+        if report.pin_ms == 0 {
+            // Not an invariant to die on — a loopback resolve can round to 0 —
+            // but worth surfacing: the fallback path must be *timing-visible*.
+            eprintln!("note: fallback resolve_latest measured 0 ms on this transport");
+        }
+
+        // A Reconnect forgets the stale head: the next scan re-resolves and
+        // reports the real head again.
+        scanner
+            .scan_triggers(&[ryo_watch::events::Trigger::Reconnect])
+            .await?;
+        if scanner.cached_pin().is_some() {
+            bail!("Reconnect must drop the head pin until a fresh head lands");
+        }
+        let report = scanner.scan_once().await?;
+        if report.block != head.number {
+            bail!(
+                "after Reconnect the scan should resolve `latest` again: got {}, want {}",
+                report.block,
+                head.number
+            );
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(err) = outcome {
+        panic!("socket-head pinning check failed: {err:#}");
+    }
+}

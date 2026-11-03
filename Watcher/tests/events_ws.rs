@@ -49,6 +49,9 @@ async fn ack(ws: &mut ServerWs, id: u64, subscription: &str) {
 }
 
 fn head_notification(subscription: &str, number: u64) -> Value {
+    // A realistic Base header shape: the scanner pins scans from these
+    // fields without a round-trip (§0t), so the fixture carries the same
+    // fields the live endpoint sends.
     json!({
         "jsonrpc": "2.0",
         "method": "eth_subscription",
@@ -56,11 +59,20 @@ fn head_notification(subscription: &str, number: u64) -> Value {
             "subscription": subscription,
             "result": {
                 "number": format!("0x{number:x}"),
-                "hash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "hash": format!("0x{number:064x}"),
                 "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "timestamp": format!("0x{:x}", 1_700_000_000u64 + number),
+                "baseFeePerGas": "0x3b9aca00",
             }
         }
     })
+}
+
+fn head_number(trigger: &Trigger) -> u64 {
+    match trigger {
+        Trigger::Head { head } => head.number,
+        other => panic!("not a head trigger: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -118,13 +130,26 @@ async fn first_connect_is_not_a_reconnect_and_ack_ids_survive_reconnect() {
         .await
         .expect("first trigger timed out")
         .unwrap();
-    assert!(matches!(first, Trigger::Head { number: 42 }), "{first:?}");
+    assert_eq!(head_number(&first), 42, "{first:?}");
+    match &first {
+        Trigger::Head { head } => {
+            assert_eq!(head.number, 42);
+            let expected: alloy::primitives::B256 =
+                "0x000000000000000000000000000000000000000000000000000000000000002a"
+                    .parse()
+                    .expect("fixture hash");
+            assert_eq!(head.hash, expected);
+            assert_eq!(head.timestamp, 1_700_000_042);
+            assert_eq!(head.base_fee_per_gas, Some(1_000_000_000));
+        }
+        other => panic!("expected a head, got {other:?}"),
+    }
 
     let second = timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("queued trigger timed out")
         .unwrap();
-    assert!(matches!(second, Trigger::Head { number: 43 }), "{second:?}");
+    assert_eq!(head_number(&second), 43, "{second:?}");
 
     let reconnect = timeout(Duration::from_secs(8), stream.next())
         .await
@@ -136,8 +161,9 @@ async fn first_connect_is_not_a_reconnect_and_ack_ids_survive_reconnect() {
         .await
         .expect("post-reconnect head timed out")
         .unwrap();
-    assert!(
-        matches!(after, Trigger::Head { number: 44 }),
+    assert_eq!(
+        head_number(&after),
+        44,
         "ack after reconnect was mapped to the wrong kind: {after:?}"
     );
 

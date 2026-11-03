@@ -55,10 +55,18 @@ fn specs(source: EventSource, pools: &[Address]) -> Vec<Spec> {
         params: json!(["pendingLogs", filter]),
         kind: SubKind::PendingLogs,
     };
+    // Heads are subscribed for every live source: the scanner uses the header
+    // to pin reads without a round-trip (§0t), and gap detection already
+    // needed them.
+    let heads = Spec {
+        method: "newHeads",
+        params: json!(["newHeads"]),
+        kind: SubKind::Heads,
+    };
     match source {
-        EventSource::Logs => vec![logs],
-        EventSource::PendingLogs => vec![pending_logs],
-        EventSource::Both => vec![logs, pending_logs],
+        EventSource::Logs => vec![logs, heads],
+        EventSource::PendingLogs => vec![pending_logs, heads],
+        EventSource::Both => vec![logs, pending_logs, heads],
         EventSource::Flashblocks => vec![
             Spec {
                 method: "newFlashblockTransactions",
@@ -70,14 +78,24 @@ fn specs(source: EventSource, pools: &[Address]) -> Vec<Spec> {
                 params: json!(["newFlashblocks"]),
                 kind: SubKind::Flashblocks,
             },
-            Spec {
-                method: "newHeads",
-                params: json!(["newHeads"]),
-                kind: SubKind::Heads,
-            },
+            heads,
         ],
         EventSource::Once => Vec::new(),
     }
+}
+
+/// The header fields a `newHeads` notification delivers. Base emits these as
+/// it produces blocks, so the newest one received *is* the newest confirmed
+/// head as far as the socket knows — the scanner pins its reads from here
+/// without paying a `latest` round-trip per scan (§0t). `hash` keeps the
+/// pinned-by-hash guarantee of §0k; `timestamp` and `base_fee` are what a
+/// resolved pin would have read from the block object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadInfo {
+    pub number: u64,
+    pub hash: B256,
+    pub timestamp: u64,
+    pub base_fee_per_gas: Option<u64>,
 }
 
 /// A decoded event that may imply a price change.
@@ -88,7 +106,7 @@ pub enum Trigger {
     /// A flashblock notification, possibly containing logs or transaction hashes.
     Flashblock { hashes: Vec<B256>, logs: Vec<Log> },
     /// A new chain head.
-    Head { number: u64 },
+    Head { head: HeadInfo },
     /// The connection was re-established; a full scan is prudent.
     Reconnect,
 }
@@ -123,7 +141,7 @@ impl Trigger {
             Self::Flashblock { hashes, logs } => {
                 format!("flashblock txs={} logs={}", hashes.len(), logs.len())
             }
-            Self::Head { number } => format!("head={number}"),
+            Self::Head { head } => format!("head={}", head.number),
             Self::Reconnect => "reconnect".to_string(),
         }
     }
@@ -392,7 +410,7 @@ impl EventStream {
                 log,
                 preconfirmed: true,
             }),
-            SubKind::Heads => parse_head(result).map(|number| Trigger::Head { number }),
+            SubKind::Heads => parse_head(result).map(|head| Trigger::Head { head }),
             SubKind::FlashblockTxs | SubKind::Flashblocks => {
                 let hashes = extract_hashes(result);
                 let logs = extract_logs(result);
@@ -410,9 +428,30 @@ fn parse_log(value: &Value) -> Option<Log> {
     serde_json::from_value(value.clone()).ok()
 }
 
-fn parse_head(value: &Value) -> Option<u64> {
-    let raw = value.get("number").and_then(Value::as_str)?;
+fn parse_hex_u64(value: &Value, field: &str) -> Option<u64> {
+    let raw = value.get(field).and_then(Value::as_str)?;
     u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok()
+}
+
+fn parse_head(value: &Value) -> Option<HeadInfo> {
+    let number = parse_hex_u64(value, "number")?;
+    let hash = value
+        .get("hash")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<B256>().ok())?;
+    // A zero hash cannot pin anything (that is the `pending` pathology §0k
+    // names); treat it as no head at all and let the scanner fall back.
+    if hash.is_zero() {
+        return None;
+    }
+    let timestamp = parse_hex_u64(value, "timestamp")?;
+    let base_fee_per_gas = parse_hex_u64(value, "baseFeePerGas");
+    Some(HeadInfo {
+        number,
+        hash,
+        timestamp,
+        base_fee_per_gas,
+    })
 }
 
 fn extract_logs(value: &Value) -> Vec<Log> {
@@ -506,22 +545,76 @@ mod tests {
         let pool = address!("b4CB800910B228ED3d0834cF79D697127BBB00e5");
         let source = EventSource::PendingLogs;
         let specs = specs(source, &[pool]);
-        assert_eq!(specs.len(), 1);
+        // §0t: every live source also subscribes to heads, because the
+        // scanner pins scans from the delivered header instead of paying a
+        // `latest` round-trip per scan.
+        assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].method, "pendingLogs");
         assert_eq!(specs[0].params[0], "pendingLogs");
         assert_eq!(
             specs[0].params[1]["address"][0],
             format!("{pool}").to_lowercase()
         );
+        assert_eq!(specs[1].method, "newHeads");
     }
 
     #[test]
-    fn both_source_subscribes_twice() {
+    fn both_source_subscribes_logs_pending_and_heads() {
         let pool = address!("b4CB800910B228ED3d0834cF79D697127BBB00e5");
-        let specs = specs(EventSource::Both, &[pool]);
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].method, "logs");
-        assert_eq!(specs[1].method, "pendingLogs");
+        let both_specs = specs(EventSource::Both, &[pool]);
+        assert_eq!(both_specs.len(), 3);
+        assert_eq!(both_specs[0].method, "logs");
+        assert_eq!(both_specs[1].method, "pendingLogs");
+        assert_eq!(both_specs[2].method, "newHeads");
+        let log_specs = specs(EventSource::Logs, &[pool]);
+        assert_eq!(
+            log_specs.iter().map(|s| s.method).collect::<Vec<_>>(),
+            vec!["logs", "newHeads"]
+        );
+    }
+
+    #[test]
+    fn parses_a_full_head_notification() {
+        let json = serde_json::json!({
+            "number": "0x32fcf0d",
+            "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "parentHash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "timestamp": "0x67000000",
+            "baseFeePerGas": "0x126889",
+        });
+        let head = parse_head(&json).expect("head parses");
+        assert_eq!(head.number, 0x32fcf0d);
+        let expected: alloy::primitives::B256 =
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .parse()
+                .unwrap();
+        assert_eq!(head.hash, expected);
+        assert_eq!(head.timestamp, 0x67000000);
+        assert_eq!(head.base_fee_per_gas, Some(0x126889));
+    }
+
+    #[test]
+    fn heads_without_usable_hashes_are_dropped() {
+        // The `pending` pathology of §0k: a zero hash cannot pin reads.
+        let json = serde_json::json!({
+            "number": "0x1",
+            "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "0x1",
+        });
+        assert!(parse_head(&json).is_none());
+        // Missing timestamp: no staleness math without it — drop, don't guess.
+        let json = serde_json::json!({
+            "number": "0x1",
+            "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        });
+        assert!(parse_head(&json).is_none());
+        // baseFeePerGas is the only optional field.
+        let json = serde_json::json!({
+            "number": "0x1",
+            "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "timestamp": "0x1",
+        });
+        assert_eq!(parse_head(&json).unwrap().base_fee_per_gas, None);
     }
 
     #[test]

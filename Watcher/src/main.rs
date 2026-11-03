@@ -855,6 +855,7 @@ struct WatchMetrics {
     refine_millis: u64,
     simulate_millis: u64,
     fresh_millis: u64,
+    pin_millis: u64,
 }
 
 impl WatchMetrics {
@@ -879,13 +880,14 @@ impl WatchMetrics {
         self.refine_millis += report.refine_ms;
         self.simulate_millis += report.simulate_ms;
         self.fresh_millis += report.fresh_ms;
+        self.pin_millis += report.pin_ms;
     }
 
     fn summary(&self) -> String {
         let scans = self.scans.max(1) as u128;
         let avg = |total: u128| (total / scans) as u64;
         format!(
-            "events={} scans={} skipped={} failed={} routes={} quotes={} simulations={} sims_cached={} opportunities={} avg_scan_ms={} avg_core_ms={} avg_gas_ms={} avg_probe_ms={} avg_refine_ms={} avg_simulate_ms={} avg_fresh_ms={}",
+            "events={} scans={} skipped={} failed={} routes={} quotes={} simulations={} sims_cached={} opportunities={} avg_scan_ms={} avg_core_ms={} avg_gas_ms={} avg_probe_ms={} avg_refine_ms={} avg_simulate_ms={} avg_fresh_ms={} avg_pin_ms={}",
             self.events,
             self.scans,
             self.skipped,
@@ -902,6 +904,7 @@ impl WatchMetrics {
             avg(self.refine_millis as u128),
             avg(self.simulate_millis as u128),
             avg(self.fresh_millis as u128),
+            avg(self.pin_millis as u128),
         )
     }
 }
@@ -1169,7 +1172,8 @@ fn print_report(report: &ScanReport, registry: &Registry) {
         report.opportunities.len()
     );
     println!(
-        "  ms: core {} gas {} probe {} refine {} simulate {} fresh {}",
+        "  ms: pin {} core {} gas {} probe {} refine {} simulate {} fresh {}",
+        report.pin_ms,
         report.core_ms,
         report.gas_ms,
         report.probe_ms,
@@ -1247,6 +1251,7 @@ fn report_json(report: &ScanReport, registry: &Registry) -> serde_json::Value {
         "simsCached": report.sims_cached,
         "notes": report.notes,
         "timingsMs": {
+            "pin": report.pin_ms,
             "core": report.core_ms,
             "gas": report.gas_ms,
             "probe": report.probe_ms,
