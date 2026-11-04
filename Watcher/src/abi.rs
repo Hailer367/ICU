@@ -93,6 +93,15 @@ pub mod cl_pool {
         // than trusting a full tuple layout. Return types never affect the
         // selector.
         function slot0() external view returns (uint160 sqrtPriceX96);
+        // Selectors only: every V3-family pool returns its `slot0`/`ticks`
+        // struct with slightly different field counts and signedness, so the
+        // local-CL cache decodes the raw 32-byte words itself (`clamm::words`).
+        function tickSpacing() external view returns (int24);
+        function tickBitmap(int16 wordPos) external view returns (uint256);
+        function ticks(int24 tickId)
+            external
+            view
+            returns (uint256, int256, uint256, uint256, int256, uint256, uint256, uint256);
     }
 }
 

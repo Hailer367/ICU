@@ -1,6 +1,7 @@
 pub mod abi;
 pub mod amm;
 pub mod chain;
+pub mod clamm;
 pub mod config;
 pub mod errors;
 pub mod events;

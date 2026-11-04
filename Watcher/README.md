@@ -56,6 +56,7 @@ src/events.rs    raw JSON-RPC WebSocket client, subscriptions, reconnect, trigge
 src/routes.rs    venue/pool registry, cycle enumeration, adapter calldata, route hash
 src/venues.rs    per-venue quote encoding/decoding, Multicall3 batching
 src/amm.rs       local exact-price math for constant-product pools (checked U256 only)
+src/clamm.rs     bit-for-bit V3-style concentrated-liquidity swap math + the event-maintained pool cache (§0u)
 src/scanner.rs   event-driven scan: quotes → rank → refine → simulate → gates → freshness pass
 src/simulate.rs  RyoCore.simulate call and result decoding
 src/gas.rs       Base gas snapshot, per-candidate L1 fee upper bound (fail-closed), ETH/USD feed
@@ -112,8 +113,8 @@ The script writes the manifest in the exact shape this crate expects
 | `quote --asset USDC --amount 1000 --route univ3:500,univ3:100` | Quotes one route |
 | `simulate ...` | Runs one route through `RyoCore.simulate` |
 | `plan ...` | `simulate` plus calldata, floors, route hash, gas estimate |
-| `scan [--pools 0,1] [--pending] [--json] [--no-freshness] [--no-dynamic-floors]` | One scan (all pools, or only affected ones) |
-| `watch [--show-empty] [--no-scan] [--metrics-every N] [--coalesce-ms N] [--json] [--no-freshness] [--no-dynamic-floors]` | Event loop |
+| `scan [--pools 0,1] [--pending] [--json] [--no-freshness] [--no-dynamic-floors] [--no-local-cl]` | One scan (all pools, or only affected ones) |
+| `watch [--show-empty] [--no-scan] [--metrics-every N] [--coalesce-ms N] [--json] [--no-freshness] [--no-dynamic-floors] [--no-local-cl]` | Event loop |
 | `floors [--json]` | Per-pool trigger table: live fee, USD depth, and the minimum swap the watcher reacts to |
 | `history [--blocks 43200] [--chunk 500] [--out data/swaps.jsonl]` | Downloads historical swap logs for the 33 registry pools as JSONL |
 | `decode 0x...` | Decodes revert data |
@@ -182,6 +183,15 @@ default `mainnet.base.org` endpoint rejects `eth_getLogs` with
 | `--assets` | `RYO_ASSETS` | `USDC,WETH` | Assets scanned, in order |
 | `--fallback-gas` | `RYO_FALLBACK_GAS` | `450000` | Gas estimate used if `eth_estimateGas` fails |
 | `--coalesce-ms` | `RYO_COALESCE_MS` | `0` | `watch` only: also wait up to N ms for more triggers before scanning |
+| `--no-local-cl` | – | off | disable local concentrated-liquidity pricing for probe/refine (latency A/B and safety valve; finalists and `plan` always quote on chain) |
+
+`--no-local-cl` off (the default) the scanner prices the 29 concentrated pools
+from a RAM copy of each pool's state — bootstrapped over Multicall3 and
+maintained from the swap events the socket already delivers — so probe/refine
+rounds need no per-pool `eth_call`. The cache is advisory "the chain as the
+socket saw it": any staleness, missing tick, or coverage gap degrades to the
+remote quoter, never to a price, and every finalist is still simulated on
+chain at the pin.
 
 Opportunities must pass **all** gates: core not paused, watcher gas ceiling,
 core `maxGasPrice`, positive simulated profit, and net USD ≥

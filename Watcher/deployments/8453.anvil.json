@@ -1,19 +1,19 @@
 {
   "chainId": 8453,
   "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-  "blockNumber": "53466744",
-  "timestamp": "1793722835",
-  "core": "0xE8493406aDc19A02f1c3AA722623deAcd7DF6eF8",
+  "blockNumber": "53510471",
+  "timestamp": "1793810289",
+  "core": "0x9e33Da73Fe1Ea386673Af5fc3BB72da93d05f6E4",
   "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
   "owner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
   "operator": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
   "profitRecipient": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
   "adapters": {
-    "univ3": "0xf1485e28070983B2145D262F110Ae1b62f9FBC6b",
-    "univ2": "0x42E4Ffc8b728D42E4A2CA3d87c8881bd007E5AbE",
-    "aerodrome": "0xA0401A31226a90F6379baEfD47C405aC52C206B7",
-    "slipstream": "0x44405E7D8C89881dAC6f8dfEe13d3C7562EA4505",
-    "pancake": "0x17761f8b0640ec4A2a38C9FBFe979Dbbf91ed795"
+    "univ3": "0xacA2783A53A8900B463fdA054F01C410C2569683",
+    "univ2": "0x19514ECa0EC5429007C2d43A2a62263d44ed0455",
+    "aerodrome": "0xD8d9Afa60a6fd88E9DeDdFa553858a67651AA3cD",
+    "slipstream": "0xCab98e47B2572959025d2fC9746354f070d0B3f9",
+    "pancake": "0xcBF17Eb1d8b0E65f4AD6753c332855A6487d6086"
   },
   "routers": {
     "univ3": "0x2626664c2603336E57B271c5C0b26F421741e481",

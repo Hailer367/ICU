@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy::eips::BlockId;
@@ -19,6 +20,7 @@ use tracing::{debug, info, warn};
 use crate::abi::ryo;
 use crate::amm::{ConstantProductPool, Curve, ten_pow};
 use crate::chain::{self, ChainProvider};
+use crate::clamm::{self, ClPoolSpec, ClPoolState};
 use crate::config::{Manifest, Settings, base};
 use crate::events::{HeadInfo, Trigger};
 use crate::gas::{self, GasSnapshot, TradeCost};
@@ -35,6 +37,9 @@ const GAS_CACHE_TTL: Duration = Duration::from_secs(2);
 /// money number, so short staleness is safe and keeps the hot path at zero
 /// extra round-trips.
 const POOL_FLOORS_TTL: Duration = Duration::from_secs(30);
+/// A fully failed CL bootstrap wave is retried no sooner than this; a
+/// degraded RPC should not pay the whole read wave every scan.
+const CL_BOOT_COOLDOWN: Duration = Duration::from_secs(30);
 /// Uniswap V2 pools on Base charge the classic 0.30 % (`amm.rs` hard-codes the
 /// same `997/1000` for local pricing). Not readable from the pool contract.
 const UNIV2_FEE_BPS: f64 = 30.0;
@@ -63,12 +68,13 @@ const AERO_FEE_MAX: U256 = U256::from_limbs([10_000u64, 0, 0, 0]);
 pub enum LegPrice {
     /// Priced locally from pinned reserves, at zero RPC cost.
     Local(U256),
-    /// Local math has no answer for this leg — concentrated liquidity, a pool
-    /// absent from this scan's reserve fetch, or a genuine refusal (dust that
-    /// rounds to zero output, a non-converging stable iteration, an over-draw,
-    /// an implausible fee). Every one of these must still be quoted on-chain:
-    /// "local math is unsure" is not evidence about profitability, and
-    /// treating it as such would silently delete a payable route.
+    /// Local math has no answer for this leg — a pool absent from this scan's
+    /// state fetch, a stale or uncovered concentrated-liquidity cache entry
+    /// (§0u), or a genuine refusal (dust that rounds to zero output, a
+    /// non-converging stable iteration, an over-draw, an implausible fee).
+    /// Every one of these must still be quoted on-chain: "local math is
+    /// unsure" is not evidence about profitability, and treating it as such
+    /// would silently delete a payable route.
     Onchain,
 }
 
@@ -82,6 +88,20 @@ pub fn price_leg(
     match cp
         .get(&step.pool_index)
         .and_then(|pool| pool.amount_out(step.token_in, input))
+    {
+        Some(out) => LegPrice::Local(out),
+        None => LegPrice::Onchain,
+    }
+}
+
+/// Decide how to price one concentrated-liquidity leg from the Scanner's
+/// event-maintained cache. The same rule as `price_leg` binds: a refusal is
+/// "no local answer", never evidence about profitability. Pure and
+/// side-effect free so the invariant stays directly testable.
+pub fn price_cl_leg(cl: &HashMap<usize, ClPoolState>, step: &RouteStep, input: U256) -> LegPrice {
+    match cl
+        .get(&step.pool_index)
+        .and_then(|pool| pool.quote_exact_in(step.token_in, input))
     {
         Some(out) => LegPrice::Local(out),
         None => LegPrice::Onchain,
@@ -375,6 +395,21 @@ pub struct Scanner {
     gas_cache: Mutex<Option<CachedGas>>,
     /// Per-pool trigger floors, refreshed when older than `POOL_FLOORS_TTL`.
     pool_floors: Mutex<Option<CachedPoolFloors>>,
+    /// The registry's concentrated-liquidity pools, in stable index order.
+    cl_specs: Vec<ClPoolSpec>,
+    /// Event-maintained CL caches keyed by registry pool index (§0u).
+    /// Advisory candidate selection only: finalists and the `plan` path are
+    /// always priced on chain at the pin.
+    cl_pools: Mutex<HashMap<usize, ClPoolState>>,
+    /// When the last CL bootstrap wave failed outright (retry cooldown).
+    cl_boot_fail: Mutex<Option<Instant>>,
+    /// Whether the local CL cache may be consulted at all. The cache is
+    /// only honest while the scanner consumes the log stream that keeps it
+    /// current (`scan_triggers`); callers that drive `evaluate` directly
+    /// (CLI scans, fork tests) never feed it events, so a stale cache
+    /// could silently mis-price legs that have no chance to self-heal.
+    /// Armed on the first trigger batch; disarmed forever by `--no-local-cl`.
+    cl_armed: AtomicBool,
     /// USD prices backing the floors and the dust screen, refreshed in the
     /// same `POOL_FLOORS_TTL` round. Only feed-resolved assets appear; USDC
     /// is constant and added on read (see `usd_price_map`).
@@ -445,6 +480,32 @@ impl Scanner {
             })
             .collect();
 
+        let cl_specs: Vec<ClPoolSpec> = registry
+            .pools
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pool)| match pool.venue {
+                Venue::UniV3 { .. } | Venue::PancakeV3 { .. } => Some(ClPoolSpec {
+                    index,
+                    address: pool.address,
+                    token0: pool.token0,
+                    token1: pool.token1,
+                    // V3/Pancake spacing comes from the pool itself.
+                    tick_spacing_hint: None,
+                    dynamic_fee: false,
+                }),
+                Venue::Slipstream { tick_spacing } => Some(ClPoolSpec {
+                    index,
+                    address: pool.address,
+                    token0: pool.token0,
+                    token1: pool.token1,
+                    tick_spacing_hint: Some(tick_spacing),
+                    dynamic_fee: true,
+                }),
+                Venue::UniV2 | Venue::Aerodrome { .. } => None,
+            })
+            .collect();
+
         Ok(Self {
             provider,
             manifest,
@@ -455,6 +516,10 @@ impl Scanner {
             routes,
             gas_cache: Mutex::new(None),
             pool_floors: Mutex::new(None),
+            cl_specs,
+            cl_pools: Mutex::new(HashMap::new()),
+            cl_boot_fail: Mutex::new(None),
+            cl_armed: AtomicBool::new(false),
             trigger_prices: Mutex::new(HashMap::new()),
             head_pin: Mutex::new(None),
             head_pinning,
@@ -1036,11 +1101,15 @@ impl Scanner {
             bail!(note);
         }
 
+        // The `plan` path is the simulate-what-you-propose path: it must
+        // price every leg on chain at the pin (§0u), so both local caches
+        // are deliberately empty here.
         let (quotes, _failed) = self
             .quote_jobs(
                 std::slice::from_ref(route),
                 &[(0usize, amount)],
                 block_id,
+                &HashMap::new(),
                 &HashMap::new(),
             )
             .await;
@@ -1090,10 +1159,16 @@ impl Scanner {
         for trigger in triggers {
             match trigger {
                 Trigger::Head { head } => self.note_head(head),
-                Trigger::Reconnect => self.forget_head(),
+                Trigger::Reconnect => {
+                    self.forget_head();
+                    self.mark_all_cl_stale();
+                }
                 _ => {}
             }
         }
+        // Cache upkeep runs for every delivered log, before the dust screen
+        // and dedupe decide whether this batch is worth a scan at all.
+        self.apply_cl_logs(triggers);
         let notional_of = |log: &Log| self.swap_notional_usd(log);
         let is_seen = |key: &TriggerKey| {
             self.deduper
@@ -1207,7 +1282,7 @@ impl Scanner {
         // One round-trip fetches every constant-product pool's reserves so the
         // probe/refine below can price those legs locally instead of via the
         // router. Shared across assets (same pinned block).
-        let cp = self.cp_pools(block_id).await;
+        let (cp, cl) = tokio::join!(self.cp_pools(block_id), self.cl_states());
 
         // Assets are independent after the shared context is resolved, so
         // scan them concurrently. `buffered` (not `buffer_unordered`) keeps
@@ -1220,6 +1295,7 @@ impl Scanner {
         let prices_ref = &asset_prices;
         let affected_ref = &affected_set;
         let cp_ref = &cp;
+        let cl_ref = &cl;
         let asset_reports =
             stream::iter(self.assets.iter().copied().map(move |asset| async move {
                 let result = self
@@ -1233,6 +1309,7 @@ impl Scanner {
                         block,
                         block_id,
                         cp_ref,
+                        cl_ref,
                     )
                     .await;
                 (asset, result)
@@ -1330,6 +1407,7 @@ impl Scanner {
             match reorg_check {
                 Ok(current) if pin.is_superseded_by(current) => {
                     report.reorged = true;
+                    self.mark_all_cl_stale();
                     report.notes.push(format!(
                         "block {} was re-orged during this scan (its hash is now {});                          these numbers describe a discarded block and are void",
                         pin.number,
@@ -1409,7 +1487,12 @@ impl Scanner {
             .enumerate()
             .map(|(index, opportunity)| (index, opportunity.amount))
             .collect();
-        let (quotes, failed) = self.quote_jobs(&routes, &jobs, block_id, &cp).await;
+        // Honesty split (§0u): these are finalist legs being re-priced for
+        // the money numbers — keep them on chain even where probe rounds
+        // used local CL math.
+        let (quotes, failed) = self
+            .quote_jobs(&routes, &jobs, block_id, &cp, &HashMap::new())
+            .await;
         if failed > 0 {
             return Fresh::Failed(format!(
                 "{failed} leg quotes could not be re-priced at block {}",
@@ -1668,6 +1751,144 @@ impl Scanner {
         out
     }
 
+    /// Warm the CL cache without waiting for the first trigger
+    /// (Phase 4a-1): `watch` pays one bootstrap wave at startup instead of
+    /// inside the first scan that needs it. Idempotent — the same sync runs
+    /// per scan via `cl_states`; calling this with the gate closed still
+    /// fills storage, which only becomes readable once armed.
+    pub async fn prime_cl(&self) {
+        if !self.settings.local_cl {
+            return;
+        }
+        self.cl_cache_sync().await;
+    }
+
+    /// Snapshot the CL cache for one scan: re-bootstrap pools that are
+    /// missing or stale, refresh Slipstream's dynamic fees, and hand back
+    /// owned clones. Every failure mode degrades to "no local answer" (the
+    /// leg quotes on chain); nothing in this path can remove a candidate.
+    /// Reads are at `latest`, not at the scan's pin: the cache is
+    /// event-maintained and advisory — candidate selection only. Finalists
+    /// and the `plan` path are always priced on chain at the pin (§0u).
+    /// Returns empty until the trigger inbox has run at least once
+    /// (`cl_armed`): a cache nobody feeds is not an honest cache.
+    async fn cl_states(&self) -> HashMap<usize, ClPoolState> {
+        if !self.settings.local_cl || !self.cl_armed.load(Ordering::Relaxed) {
+            return HashMap::new();
+        }
+        self.cl_cache_sync().await
+    }
+
+    async fn cl_cache_sync(&self) -> HashMap<usize, ClPoolState> {
+        let (mut map, need) = {
+            let cache = self.cl_pools.lock().expect("cl cache mutex poisoned");
+            let mut need: Vec<ClPoolSpec> = self
+                .cl_specs
+                .iter()
+                .filter(|spec| cache.get(&spec.index).is_none_or(|state| state.stale))
+                .copied()
+                .collect();
+            if !need.is_empty() {
+                let failed = self
+                    .cl_boot_fail
+                    .lock()
+                    .expect("cl cooldown mutex poisoned");
+                if let Some(at) = *failed
+                    && at.elapsed() < CL_BOOT_COOLDOWN
+                {
+                    need.clear();
+                }
+            }
+            (cache.clone(), need)
+        };
+        if !need.is_empty() {
+            let head = chain::block_number(&self.provider).await.unwrap_or(0);
+            let fresh =
+                clamm::bootstrap_pools(&self.provider, &need, BlockId::latest(), head).await;
+            let mut failed = self
+                .cl_boot_fail
+                .lock()
+                .expect("cl cooldown mutex poisoned");
+            if fresh.is_empty() {
+                *failed = Some(Instant::now());
+                debug!("cl bootstrap failed; every CL leg stays remote");
+            } else {
+                *failed = None;
+                debug!(pools = fresh.len(), "cl bootstrap");
+            }
+            map.extend(fresh);
+        }
+        // Slipstream's `fee()` is dynamic; refresh it for the pools that were
+        // not just re-bootstrapped (those already read a fresh fee).
+        let refreshing: Vec<(usize, Address)> = self
+            .cl_specs
+            .iter()
+            .filter(|spec| {
+                spec.dynamic_fee
+                    && !need.iter().any(|n| n.index == spec.index)
+                    && map.contains_key(&spec.index)
+            })
+            .map(|spec| (spec.index, spec.address))
+            .collect();
+        if !refreshing.is_empty() {
+            let addrs: Vec<Address> = refreshing.iter().map(|(_, addr)| *addr).collect();
+            let fees = clamm::fetch_fees(&self.provider, &addrs, BlockId::latest()).await;
+            for ((index, _), fee) in refreshing.iter().zip(fees) {
+                if let (Some(fee), Some(state)) = (fee, map.get_mut(index)) {
+                    state.refresh_fee(fee);
+                }
+            }
+        }
+        let out = map.clone();
+        *self.cl_pools.lock().expect("cl cache mutex poisoned") = map;
+        out
+    }
+
+    /// Fold the batch's pool logs into the CL cache before anything else
+    /// reads it. Swap events carry the post-state words, so steady-state
+    /// maintenance costs no RPC; any other pool log (mint/burn/collect/…)
+    /// can flip tick state the cached bitmap has not seen, so it marks the
+    /// pool stale. This runs for every delivered log: the dust screen gates
+    /// scanning, never cache upkeep.
+    fn apply_cl_logs(&self, triggers: &[Trigger]) {
+        if !self.settings.local_cl {
+            return;
+        }
+        // Consuming triggers is what certifies the cache: from here on every
+        // state change that could move a price passes through this inbox.
+        self.cl_armed.store(true, Ordering::Relaxed);
+        let mut cache = self.cl_pools.lock().expect("cl cache mutex poisoned");
+        for trigger in triggers {
+            let logs: &[Log] = match trigger {
+                Trigger::Log { log, .. } => std::slice::from_ref(log),
+                Trigger::Flashblock { logs, .. } => logs.as_slice(),
+                _ => continue,
+            };
+            for log in logs {
+                let Some(&index) = self.pool_index.get(&log.address()) else {
+                    continue;
+                };
+                let Some(state) = cache.get_mut(&index) else {
+                    continue; // not cached yet: bootstrap will read the truth
+                };
+                match clamm::swap_after_words(log) {
+                    Some((sqrt, liquidity, tick)) => state.apply_swap_after(sqrt, liquidity, tick),
+                    None => state.mark_stale(),
+                }
+            }
+        }
+    }
+
+    /// Reconnect/re-org: the socket may have missed pool logs, and a
+    /// discarded block's after-state words were applied in good faith. Only
+    /// a re-read can vouch for the cache now.
+    fn mark_all_cl_stale(&self) {
+        let mut cache = self.cl_pools.lock().expect("cl cache mutex poisoned");
+        for state in cache.values_mut() {
+            state.stale = true;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn scan_asset(
         &self,
@@ -1680,6 +1901,7 @@ impl Scanner {
         block: ScanBlock,
         block_id: BlockId,
         cp: &HashMap<usize, ConstantProductPool>,
+        cl: &HashMap<usize, ClPoolState>,
     ) -> Result<AssetReport> {
         let mut report = AssetReport::default();
         let symbol = self
@@ -1774,7 +1996,7 @@ impl Scanner {
                 amounts.push(*amount);
             }
         }
-        let (results, failed) = self.quote_jobs(&all_routes, &jobs, block_id, cp).await;
+        let (results, failed) = self.quote_jobs(&all_routes, &jobs, block_id, cp, cl).await;
         report.quote_failures += failed;
         report.quotes += count_quotes(&results);
         update_best_from_jobs(&mut best, &best_keys, &amounts, &results);
@@ -1825,7 +2047,7 @@ impl Scanner {
         }
         if !refine_jobs.is_empty() {
             let (quotes, refine_failed) = self
-                .quote_jobs(&refined_routes, &refine_jobs, block_id, cp)
+                .quote_jobs(&refined_routes, &refine_jobs, block_id, cp, cl)
                 .await;
             report.quote_failures += refine_failed;
             report.quotes += count_quotes(&quotes);
@@ -1994,6 +2216,7 @@ impl Scanner {
         jobs: &[(usize, U256)],
         block: BlockId,
         cp: &HashMap<usize, ConstantProductPool>,
+        cl: &HashMap<usize, ClPoolState>,
     ) -> (Vec<Option<Vec<U256>>>, usize) {
         let mut failures = 0usize;
         let mut quotes: Vec<Option<Vec<U256>>> = jobs
@@ -2035,6 +2258,17 @@ impl Scanner {
                 // fee) is *not* evidence that the route is unprofitable, so it
                 // must not delete the candidate: fall through to the quoter.
                 if let LegPrice::Local(out) = price_leg(cp, step, input) {
+                    if let Some(Some(current)) = quotes.get_mut(job_index) {
+                        current.push(out);
+                    }
+                    continue;
+                }
+
+                // Local concentrated-liquidity leg (§0u). The cache is
+                // event-maintained ("the chain as the socket saw it"), so it
+                // drives probe/refine candidate selection only; a refusal —
+                // stale, uncovered ticks, dust — quotes on chain like always.
+                if let LegPrice::Local(out) = price_cl_leg(cl, step, input) {
                     if let Some(Some(current)) = quotes.get_mut(job_index) {
                         current.push(out);
                     }

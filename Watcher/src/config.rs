@@ -206,6 +206,11 @@ pub struct Settings {
     /// finalists at a newly resolved block so the reported numbers describe
     /// the freshest consistent state. Costs nothing when nothing was found.
     pub freshness: bool,
+    /// Price concentrated-liquidity legs from an in-RAM pool cache
+    /// maintained from the live event stream (§0u) during probe/refine.
+    /// Finalists and the `plan` path always quote on chain regardless;
+    /// turning this off restores the pure remote-quoting probe path.
+    pub local_cl: bool,
 }
 
 impl Default for Settings {
@@ -230,6 +235,7 @@ impl Default for Settings {
             min_swap_usd: 500.0,
             dynamic_floors: true,
             freshness: true,
+            local_cl: true,
         }
     }
 }

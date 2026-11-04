@@ -75,6 +75,12 @@ struct Group {
     concentrated: bool,
 }
 
+/// `base-rpc.publicnode.com` rejects any `eth_getLogs` filter with more
+/// than 10 addresses (error -32602, observed 2026-11-04; its error even
+/// advertises the cap-free dedicated node). Range splitting cannot fix an
+/// address-count rejection, so filters are built under the cap.
+const MAX_ADDRESSES_PER_FILTER: usize = 10;
+
 fn groups(registry: &Registry) -> Vec<Group> {
     let mut concentrated = Vec::new();
     let mut constant_product = Vec::new();
@@ -86,29 +92,36 @@ fn groups(registry: &Registry) -> Vec<Group> {
             Venue::UniV2 | Venue::Aerodrome { .. } => constant_product.push(pool.address),
         }
     }
-    vec![
-        Group {
-            topics: vec![
+    let mut out = Vec::new();
+    for (addresses, topics, is_concentrated) in [
+        (
+            concentrated,
+            vec![
                 keccak256(SWAP_V3_SIG.as_bytes()),
                 keccak256(SWAP_PANCAKE_V3_SIG.as_bytes()),
             ],
-            addresses: concentrated,
-            concentrated: true,
-        },
-        Group {
+            true,
+        ),
+        (
             // Uniswap V2 and Solidly-style (Aerodrome) pools both carry four
             // amount words but use different event signatures.
-            topics: vec![
+            constant_product,
+            vec![
                 keccak256(SWAP_V2_SIG.as_bytes()),
                 keccak256(SWAP_SOLIDLY_SIG.as_bytes()),
             ],
-            addresses: constant_product,
-            concentrated: false,
-        },
-    ]
-    .into_iter()
-    .filter(|group| !group.addresses.is_empty())
-    .collect()
+            false,
+        ),
+    ] {
+        for slice in addresses.chunks(MAX_ADDRESSES_PER_FILTER) {
+            out.push(Group {
+                topics: topics.clone(),
+                addresses: slice.to_vec(),
+                concentrated: is_concentrated,
+            });
+        }
+    }
+    out
 }
 
 fn topic_address(topic: &B256) -> Address {
@@ -235,9 +248,9 @@ async fn fetch_segment(
 
     match provider.get_logs(&filter).await {
         Ok(logs) => Ok(logs),
-        // Public endpoints cap result size. Split the range instead of
-        // failing the whole download.
-        Err(err) if depth < 5 && to > from => {
+        // Public endpoints cap result size (and Alchemy free caps range at
+        // 10 blocks). Split the range instead of failing the whole download.
+        Err(err) if depth < 8 && to > from => {
             warn!(from, to, error = %err, "log query failed; splitting range");
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mid = from + (to - from) / 2;
@@ -421,7 +434,9 @@ mod tests {
     fn constant_product_group_covers_v2_and_solidly_topics() {
         let registry = Registry::base_curated().unwrap();
         let groups = groups(&registry);
-        assert_eq!(groups.len(), 2);
+        // Address-cap chunking splits the concentrated side; the
+        // constant-product side (4 pools) must stay a single group.
+        assert_eq!(groups.iter().filter(|g| !g.concentrated).count(), 1);
         let constant = groups
             .iter()
             .find(|group| !group.concentrated)
@@ -488,5 +503,36 @@ mod tests {
         }));
         assert!(swap_deltas(&log, true).is_none());
         assert!(decode_swap(&log, true, &registry).is_none());
+    }
+    #[test]
+    fn filters_respect_the_address_cap() {
+        let registry = crate::routes::Registry::base_curated().unwrap();
+        let groups = groups(&registry);
+        assert!(!groups.is_empty());
+        for group in &groups {
+            assert!(
+                group.addresses.len() <= MAX_ADDRESSES_PER_FILTER,
+                "group carries {} addresses",
+                group.addresses.len()
+            );
+        }
+        let total: usize = groups.iter().map(|g| g.addresses.len()).sum();
+        assert_eq!(total, registry.pools.len(), "every pool is watched");
+        let concentrated_pools: usize = registry
+            .pools
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.venue,
+                    Venue::UniV3 { .. } | Venue::Slipstream { .. } | Venue::PancakeV3 { .. }
+                )
+            })
+            .count();
+        let concentrated_seen: usize = groups
+            .iter()
+            .filter(|g| g.concentrated)
+            .map(|g| g.addresses.len())
+            .sum();
+        assert_eq!(concentrated_seen, concentrated_pools);
     }
 }

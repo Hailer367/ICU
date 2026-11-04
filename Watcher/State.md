@@ -1,8 +1,9 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-11-03 (§0u scopes the one remaining big latency item —
-local swap math for the 29 concentrated pools; §0s shipped the Tier-1 pairs,
-§0t the socket-head pins and batched cost probes)
+Last updated: 2026-11-04 (§0w scopes the next big program — race-readiness:
+gap autopsy on historical market data, replay benchmarking, and the
+optimization loop until the pipeline beats measured competitor close times;
+§0v shipped §0u's local CL math, live-differentiated wei-for-wei)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -2530,6 +2531,368 @@ makes 3-hop probes cheap too).
 
 ---
 
+
+### 0v. Local CLMM swap math shipped: bit-for-bit, live-differentialed (2026-11-04)
+
+§0u was executed in full. The watcher now prices all 29 concentrated pools
+from RAM during probe/refine, and the quotes are **identical to the on-chain
+quoters at the last wei** — verified repeatedly against live Base through the
+Alchemy endpoint, including the quoters' `sqrtPriceX96After` word (agreement
+there proves the tick *walk* matches, not just the final amount).
+
+**What was built.**
+
+- `src/clamm.rs` (~1,150 lines): a line-for-line port of the V3 quoting path
+  — `TickMath.getSqrtRatioAtTick/getTickAtSqrtRatio`, `FullMath.mulDiv(+Up)`,
+  `SqrtPriceMath`, `SwapMath.computeSwapStep`, `TickBitmap` word search, and
+  the `pool.swap` main loop. The port mirrors upstream **arithmetic flavour
+  per call site**: v3-core compiles at solc 0.7.6, where plain `uint` ops
+  wrap, explicit casts truncate, and only SafeMath helpers revert. Wrapping
+  where the contract wraps (`mulmod`-style products, the tick-magic ladder),
+  `checked_*` where it uses SafeCast/LowGasSafeMath/LiquidityMath, assembly
+  div-by-zero semantics where it uses assembly. Every refusal is a `None`
+  meaning "quote on chain", never "unprofitable" — the §0j rules, restated
+  in the module header.
+- **Protocol fees are not modelled, on purpose**: `swap()` deducts
+  `amountIn + feeAmount` from the remaining input *before* the protocol
+  carve-out moves part of the fee aside, so quoted amounts are independent
+  of `slot0.feeProtocol` (verified against Pancake, whose defaults run
+  32–34 % protocol share, and Pancake's 6-field slot0 layout).
+- **Bootstrap**: 3-round Multicall3 read per pool at one block — slot0/fee/
+  liquidity/tickSpacing, a ±16-word tick-bitmap band, then every initialized
+  tick inside the chosen coverage (soft cap 300 ticks, denser side wins;
+  the band always covers the current word). `tickSpacing` is read from the
+  pool, never derived from the fee tier. A Slipstream spacing hint mismatch
+  against the pool's own answer ⇒ the pool is dropped (remote), never trusted.
+- **Maintenance**: Swap events carry the post-state (`sqrtPriceX96`,
+  `liquidity`, `tick`) — applied from the trigger stream at zero RPC cost.
+  Any *other* pool log (Mint/Burn/Collect/unknown shape) marks the pool
+  stale: re-bootstrap on the next scan. `Trigger::Reconnect` and the §0k
+  re-org-void path mark the whole cache stale. Slipstream `fee()` is
+  refreshed per scan for non-rebootstrapped dynamic pools.
+- **Honesty split (§0u's pinned decision, written into the code first)**:
+  local CL math serves probe/refine candidate selection only. `plan`,
+  finalist quoting in the freshness pass, and `simulate` all stay on chain
+  at the pin — the money numbers never read from this cache.
+- **The armed gate.** A cache is only honest while its owner consumes the
+  log stream that keeps it current. `evaluate` called directly (CLI `scan`,
+  the fork tests) never feeds events, so a pre-skew cache would silently
+  mis-price legs that can never self-heal. Found the hard way:
+  `fork_opportunity` went to 0 opportunities because its first `evaluate`
+  bootstrapped the cache *before* the skew and the second trusted it after.
+  Fix: `cl_armed` — the local path engages only after `scan_triggers` has
+  consumed a batch (watch mode); direct-evaluate callers are pure remote,
+  exactly the pre-§0v behaviour. `--no-local-cl` disables the path entirely
+  (A/B and safety valve; finalists/plan unaffected).
+
+**Verification (all on 2026-11-04, this machine: Rust 1.99.1, Foundry/Anvil
+1.9.0 installed from the release tarball into `~/.foundry/bin`).**
+
+- **Upstream-vector unit tests** (`clamm::tests`, 11): the 28 explicit
+  `getSqrtRatioAtTick` rows from v3-core's own `TickMath.spec.ts.snap`;
+  MIN/MAX tick and sqrt-ratio boundaries; the `getTickAtSqrtRatio` spec
+  vectors incl. `MAX_SQRT_RATIO-1 = MAX_TICK-1`; `mulDiv`/`mulDivRoundingUp`
+  MaxUint256 and Q128 ratios against independently computed decimal
+  constants; all five fully-explicit upstream `computeSwapStep` vectors
+  (incl. the insufficient-liquidity exact-output ones); bitmap word search
+  incl. negative-tick floor compression and unknown-word refusal; a dense
+  round trip (8,200 ticks + the 19 magic-number cut points); monotonicity;
+  dust/absurd-input refusals. `cargo test --lib`: 128 pass.
+- **Live differential** (`tests/cl_local_math.rs`, ignored, `RYO_LIVE_RPC`):
+  every CL pool × both directions × a 10-step amount sweep (1 wei dust to
+  ~$8k-scale units), local vs the exact quoter calls the remote path makes,
+  **both at the same pinned block**. Four independent runs: exact matches
+  531/556 every time, `sqrtPriceX96After` agreement on all of them, **0
+  mismatches**, 25 coverage refusals (thin pools at the biggest sizes —
+  the designed degrade-to-remote), 0 dangerous refusals. `cl_local_math`
+  also asserts a local in→out→in round trip never returns more than it paid.
+- **Event-replay differential** (`maintained_cache_matches_after_live_event_replay`):
+  bootstrap, replay real chain logs from a ~9-block window through the same
+  entry point the trigger loop uses (161–262 swap after-states applied; 34–76
+  non-swap logs stale-marked), refresh dynamic fees, then repeat the full
+  differential at the newer pin. Fresh caches: 493/518 exact (95 %),
+  0 mismatches; stale-marked pools refused everything they should. Floor
+  applies to *fresh-pool* comparisons only — stale ⇒ refuse is designed
+  behaviour, not a defect.
+- **Fork playbook** (anvil fork of the Alchemy HTTP endpoint, standard
+  `Deploy.s.sol` + manifest): `validate` 33 pools OK; `local_math` (CP) pass;
+  `pinned_block` 5/5; `tier1_expansion` 4/4 (incl. the executing triangle);
+  `fork_opportunity` with `RYO_FORK_EXECUTE=1`: skew → scan (with the armed
+  gate: pure remote, deterministic) → 8 opportunities → `execute` broadcast →
+  **recipient gained exactly the simulated profit** (7154041966121413 WETH
+  wei, realized == simulated); Foundry suite 133/134 (one pre-existing
+  market-drift flake in `test_fork_core_arbitrage_aerodrome_to_univ3` whose
+  fixed 60k skew no longer clears the fee threshold on today's deeper pool
+  state — passes on retry; no Solidity was touched).
+- **Latency A/B** (watch, live pending-logs socket + fork HTTP, 100 triggers
+  each, same warm fork): `--no-local-cl` avg_probe_ms 6594 (4 scans) vs
+  local CL avg_probe_ms **119** (9 scans, simulations exercised): ~50x on
+  the probe stage and >2x scan throughput in the same window. The fork
+  exaggerates the remote side (QuoterV2 `eth_call` through anvil's EVM on
+  fetched state), so treat 119 ms as fork-bound evidence of *eliminated*
+  round-trips, not the live floor; the honest live number (vs §0u's 314 ms
+  p50) can only be measured once the core is deployed on mainnet and the
+  full read path runs live.
+- `cargo clippy --all-targets` clean, `cargo fmt --check` clean,
+  `events_ws` pass, README + `--no-local-cl` documented.
+
+**Known bounds and leftovers (deliberate).**
+
+- Coverage refusals at oversized probes (~25/556): thin pools cross past the
+  cached tick budget. The right lever is raising `TICK_CAP_PER_DIRECTION`
+  or making it size-aware, not chasing 100 %.
+- A swap that lands *while* a bootstrap read is in flight can miss that
+  one event (window ≤ 1 scan); the price self-heals on the pool's next
+  event, and finalists are on-chain-verified regardless.
+- Slipstream fee staleness between per-scan refreshes can only mis-rank a
+  probe candidate; it can never mis-pay.
+- `local_math.rs`'s CP sweep still skips CL legs on purpose; the CL side has
+  its own differential (`cl_local_math`) which additionally checks the
+  sqrt-after word.
+- `examples/capture_pin.rs` could grow a CL mode (generate pinned CL ground
+  truth the way §0j did for CP). Not needed: the live differential is the
+  stronger oracle.
+- Fork tests and live tests must not run concurrently against one Alchemy
+  key (429s); serialized runs are stable. `pinned_block`/`fork_opportunity`
+  snapshot+revert per test: run fork suites with `--test-threads=1`.
+- The skew tests (this one and `fork_opportunity`) fund themselves from the
+  **Balancer vault's live USDC balance, which oscillates between ~$0 and
+  ~$75k** as pools rebalance; a freshly forked head can fail them outright
+  ("vault only holds 0 USDC"). Deterministic recipe: `anvil --fork-url
+  <alchemy> --chain-id 8453 --fork-block-number <block>` pinned to a moment
+  when the vault was funded (53510471 worked on 2026-11-04), then redeploy.
+  Worth fixing properly later: fund a fresh test address with `cast`-style
+  impersonation of a big USDC holder (e.g. an exchange whale) or
+  `anvil_setStorageAt` the vault slot, instead of depending on a
+  third-party's balance luck. Same category as §0r's note that the fixed
+  60k skew is market-state-sensitive.
+
+---
+
+
+### 0w. Race-readiness program: gap autopsy → replay benchmark → optimize, in a loop (started 2026-11-04, Phases 1–2 done, 3–4 open)
+
+This is the full handoff for the next session; nothing from the conversation
+is needed to execute it. §0v made the watcher *reflex-fast and provably
+correct*; what nobody has yet measured is **whether it can win real races**:
+every live watch run so far (§0o, and §0v's A/B runs again) found 0
+opportunities on un-skewed traffic. The inference is that cross-venue gaps
+close before a same-block-late scanner arrives — but that has never been
+quantified, and neither has our own time-to-ready-calldata. This program
+turns both into numbers and then optimizes against them.
+
+**PROGRESS 2026-11-04 (later hours of the §0v session) — Phases 1–2 landed.**
+
+- Phase 1: the harvester bug was real and is FIXED (`history.rs`: filters
+  chunked to ≤10 addresses, range-split depth raised to 8; unit test
+  `filters_respect_the_address_cap`). 24 h of events downloaded to
+  `data/swaps_24h.jsonl` (157 MB, 340,396 events, git-ignored — regenerate
+  per session with the runbook command below; it takes ~5 minutes against
+  publicnode).
+- Phase 2: `tools/gap_autopsy.py` works and produced **Record A** (reports
+  committed nowhere; regenerate with
+  `python3 tools/gap_autopsy.py data/swaps_24h.jsonl data/gap_autopsy_24h.md 2.0`,
+  and at 20/60/200 bps). Headline numbers from the 24 h window
+  (blocks ~53470.7k..53513.9k, 2026-11-04):
+  * ≥2 bps episodes: **63,630** (~44/min), 25% closed in the opening block,
+    median lifetime 3 blocks (~6 s), p90 12 blocks;
+  * ≥60 bps (the bot's approximate round-trip cost line): **22,624**
+    episodes/day, only 19% same-block-closed;
+  * ≥200 bps: **1,537**/day, 29% same-block-closed → **71% of ≥2% gaps
+    survived the opening block**, median life still ~3 blocks;
+  * the largest (≈470–494 bps) cluster on the thin `slipstream:50`
+    WETH/USDC pool and concentrate in two blocks (53506881, 53507843) —
+    ideal replay targets: one fork pin covers several episodes;
+  * named competitors (recipient of the closing trade):
+    `0x51C72848c68a965f66FA7a88855F9f7784502a7F` closed **3,265** episodes in
+    24 h (one every ~26 s), then `0x278d858f…` 814, `0x29BE31E7…` 758,
+    `0x7c4c7Ac3…` 611, `0x8F10B468…` 574 — study and decode their closing
+    txs first (Phase 4 lever 8 now has concrete targets).
+  * Verdict shift: opportunities are NOT scarce — the open question is now
+    precisely "why does the watcher's live path see zero": pin staleness
+    (head−2 ≈ 4 s into a median-6 s lifetime), the floor/dust screens, or
+    real-size slippage eating price gaps on thin pools. The replay harness
+    answers this.
+- Remaining §0v tails as of this push: `dynamic_floors` PASSED on the warm
+  pinned fork (1190 s); `fork_simcache` still FAILED there ("re-simulated
+  everything, sims_cached=0") — hypothesis unchanged (its 60k-skew scenario
+  outcome is market-state-sensitive: on the pinned block the vault funded
+  only a 15.8k skew). Next session: rerun with `--nocapture` on a fork
+  pinned where the vault holds ≥ 60k, and only suspect the code if the two
+  scans pin the same block and the cache still misses.
+- Phase 3 prep note: the autopsy currently stores `open_block`/`peak_bps`
+  per episode but NOT the opener tx hash / log index; add
+  `open_tx`/`open_log`/`open_pool` fields (the per-pool last event of the
+  opening block) before building the replay harness — a draft of this
+  extension exists in the session history pattern: track `last_event[p]`
+  alongside `last[p]`. The replay draft example was deliberately NOT
+  committed (incomplete; raw-tx re-broadcast is fragile — use
+  anvil-impersonation re-send of the opener's `to`/`input` from the source
+  tx instead).
+- Phase 4a-1 (prime the CL cache at watch startup instead of inside the
+  first scan) is DONE (`Scanner::prime_cl`, called from `watch_command`
+  before the loop). Phase 4a-2 (per-scan `cl_states` HashMap clone cost)
+  not measured yet — measure inside the replay harness.
+
+**The scoreboard we are trying to beat (the "records").**
+- *Record A (competitor):* the distribution of **gap close times** on Base,
+  measured from mined history: for each detected gap opening, the ordering
+  of events within the opening block (logIndex) shows whether a searcher
+  closed it in the same block, the next one, or later. Mined data gives
+  2-second bucket + within-block ordering, not sub-block wall time —
+  enough to build a close-time distribution and a hard bar.
+- *Record B (ours):* **trigger-received → ready-calldata** latency of this
+  pipeline, replayed against those exact historical moments. Today's
+  evidence points (probe_ms p50 314 ms remote / fork A/B 119 ms with local
+  CL, §0v) are starting values, not results — the replay harness produces
+  the real series.
+- *Winning condition, raised every pass:* our B distribution beats the A
+  distribution's median → then its p75 → then p90. When we can send (mainnet
+  deploy + live mode), the scoreboard flips to empirical: simulated-winner
+  rate vs landed-vs-gone ratio. Until then, paper-racing only — the hard
+  constraints below hold.
+
+**Phase 1 — Harvest the history (fix the harvest first; it is broken today).**
+
+- Bug found 2026-11-04 while attempting the first download: `history.rs`
+  `groups()` puts **all 29 CL pools in one filter**; `base-rpc.publicnode.com`
+  rejects any `eth_getLogs` with >10 addresses (`error -32602: A maximum of
+  10 addresses is allowed`), and the failure handler splits only the *block
+  range* (down to 15-block chunks) while re-sending the same 29 addresses —
+  so it can never succeed. **Fix:** slice each group's addresses into ≤10
+  per request (4 CL groups: 10+10+9 plus the CP group's 4 — and note the
+  group split must not mix CL and CP signatures since topic0s are grouped
+  too: keep the two event-shape groups separate, sub-split addresses inside
+  each). Also worth trying: publicnode's *dedicated* free endpoints, which
+  their error message itself advertises as uncapped.
+- Endpoint budgets: Alchemy free caps `eth_getLogs` at **10 blocks per
+  request** (§0r) → 24h = ~4,320 range-requests; publicnode takes 500-block
+  ranges but 10 addresses → 24h ≈ 86×4 requests per address-group. Harvest
+  from publicnode, keep Alchemy for state/simulation work, never run both
+  heavy paths against the Alchemy key concurrently (429s, §0v note).
+- Runbook:
+  `./target/debug/ryo-watch --http-rpc https://base-rpc.publicnode.com history --blocks 43200 --chunk 500 --out data/swaps_24h.jsonl`
+  `SwapRecord` already carries, per event: block, **block timestamp**, tx
+  hash, **log_index**, pool, venue, signed deltas, and for CL pools
+  **sqrt_price_x96 / liquidity / tick** — every CL pool's full price state
+  after every swap, offline. That is the entire raw material for Phase 2.
+
+**Phase 2 — Gap autopsy (offline analysis; Python over the JSONL is fine).**
+
+- Price reconstruction: for each CL pool, price = (sqrtPriceX96/2^96)^2 ×
+  10^(dec0-dec1); event order = (block, log_index); state after each event
+  is the event's own words (no RPC).
+- Pair pools by token pair (USDC/WETH ×12 pools, USDC/cbBTC ×6, WETH/cbBTC
+  ×7, EURC pairs ×3); for each ordered pair of pools on the same pair, a
+  **gap** exists when the cross price after fees+buffer clears:
+  p_out/p_in − (fee_i + fee_j + slippage + profit buffer) > 0 using the
+  watcher's own cost model constants; report gap opens, their USD size at
+  the $500–8k probe sizes (use the local CL math itself to size them), and
+  their lifetime in blocks and in log-position.
+- **Who closed it:** same-block sequences `big trade → gap opens →
+  counter-trade(s) by the same tx or address across the other pool` =
+  searcher close. Record: did it close in-block or later, and how many
+  log-positions the winner had after the open (queue-position proxy). This
+  builds Record A and, as a bonus, names the competitor txs worth reading
+  (they are public on Base — their *timing*, gas and route choices are the
+  market intel).
+- Granularity caveat to state in every chart: mined blocks are 2 s buckets
+  and Flashblocks (200 ms) do not exist in mined history at sub-block
+  resolution — treat "closed in the same block it opened" as the fast
+  bucket and size our target against it, not against 2 s.
+
+**Phase 3 — Replay benchmark (our pipeline against those moments).**
+
+- Determinism recipe proven today: `anvil --fork-url <alchemy> --chain-id
+  8453 --fork-block-number <N>` reproduces exact chain state (the vault
+  balance oscillation that broke §0v's fork runs disappears when pinned).
+- Harness (new, `examples/` or an ignored test): fork pinned to `block_of_gap_open − 1`;
+  bootstrap the CL cache as a watcher's would (a first `scan_triggers` batch
+  arms it); feed the recorded events from `block+1..` as synthetic
+  `Trigger::Log`s through `scan_triggers`; measure trigger→scan-report→
+  ready-calldata (`plan`'s output shape, never sent); assert the *prices we
+  see in replay match the autopsy's* (independent oracle chain: autopsy
+  price vs local math vs quoter). Then compare B vs Record A.
+- The paper-race verdict per replayed gap: `ready_time` vs the gap's
+  measured close position ⇒ would we have made it, given same-block
+  inclusion? Report the win-rate curve, not a single number.
+- Reuse from today, do not rebuild: `clamm.rs` (local CL math + cache),
+  `tests/cl_local_math.rs` (bootstrap at any pinned block + diff arms),
+  the A/B flag (`--no-local-cl`), and `history.rs` (the dataset).
+
+**Phase 4 — Optimize in a loop (every lever: side-test with the replay,
+keep only real wins, update State.md records each pass).** Use web search
++ GitHub aggressively here — the ecosystem is public. Non-exhaustive list,
+roughly ordered by expected yield:
+
+1. **Bootstrap-before-first-trigger**: today the cache builds *inside* the
+   first evaluate (the wave delays the very first scans). On `watch` start
+   (and on every re-bootstrap wave), do the CL bootstrap concurrently with
+   waiting for triggers, not serially before the first scan.
+2. **Per-scan cache clone**: `cl_states` clones every pool's bitmap+ticks
+   HashMap per scan; measure it, then share via `Arc<Mutex<..>>` interior
+   patterns or diff-apply, if it shows up in `probe_ms`.
+3. **`eth_simulateV1` for candidate batches** — works on Alchemy today,
+   blocked only for *fork-proofing* the tests (Anvil 1.9.0 parse error);
+   the replay harness can verify it live-first (fold execute-gas into §0t's
+   batched probes). Search: `eth_simulateV1` examples on Base/OP Stack.
+4. **Trigger source**: `pendingLogs` (~1 s early, lands pool+words) is the
+   default; Flashblocks (200 ms) give `newFlashblockTransactions` (tx hash
+   only — cannot identify the pool, §6.B) — research whether Alchemy's
+   flashblock payloads can be paired with a fast `eth_getBlockReceipts`-style
+   enrich, and what dedicated node services expose. This is the single
+   biggest potential cut to *observed* price-change time.
+5. **Single-flight pipelining** (next trigger starts while a scan runs):
+   deliberately out per §6.G; the replay benchmark is the right place to
+   re-evaluate with data rather than re-litigate it by argument.
+6. **Coalescing default** (`--coalesce-ms`) tuned against Record A, not vibes.
+7. **Tick budget by probe size**: `TICK_CAP_PER_DIRECTION`/`WORDS_PER_DIRECTION`
+   currently fixed; size them from the probe grid so ~all realistic probes
+   resolve locally (today's leftovers: ~25/556 coverage refusals).
+8. **Competitor study**: decode the fast-close txs found in Phase 2
+   (`decode` CLI + public traces) — their routes, sizes, and venues tell
+   us where the crowding is; prefer the uncrowded corners (Slipstream odd
+   spacings, cross-venue legs) for the $0.25-floor probes.
+9. Long shots (research first, timebox): private orderflow / sequencer
+   submission on Base (docs), running our own full node with local
+   Flashblocks stream, Rust-side hot-path profiling of
+   scanner→multicall→WS (flamegraph the replay runs).
+
+**Hard constraints inherited, unchanged:** dry-run/paper only until the core
+is deployed on mainnet AND the user opts into live explicitly; no
+priority-fee bidding; no separate flashblock fee; finalists/plan always
+priced on chain; every local refusal means "quote on chain", never
+"unprofitable"; keys live in the environment only; explain state simply to
+the user at every handoff.
+
+**Open §0v tails to close before/at the start (housekeeping, small):**
+
+- `fork_simcache` failed twice on 2026-11-04 (first run: the vault-skew
+  funding drift documented in §0v; second, at the pinned solvent block, on a
+  *cold* fork: "second full scan re-simulated everything (simulations=8,
+  sims_cached=0)" after 1396 s). Working hypothesis: with multi-second state
+  fetches the two scans pinned different heads, so the input-pinned cache
+  correctly refused to reuse (not a §0v regression: the armed gate makes the
+  scanner's read path identical to the pre-§0v build that passed this test
+  on 2026-11-01). Verify by rerunning **on the now-warm pinned fork** with
+  `--nocapture`; if it still fails with equal pins, bisect against
+  `git stash`/revert of §0v's `quote_jobs` signature change — the behavior
+  difference surface is provably only the two map arguments.
+- `dynamic_floors` was mid-run at §0w writing time (on the same pinned
+  fork); record its outcome here when in.
+- `deployments/8453.anvil.json` was rewritten by today's redeploys (different
+  nonce-dependent addresses than the committed one). Local-fork file only;
+  decide whether to commit it or keep the October version.
+
+**Definition of done for the program (v1):** Phase 1 dataset downloaded with
+the fixed harvester; Phase 2 gap/close report + Record A distribution
+committed under `data/`; Phase 3 replay harness merged as a test/example
+with its first B-vs-A win-rate curve; Phase 4 items 1–2 done and recorded,
+each lever's keep/drop evidenced in this file. That is when we can answer
+"can it compete today" with numbers instead of inference.
+
+---
+
 ## 8. Key protocol facts / gotchas
 
 - `RyoCore.simulate` **always reverts**. Success is
@@ -2668,13 +3031,16 @@ for you.
 
 ## 11. Next move (one line)
 
-Pick up **§0u: local swap math for the 29 concentrated pools** — it is the
-full handoff (scope, references, pinned decisions, test plan, and the
-measured baseline to beat). Everything before it is done and verified:
-Tier-1 pairs (§0s), socket-head pins and batched candidate probes (§0t).
-After §0u, in value order: decide `--max-hops 3` as the default (the §0s
-live A/B — 153 ms vs 399 ms — supports it), `eth_simulateV1` candidate
-batches once Anvil supports fork proofs of it (it works on Alchemy today),
-deploy the core + five adapters on Base mainnet (the gating item for going
-live), Uniswap V4 (largest venue gap), profit-only failed-sim caching,
-and CI.
+Pick up **§0w: the race-readiness program** — it is the full handoff
+(harvest bug fixes, gap-autopsy method, replay harness design, the record
+definitions, the ordered optimization levers, and the small §0v tails to
+close first). Then, in value order: deploy the core + adapters on Base
+mainnet (the gating item for going live — it also unlocks the honest live
+probe-latency number vs §0u's 314 ms baseline), decide `--max-hops 3` as
+the default (the §0s live A/B — 153 ms vs 399 ms — supports it, and local
+CL math makes 3-hop probes cheap too), `eth_simulateV1` candidate batches
+once Anvil supports fork proofs of it (it works on Alchemy today), Uniswap
+V4 as the largest venue gap (start hookless-only pools; hook fields are
+immutable per pool, so a hookless whitelist never needs revisiting; audit
+hook contracts separately if ever included), size-aware CL tick budgets,
+profit-only failed-sim caching, and CI.

@@ -189,6 +189,11 @@ enum Command {
         /// per-pool floors derived from live fee and depth.
         #[arg(long)]
         no_dynamic_floors: bool,
+        /// Price concentrated-liquidity legs remotely even where the local
+        /// pool cache (§0u) could answer. Latency comparison and safety
+        /// valve; finalists and `plan` always quote on chain regardless.
+        #[arg(long)]
+        no_local_cl: bool,
     },
     /// Subscribe to Base events and scan on each trigger.
     Watch {
@@ -220,6 +225,11 @@ enum Command {
         /// per-pool floors derived from live fee and depth.
         #[arg(long)]
         no_dynamic_floors: bool,
+        /// Price concentrated-liquidity legs remotely even where the local
+        /// pool cache (§0u) could answer. Latency comparison and safety
+        /// valve; finalists and `plan` always quote on chain regardless.
+        #[arg(long)]
+        no_local_cl: bool,
     },
     /// Print the per-pool trigger floors (live fee, depth, and the minimum
     /// swap USD the watcher will react to for each pool).
@@ -308,10 +318,12 @@ async fn run() -> Result<()> {
             json,
             no_freshness,
             no_dynamic_floors,
+            no_local_cl,
         } => {
             let mut settings = settings;
             settings.freshness = !no_freshness;
             settings.dynamic_floors = !no_dynamic_floors;
+            settings.local_cl = !no_local_cl;
             scan_command(&settings, &pools, pending, json).await
         }
         Command::Watch {
@@ -323,10 +335,12 @@ async fn run() -> Result<()> {
             coalesce_ms,
             no_freshness,
             no_dynamic_floors,
+            no_local_cl,
         } => {
             let mut settings = settings;
             settings.freshness = !no_freshness;
             settings.dynamic_floors = !no_dynamic_floors;
+            settings.local_cl = !no_local_cl;
             watch_command(
                 &settings,
                 cli.source,
@@ -372,6 +386,7 @@ fn settings_from_cli(cli: &Cli) -> Settings {
         min_swap_usd: cli.min_swap_usd,
         dynamic_floors: true,
         freshness: true,
+        local_cl: true,
     }
 }
 
@@ -962,6 +977,10 @@ async fn watch_command(
     let scanner = Scanner::new(provider, manifest, settings.clone())?;
     let pools = scanner.registry().all_pool_addresses();
     let mut stream = EventStream::new(ws, source, &pools);
+    // Phase 4a-1: bootstrap the CL cache now, while the socket is still
+    // connecting, so the very first trigger does not pay the read wave
+    // inside its own scan.
+    scanner.prime_cl().await;
 
     if settings.mode == Mode::Live {
         warn!(
