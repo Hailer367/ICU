@@ -966,7 +966,10 @@ async fn chunked_multicall(
     block: BlockId,
 ) -> Vec<std::result::Result<Bytes, String>> {
     let mut out = Vec::with_capacity(calls.len());
-    for chunk in calls.chunks(MULTICALL_CHUNK) {
+    for (ci, chunk) in calls.chunks(MULTICALL_CHUNK).enumerate() {
+        if std::env::var("RYO_TRACE_BOOT").is_ok() {
+            eprintln!("[boot] chunk {ci}/{}", calls.len().div_ceil(MULTICALL_CHUNK));
+        }
         out.extend(chain::multicall_raw(provider, chunk, block).await);
     }
     out

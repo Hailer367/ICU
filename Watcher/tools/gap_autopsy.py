@@ -20,6 +20,7 @@ Fee notes: UniV3/Pancake tiers are static. Slipstream fees are dynamic;
 defaults use §0p's measured values (ts1 0.8bps, ts10/50 5bps, ts100 8.33,
 ts200 assumed 8.33 — approximate and flagged).
 """
+import bisect
 import json
 import sys
 from collections import defaultdict
@@ -83,9 +84,11 @@ def price(r):
 
 
 def analyze(events, gap_bps=5.0):
-    # per-pool price timeline: block -> last price in that block
+    # per-pool price timeline: block -> last price in that block.
+    # `events` is sorted by (block, log_index), so repeated assignment to
+    # (pool, block) leaves the block's LAST event — one pass, no rescans.
     by_pool_block = defaultdict(dict)
-    by_pool_events = defaultdict(list)
+    last_ev_pb = {}  # (pool, block) -> last event in that block
     pairs_of = {}
     for r in events:
         pool = r["pool"].lower()
@@ -94,7 +97,7 @@ def analyze(events, gap_bps=5.0):
         if not (0.001 < p < 1e9):
             continue
         by_pool_block[pool][r["block"]] = p
-        by_pool_events[pool].append(r)
+        last_ev_pb[(pool, r["block"])] = r
         pairs_of[pool] = pair
 
     pools_by_pair = defaultdict(list)
@@ -111,9 +114,7 @@ def analyze(events, gap_bps=5.0):
             for p in pools:
                 if b in by_pool_block[p]:
                     last[p] = by_pool_block[p][b]
-                    evs = [r for r in by_pool_events[p] if r["block"] == b]
-                    if evs:
-                        last_event[p] = max(evs, key=lambda r: r["log_index"])
+                    last_event[p] = last_ev_pb[(p, b)]
             if any(v is None for v in last.values()):
                 continue
             for i in pools:
@@ -163,25 +164,71 @@ def analyze(events, gap_bps=5.0):
 
 def closers(events, episodes):
     """For each episode: did a trade on the SELL pool occur within the
-    opening block, after the opening event's log position? Who did it?"""
+    opening block, after the opening event's log position? Who did it?
+
+    Records, as the Record A close-time proxy:
+      * `close_lag_blocks`: blocks from open until the first counter-pool
+        trade (0 = same block, None = never closed in window);
+      * `close_pos_gap`: for same-block closes, the log-index distance
+        between the opening event and the closing event within the block
+        (queue-position proxy — sub-block wall time is unobservable in
+        mined history, but ordering is);
+      * `close_tx`/`close_log`: the FIRST closing trade, i.e. the bot that
+        actually won the race (not the last one in the block).
+    """
     out = []
     idx_by_pool = defaultdict(list)
     for r in events:
         idx_by_pool[r["pool"].lower()].append(r)
+    # events arrive sorted by (block, log_index); keep the key arrays for bisect
+    keys_by_pool = {
+        p: [(r["block"], r["log_index"]) for r in evs] for p, evs in idx_by_pool.items()
+    }
     for e in episodes:
         sell_addr = e["sell"].split("/")[1]
         full = [p for p in idx_by_pool if p.startswith(sell_addr)]
         closed_same_block = None
         closer = None
+        close_lag_blocks = None
+        close_pos_gap = None
+        close_tx = None
+        close_log = None
         if full:
-            pool_ev = idx_by_pool[full[0]]
-            same = [r for r in pool_ev if r["block"] == e["open_block"]]
-            if same:
-                closed_same_block = True
-                best = max(same, key=lambda r: r["log_index"])
-                closer = best["recipient"] or best["sender"]
-        out.append(dict(e, closed_same_block=closed_same_block, closer=closer))
+            pool_key = full[0]
+            pool_ev = idx_by_pool[pool_key]
+            # first counter-pool trade strictly after the gap opened
+            start = bisect.bisect_right(
+                keys_by_pool[pool_key],
+                (e["open_block"], e["open_log"] if e["open_log"] is not None else -1),
+            )
+            if start < len(pool_ev):
+                first = pool_ev[start]
+                close_lag_blocks = first["block"] - e["open_block"]
+                closer = first["recipient"] or first["sender"]
+                close_tx = first.get("tx_hash")
+                close_log = first["log_index"]
+                closed_same_block = first["block"] == e["open_block"]
+                if closed_same_block and e["open_log"] is not None:
+                    close_pos_gap = first["log_index"] - e["open_log"]
+        out.append(
+            dict(
+                e,
+                closed_same_block=closed_same_block,
+                closer=closer,
+                close_lag_blocks=close_lag_blocks,
+                close_pos_gap=close_pos_gap,
+                close_tx=close_tx,
+                close_log=close_log,
+            )
+        )
     return out
+
+
+def _percentile(sorted_vals, q):
+    if not sorted_vals:
+        return None
+    i = min(len(sorted_vals) - 1, int(q * len(sorted_vals)))
+    return sorted_vals[i]
 
 
 def report(episodes, ts_min, ts_max, gap_bps):
@@ -189,6 +236,15 @@ def report(episodes, ts_min, ts_max, gap_bps):
 
     lifetimes = [e["last_block"] - e["open_block"] + 1 for e in episodes]
     same_block = sum(1 for e in episodes if e["closed_same_block"])
+    closed = [e for e in episodes if e["close_lag_blocks"] is not None]
+    lags = sorted(e["close_lag_blocks"] for e in closed)
+    lag_hist = defaultdict(int)
+    for L in lags:
+        lag_hist[0 if L == 0 else 1 if L == 1 else 2 if L == 2 else 3 if L <= 5 else 4] += 1
+    pos_gaps = sorted(
+        e["close_pos_gap"] for e in closed if e.get("close_pos_gap") is not None
+    )
+    never = len(episodes) - len(closed)
     top_edges = sorted(episodes, key=lambda e: -e["peak_bps"])[:12]
     by_closer = defaultdict(int)
     for e in episodes:
@@ -198,21 +254,39 @@ def report(episodes, ts_min, ts_max, gap_bps):
         f"# Gap autopsy — {gap_bps} bps threshold",
         "",
         f"- episodes >= {gap_bps} bps: **{len(episodes)}**",
-        f"- closed by a sell-pool trade in the SAME block: **{same_block} "
+        f"- closed by a counter-pool trade (first one wins the race): "
+        f"**{len(closed)}**, never in window: **{never}**",
+        f"- closed in the SAME block it opened: **{same_block} "
         f"({100*same_block//max(1,len(episodes))}%)**",
         f"- median lifetime (blocks): **{median(lifetimes) if lifetimes else 0}**; "
-        f"p90: **{sorted(lifetimes)[int(0.9*len(lifetimes))]-1 if lifetimes else 0}**"
-        if lifetimes else "- no episodes",
+        f"p90: **{_percentile(sorted(lifetimes), 0.9)}**"
+        if lifetimes
+        else "- no episodes",
         f"- window: blocks ts {ts_min}..{ts_max}",
         "",
+        "## Record A — close-lag distribution (blocks from open to first counter-trade)",
+        "| lag | count | share |",
+        "|---|---|---|",
+    ]
+    labels = {0: "0 (same block)", 1: "1", 2: "2", 3: "3-5", 4: "6+"}
+    for k in (0, 1, 2, 3, 4):
+        n = lag_hist.get(k, 0)
+        lines.append(f"| {labels[k]} | {n} | {100*n//max(1,len(lags))}% |")
+    lines += [
+        "",
+        f"- same-block close POSITION gap (log indexes between opener and winner): "
+        f"median **{_percentile(pos_gaps, 0.5)}**, p90 **{_percentile(pos_gaps, 0.9)}** "
+        f"over {len(pos_gaps)} same-block closes",
+        "",
         "## Largest gap episodes",
-        "| pair | buy at | sell at | open block | peak bps | same-block close | closer |",
-        "|---|---|---|---|---|---|---|",
+        "| pair | buy at | sell at | open block | peak bps | lag | pos gap | closer |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for e in top_edges:
         lines.append(
             f"| {e['pair']} | {e['buy']} | {e['sell']} | {e['open_block']} | "
-            f"{e['peak_bps']} | {bool(e['closed_same_block'])} | {str(e['closer'])[:14]} |"
+            f"{e['peak_bps']} | {e['close_lag_blocks']} | {e.get('close_pos_gap')} | "
+            f"{str(e['closer'])[:14]} |"
         )
     lines += ["", "## Most frequent closers", ""]
     for addr, n in sorted(by_closer.items(), key=lambda kv: -kv[1])[:10]:

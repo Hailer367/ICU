@@ -3031,6 +3031,11 @@ for you.
 
 ## 11. Next move (one line)
 
+> **Race-readiness program (§0w Phase 3–4) has its own dedicated, always-current
+> handoff: see `RACE_PROGRAM.md` at the repo root. It is the single resume point
+> for that program and records the exact in-flight blocker (the replay
+> harness's clock-pin vs deploy-blocks bug) and the post-Denim 200ms win bar.**
+
 Pick up **§0w: the race-readiness program** — it is the full handoff
 (harvest bug fixes, gap-autopsy method, replay harness design, the record
 definitions, the ordered optimization levers, and the small §0v tails to
