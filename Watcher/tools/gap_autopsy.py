@@ -84,64 +84,86 @@ def price(r):
 
 
 def analyze(events, gap_bps=5.0):
-    # per-pool price timeline: block -> last price in that block.
-    # `events` is sorted by (block, log_index), so repeated assignment to
-    # (pool, block) leaves the block's LAST event — one pass, no rescans.
-    by_pool_block = defaultdict(dict)
-    last_ev_pb = {}  # (pool, block) -> last event in that block
-    pairs_of = {}
+    # Event-wise state machine (rewritten 2026-11-06). The old block-wise
+    # detector recorded open_tx = the last event of the STALE pool — which
+    # can predate the gap by a thousand blocks and is NOT the trade that
+    # opens anything. The gap is created by the event that pushes a direction
+    # over the line; the replay must key on that trade (gap_tx): the trigger
+    # the watcher would react to, the transaction whose fidelity matters,
+    # and the position the winner beat. Peak/last are tracked continuously
+    # per open run.
+    by_pair = defaultdict(list)
     for r in events:
         pool = r["pool"].lower()
-        pair = REGISTRY[pool][0]
         p = price(r)
         if not (0.001 < p < 1e9):
             continue
-        by_pool_block[pool][r["block"]] = p
-        last_ev_pb[(pool, r["block"])] = r
-        pairs_of[pool] = pair
-
-    pools_by_pair = defaultdict(list)
-    for pool, pair in pairs_of.items():
-        pools_by_pair[pair].append(pool)
+        by_pair[REGISTRY[pool][0]].append((r, pool, p))
 
     episodes = []
-    for pair, pools in pools_by_pair.items():
-        blocks = sorted(set().union(*[set(by_pool_block[p]) for p in pools]))
-        # forward-fill last-known prices per pool
+    for pair, rows in by_pair.items():
+        pools = sorted({pool for _, pool, _ in rows})
+        fee = {p: REGISTRY[p][2] / 10_000.0 for p in pools}
         last = {p: None for p in pools}
         last_event = {p: None for p in pools}
-        for b in blocks:
-            for p in pools:
-                if b in by_pool_block[p]:
-                    last[p] = by_pool_block[p][b]
-                    last_event[p] = last_ev_pb[(p, b)]
+        # open runs per direction (i = stale/buy side, j = sell side)
+        runs = {}
+        def edges_after(pool):
+            """directions whose edge can move when `pool` traded"""
+            out = []
+            for j in pools:
+                if j != pool:
+                    out.append((pool, j))   # pool went stale-cheap
+            for i in pools:
+                if i != pool:
+                    out.append((i, pool))   # pool rose to expensive
+            return out
+        for r, pool, p in rows:
+            last[pool] = p
+            last_event[pool] = r
             if any(v is None for v in last.values()):
                 continue
-            for i in pools:
-                for j in pools:
-                    if i == j:
-                        continue
-                    fi = REGISTRY[i][2] / 10_000.0
-                    fj = REGISTRY[j][2] / 10_000.0
-                    edge = (last[j] * (1 - fj)) / (last[i] * (1 + fi)) - 1
-                    if edge * 10_000 >= gap_bps:
-                        ev = last_event[i] or {}
-                        episodes.append(
-                            dict(
-                                pair=pair,
-                                buy_pool=REGISTRY[i][1] + "/" + i[:8],
-                                sell_pool=REGISTRY[j][1] + "/" + j[:8],
-                                open_block=b,
-                                edge_bps=round(edge * 10_000, 2),
-                                open_tx=ev.get("tx_hash"),
-                                open_log=ev.get("log_index"),
-                                open_pool=i,
-                            )
-                        )
+            for (i, j) in edges_after(pool):
+                edge = (last[j] * (1 - fee[j])) / (last[i] * (1 + fee[i])) - 1
+                ebps = edge * 10_000
+                above = ebps >= gap_bps
+                run = runs.get((i, j))
+                if above and run is None:
+                    ev = last_event[i] or {}
+                    runs[(i, j)] = dict(
+                        pair=pair,
+                        buy_pool=REGISTRY[i][1] + "/" + i[:8],
+                        sell_pool=REGISTRY[j][1] + "/" + j[:8],
+                        open_block=r["block"],
+                        edge_bps=round(ebps, 2),
+                        open_tx=ev.get("tx_hash"),
+                        open_log=ev.get("log_index"),
+                        open_pool=i,
+                        gap_tx=r["tx_hash"],
+                        gap_log=r["log_index"],
+                        gap_pool=pool,
+                        last_block=r["block"],
+                    )
+                elif above:
+                    run["peak_bps_row"] = max(
+                        run.get("peak_bps_row", run["edge_bps"]), ebps)
+                    run["last_block"] = r["block"]
+                elif run is not None:
+                    run["peak_bps"] = max(run["edge_bps"],
+                                          run.get("peak_bps_row", 0.0))
+                    episodes.append(run)
+                    runs[(i, j)] = None
+        for key, run in runs.items():
+            if run:
+                run["peak_bps"] = max(run["edge_bps"],
+                                      run.get("peak_bps_row", 0.0))
+                episodes.append(run)
     # merge consecutive-block episodes for the same direction
     merged = []
     by_dir = defaultdict(list)
     for e in episodes:
+        e = dict(e)
+        e.pop("peak_bps_row", None)
         by_dir[(e["pair"], e["buy_pool"], e["sell_pool"])].append(e)
     for (pair, bi, sj), rows in by_dir.items():
         rows.sort(key=lambda r: r["open_block"])
@@ -149,16 +171,22 @@ def analyze(events, gap_bps=5.0):
         for r in rows:
             if cur and r["open_block"] - cur["last_block"] <= 1:
                 cur["last_block"] = r["open_block"]
-                cur["peak_bps"] = max(cur["peak_bps"], r["edge_bps"])
+                cur["peak_bps"] = max(cur["peak_bps"], r["peak_bps"])
             else:
                 if cur:
                     merged.append(cur)
-                cur = dict(pair=pair, buy=bi, sell=sj, open_block=r["open_block"],
-                           last_block=r["open_block"], peak_bps=r["edge_bps"],
+                cur = dict(pair=pair, buy=bi, sell=sj,
+                           open_block=r["open_block"],
+                           last_block=r["open_block"],
+                           peak_bps=r["peak_bps"],
                            open_tx=r.get("open_tx"), open_log=r.get("open_log"),
-                           open_pool=r.get("open_pool"))
+                           open_pool=r.get("open_pool"),
+                           gap_tx=r.get("gap_tx"), gap_log=r.get("gap_log"),
+                           gap_pool=r.get("gap_pool"))
         if cur:
             merged.append(cur)
+    for e in merged:
+        e.setdefault("edge_bps", e.get("peak_bps"))
     return merged, events
 
 
@@ -196,10 +224,20 @@ def closers(events, episodes):
         if full:
             pool_key = full[0]
             pool_ev = idx_by_pool[pool_key]
-            # first counter-pool trade strictly after the gap opened
+            # first counter-pool trade strictly after the GAP-CREATING event
+            # (2026-11-06: was keyed on open_log — the stale pool's last
+            # trade, which can predate the block and is not the race start)
+            race_start = e.get("gap_log")
+            if race_start is None:
+                race_start = e["open_log"] if e["open_log"] is not None else -1
+            closed_same_block = None
+            closer = None
+            close_lag_blocks = None
+            close_pos_gap = None
+            close_tx = None
+            close_log = None
             start = bisect.bisect_right(
-                keys_by_pool[pool_key],
-                (e["open_block"], e["open_log"] if e["open_log"] is not None else -1),
+                keys_by_pool[pool_key], (e["open_block"], race_start),
             )
             if start < len(pool_ev):
                 first = pool_ev[start]
@@ -208,8 +246,8 @@ def closers(events, episodes):
                 close_tx = first.get("tx_hash")
                 close_log = first["log_index"]
                 closed_same_block = first["block"] == e["open_block"]
-                if closed_same_block and e["open_log"] is not None:
-                    close_pos_gap = first["log_index"] - e["open_log"]
+                if closed_same_block:
+                    close_pos_gap = first["log_index"] - race_start
         out.append(
             dict(
                 e,

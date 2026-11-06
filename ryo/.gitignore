@@ -5,3 +5,4 @@ broadcast/
 .venv/
 lib/
 lcov.info
+foundry.lock

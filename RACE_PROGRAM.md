@@ -3,10 +3,17 @@
 > **This file is the single resume point for the race-readiness program.** It
 > exists so a fresh session can pick up mid-loop with zero chat context. Read
 > it top-to-bottom once, then run the "RESUME HERE" block. It complements (does
-> not replace) `Watcher/State.md` §0w, which is the running log.
+> not replace) `Watcher/State.md` §0w+§0x, which is the running log.
 >
-> Status date: **2026-11-05 (~20:00 UTC).** Denim activated today at 18:00 UTC.
-> Last green unit-test count on this box: **129 lib tests** (`cargo test --lib`).
+> Status date: **2026-11-06 (21:05 UTC).** Harness fidelity: SIX bug-classes
+> found & fixed (§4). **RUN 7 — the first race under corrected gap-tx
+> semantics — was in flight at commit time on the 627.5 bps episode at block
+> 53,552,121.** First place to look: the newest `data/runs/*_harness.log` +
+> `data/race_results.jsonl`; if absent (sandbox died mid-run), re-run §8
+> step 2 (~15–50 min; caches). If the data files are missing entirely, run
+> §8 step 3 to rebuild — the episode JSON MUST come from the 2026-11-06
+> autopsy (older files lack `gap_tx` and the harness refuses them).
+> Last green: **129 lib tests** (re-run post-edits 2026-11-06).
 
 ---
 
@@ -120,6 +127,18 @@ for interpreting deadlines.
 - Dominant 2bps same-block closer: `0x51C72848…` (**500/day** = one every ~26 s),
   then `0x7c4c7Ac3…` 166, `0x29BE31E7…` 95, `0x278d858f…` 91.
 
+> **SUPERSEDED 2026-11-06 by the gap-tx rebuild (bug-class #6, §4):** the
+> numbers above measure per-BLOCK continuations and key the race start on
+> the stale pool's last trade. The corrected event-wise detector on the
+> same window gives the true contest picture:
+> **≥60 bps: 294 gap OPENINGS/day; 158 closed by a counter trade; 62
+> same-block (21%); 88 contested (lag ≤1); median lifetime 1 block;
+> same-block winner position: from the top, ~384 for the biggest (627 bps)
+> episode.** Headline: gaps are rarer than we thought AND far more
+> same-block-contested than the old table suggested — the contested cohort
+> is 88/day, not ~11. Regenerate: `gap_autopsy.py` (rebuilt) on
+> `swaps_24h.jsonl`; ranks/hashes in State.md §0x.
+
 ### Post-Denim (canonical 200ms blocks — pendingLogs/Flashblocks GONE)
 Verified live: **190 ms/block**. This is the new reality. From
 `tools/denim_cutover.sh` over a 1h window:
@@ -172,42 +191,75 @@ ready_ms by design.
    reverted**. Fixed by the M1 per-block mining + source-timestamp design.
 5. Receipt attribution counted pool-tx status flips wrong. Fixed the counter.
 
-### STILL OPEN — the one blocker (start here next session)
-The run stops with:
-`cannot pin local block timestamp to source ts 1793890777: … 1793890777 is lower
-than previous block's timestamp` (`evm_setNextBlockTimestamp` → `-32602`).
+### RESOLVED 2026-11-06 — what the blocker actually was (five bug-classes)
 
-**Root cause (diagnosed, not yet fixed): Anvil clamps `--timestamp` to the fork
-block's own timestamp — you cannot set the local clock BEFORE the forked base
-block.** So the ~40 deploy transactions (forge broadcast, each mining a block,
-each +1s) advance the head to roughly `base_ts + 40`, which is already *past*
-the first replay source ts (`base_ts + warmup*2 + 2` with warmup=3 ≈ +8s). The
-`-300`/`-30s` pre-pin in `race_replay.sh` is therefore a no-op past the clamp,
-and the very first `setNextBlockTimestamp(source_ts)` is rejected as "in the
-past". The window simply starts too close to the fork block for the deploy
-consumption.
+The old §4 diagnosis ("Anvil clamps --timestamp, raise warmup") was only the
+first of FIVE fidelity bug-classes, each found by pushing the run deeper. All
+five are fixed in the committed harness; the run now reaches the race window
+with every gate green. Full evidence in State.md §0x. In one line each:
 
-**Fix options (pick one, verify, record):**
-- (A, simplest, most robust) **Increase `warmup`** so the first replay source ts
-  sits comfortably after the deploy-consumed blocks. Deploy creates ~40–45 blocks
-  ⇒ need `warmup ≥ 30` (window ≥60s) OR, better, set the fork base a *fixed
-  margin of real seconds* before open and make the harness **skip the first
-  (deploy_block_count) replayable blocks**, i.e. start the source-timestamp pin
-  only once `source_ts > current_head_ts`. In `replay_race.rs`, replace the hard
-  fail with: `let want = max(ts, head_ts+1)` for the WARMUP blocks only, and
-  require the exact source ts from the open block onward (the contested block is
-  what must be deadline-faithful; warmup blocks may drift harmlessly).
-- (B) **Deploy with fewer blocks**: pass `anvil --timestamp` won't help; instead
-  record `head_ts` right after deploy in `race_replay.sh` and choose
-  `BASE = open_block - warmup - 1 - deploy_blocks` where `deploy_blocks` is
-  measured from the deploy receipt count, then pin normally.
-- (C) Set `evm_setNextBlockTimestamp` only when `ts > head_ts`, else rely on
-  automine and log the skip; assert the *open block specifically* got its exact
-  source ts (that is the only block whose deadlines matter for the verdict).
+1. **Clock rewind is impossible** — measured: `--timestamp` IS clamped on
+   forks, and BOTH `evm_` and `anvil_setNextBlockTimestamp` reject ≤ parent
+   (the belief that the `anvil_` variant could rewind was false; so was the
+   old `evm_increaseTime(-N)` hack — its error was `.ok()`-swallowed).
+   Fix: 60-block warmup absorbed by forward-only drift pins; HARD bail
+   unless the open block lands on its exact source timestamp.
+2. **forge broadcast died on `eth_feeHistory` "invalid block range"** (Alchemy
+   passthrough + foundry's Base table missing cobalt/denim — foundry#17950).
+   Fix: pre-mine 12 blocks so feeHistory serves locally.
+3. **Block overflow**: anvil's 30M gas limit cannot hold 117-tx blocks; the
+   spilled backlog polluted the opener's world. Fix: `--gas-limit 500000000
+   --max-transactions 4096` (verified: 130 queued txs land in ONE block) + a
+   drain guard that BAILS on any unmined replay tx — do NOT drain with extra
+   mines (run 3 did; it poisoned the clock +65 s and the bail caught it).
+4. **Block-NUMBER-bound auth**: replayed txs whose signatures verify against
+   `block.number` (or real chain blockhashes) revert when local numbers run
+   +D ahead. Proven by A/B eth_call: mainnet SUCCESS / local REVERT with the
+   local block number inside the error payload. Fix: `race_replay.sh` forks
+   D blocks earlier and ITERATES until `head == base`, so race-window blocks
+   carry exact source numbers AND timestamps; the harness hard-asserts
+   alignment + fork-point hash + `RYO_EXPECT_OPEN_BLOCK` agreement.
+   UNFIXABLE class → skipped by design: **CoW GPv2Settlement openers**
+   (`0x9008d19f…`) bind EIP-1271 orders to real blockhashes, which a
+   re-signed replay can never reproduce (re-signed txs → different txRoot →
+   different blockhashes, permanently). `RYO_SKIP_OPENER_TO` walks around
+   them with logged evidence; 4 of the 46 contested episodes (incl. old
+   rank 0–2) are this class. Record A itself is unaffected — it is measured
+   from mined history.
+5. **Mempool ordering + fabricated fees**: default `fees` sorting permuted
+   intra-block causality. Fix: `--order fifo` (1.9.0 accepts only `fifo`/
+   `fees` — measured), and replay txs now carry their source
+   `maxFeePerGas`/`maxPriorityFeePerGas`/`gasPrice`.
 
-Whichever is chosen: **re-run rank 0, confirm the opener does NOT revert
-(`open_ok == Some(true)`) and `pool_tx_mismatch` is near zero**, then read
-`ready_ms`.
+Plus one RACE-SEMANTICS fix: the open block is delivered in TWO trigger
+passes (opener's logs alone first, then the rest) — otherwise a whole-block
+delivery shows the scanner the gap already closed by the same-block winner
+and makes every contested episode un-winnable by construction. `ready_ms`
+is now timed the way pre-Denim `pendingLogs` really behaved (~1.2 s early).
+
+### Where Record B stands (commit-time 2026-11-06 ~21:00 UTC)
+
+Run 6 completed under full fidelity gates (`open_ts_exact=true`, zero
+drift, zero send failures) and returned **NO READY CALLDATA** — which
+uncovered bug-class #6, an EPISODE-SEMANTICS error bigger than any plumbing
+bug: the autopsy's `open_tx` was the stale pool's *last trade whenever that
+was*, not the trade that opened the gap (one such tx served 6,150
+episodes; for the run-6 episode it sat ~1,000 blocks BEFORE the window).
+The scanner therefore always received the open block complete — gap
+already closed by the winner — so no same-block episode could ever be
+contested. Fixed end-to-end: the autopsy now runs an event-wise state
+machine emitting **`gap_tx`/`gap_log`/`gap_pool`** (the trade that pushes
+a direction over the line), `closers()` measures the winner from THAT
+position, and the harness keys both the two-pass feed and the fidelity
+gate on `gap_tx`. This also CORRECTS Record A itself (see §3).
+
+**Run 7 was in flight at commit time** on the corrected top episode:
+**627.5 bps, block 53,552,121** (stale side slipstream:200; three contested
+sell sides: univ3:3000 / pancake:500 / slipstream:100; same-block winner at
+position 384 → proxy 1,280 ms). Its gap-tx callee `0x6a000f2000…` is a
+UNKNOWN class — if it reverts with a signature-style error, add it to
+`SKIP_TO` in `race_replay.sh` and the selection walks on. If it prints
+READY: first Record B number, go to §8 step 4.
 
 ---
 
@@ -247,6 +299,12 @@ Denim activated 2026-11-05 18:00 UTC. Consequences for this codebase:
   `ScanBlock::Pending`, `events.rs` flashblock subscriptions, and the §0t/§0k
   pending notes. `eth_simulateV1` folds execute-gas into a batch on Alchemy but
   is **unsupported by Anvil 1.9.0** — blocked for fork proof-of-correctness.
+- Verified live 2026-11-06: ~233 ms/block at head 53.95M; minimum base fee
+  floor live at exactly 5,000,000 wei (0.005 gwei — the arXiv paper's Feb-2026
+  ramp endpoint, and it sets the gas-cost floor every ready-time must clear).
+  `denim_cutover.sh` ran: post-Denim 1 h window shows the ≥60 bps contested
+  cohort EMPTY and the 2 bps cohort 73% winnable at ready_ms ≤ 200 — confirm
+  with a longer (6–12 h) harvest before concluding (1 h is thin).
 
 ---
 
@@ -277,35 +335,66 @@ revm.
 
 ---
 
-## 8. RESUME HERE (exact commands)
+## 8. RESUME HERE (exact commands) — continue from RUN 7
 
 ```bash
-export PATH="$PATH:$HOME/.foundry/bin"           # forge/anvil
-cd /home/runner/ICU/Watcher
+export PATH="$PATH:$HOME/.config/.foundry/bin"   # forge/anvil 1.9.0
+cd Watcher                                        # repo root = ICU/
 source ~/.ryo_env                                 # ALCHEMY_BASE_HTTP/_WS (env-only)
 
-# sanity (must be green): cargo test --lib  → 129 pass; cargo clippy --all-targets; cargo fmt --check
+# 0. SANITY FIRST: cargo test --lib  → must be 129 pass;
+#    cargo clippy --all-targets; cargo fmt --all --check
+#    (the 2026-11-06 harness edits touched only tests/ + tools/, but verify).
 
-# ---- FIRST TASK: fix §4 "STILL OPEN" (clock-pin vs deploy-blocks), then: ----
-cargo test --test replay_race --no-run
-./tools/race_replay.sh data/gap_autopsy_24h_60bps.json 0 1      # rank 0, lag<=1
-# expect: opener status == source, pool_tx_mismatch ~ 0, and a ready_ms number.
-# If reuse is safe (same base, warm fork): ./tools/race_replay.sh <eps> <rank> 1 "" --reuse
+# 1. WHERE RUN 6 ENDED: the newest file matching data/runs/*_harness.log
+#    (rotate-on-write since 2026-11-06) + data/race_results.jsonl.
+#    - If it printed the summary JSON: read ready_ms / verdict /
+#      t_close_proxy_ms / open_ok gates, append to §4/§3, and go to step 4.
+#    - If it died at open_ok=false citing `0xcdcd644b…` signatures: that whole
+#      opener class is un-replayable → set RYO_SKIP_OPENER_TO and rerun step 2.
+#    - If there is no new log (the process died with the sandbox): rerun it.
 
-# rebuild Record A anytime after re-harvest:
+# 2. RUN 7 (first replayable episode under corrected gap-tx semantics —
+#    the 627.5 bps triple at 53,552,121; CoW-class gaps auto-skipped):
+./tools/race_replay.sh data/gap_autopsy_24h_60bps.json 0 1
+#    expect in the log: "aligned: head == base", zero "WARMUP DRIFT" at open,
+#    trigger status == source, pool_tx_mismatch low, then READY + verdict +
+#    summary JSON. If the trigger class 0x6a000f2000… proves un-replayable
+#    (signature revert), add it to SKIP_TO in the script and rerun.
+
+# 3. DATA FILES ARE GIT-IGNORED. If missing (fresh machine), rebuild:
+#    a) forge deps (in ../ryo): forge install foundry-rs/forge-std@v1.17.0
+#       --no-commit && forge install OpenZeppelin/openzeppelin-contracts@v5.7.0
+#       --no-commit   (libs + foundry.lock are git-ignored now — never commit)
+#    b) cargo build --all-targets
+#    c) harvest the PRE-Denim window (publicnode, ~2 min):
+./target/debug/ryo-watch --http-rpc https://base-rpc.publicnode.com \
+  history --from-block 53548970 --to-block 53592170 --chunk 500 --out data/swaps_24h.jsonl
+#    (the progress log counts CUMULATIVE records — 216,906 is the target)
+#    d) Record A (seconds):
 python3 tools/gap_autopsy.py data/swaps_24h.jsonl data/gap_autopsy_24h_60bps.md 60.0
-python3 tools/winrate_curve.py data/gap_autopsy_24h_60bps.json 100 200 400 800
+#    (the 2026-11-06 crossing-based detector reproduces: 294 eps @≥60bps,
+#     158 closed, 62 same-block, 88 contested, rank 0 = 627.5bps @53552121)
 
-# post-Denim re-baseline (public endpoints, safe to run alongside):
-./tools/denim_cutover.sh 18000
+# 4. THE LOOP (unchanged mission): more ranks for a distribution — episodes
+#    cluster by open_block so warm forks cover several ranks per pin:
+#      ranks 4,7,8 open at 53553197/53553580-81 → reuse:
+#      ./tools/race_replay.sh data/gap_autopsy_24h_60bps.json <N> 1 "" --reuse
+#    then per-phase lever side-tests (§7) against the baseline ready_ms,
+#    keep/drop evidenced HERE and in State.md, and the win-rate curve:
+python3 tools/winrate_curve.py data/gap_autopsy_24h_60bps.json --period 2.0 --lead 0 100 200 400 800 1600
+#    post-Denim reality uses --period 0.2 --lead 0; a 6-12h post-Denim
+#    re-baseline via ./tools/denim_cutover.sh 180000-equivalent is still open
+#    (the 1h sample showed the >=60bps contested cohort EMPTY — verify on a
+#    longer window before concluding).
 ```
 
-Episodes/ranks available in `data/gap_autopsy_24h_60bps.json` (ranked by lag then
-peak_bps). rank 0 = `slipstream:50 -> pancake:100`, open_block 53550718, 236bps,
-same-block, `close_pos_gap 212`, closer `0x45a16A56…`. Ranks 1–9 are the
-thin-pool slipstream:50/200 same-block + lag-1 cluster around blocks
-53550718/53552121 (see §3) — good first Record-B substrate because they are the
-most-contested.
+Harness invariants (all hard-asserted; if any fires, the run is VOID — fix
+the harness, never the expectations): head==base number alignment; fork-point
+hash == source; exact source ts at open (`open_ts_exact`); opener status ==
+source (`open_ok`); pool_tx_mismatch ≈ 0 in the race window; zero unmined
+pool txs anywhere; two-pass open-block delivery (opener alone first);
+episode cross-check via RYO_EXPECT_OPEN_BLOCK.
 
 ### Fork gotchas (from State.md, still true)
 - Anvil **consumes** a snapshot on revert; never stack >1; `--reuse` handles this.
@@ -328,7 +417,16 @@ most-contested.
 - That is when we can answer "can it compete today" with numbers, not inference.
 
 ## 10. Security / cleanup reminders
-- **Revoke the GitHub PAT** after this push (session-scoped, was shared in chat).
-- Rotate the Alchemy key when done; it is only in `~/.ryo_env`, never in the repo.
-- `Watcher/deployments/8453.race.json` contains only addresses (no secrets) — safe
-  to commit; it is regenerated per fork and is local-fork-only.
+- **Revoke the GitHub PAT after this push** (session-scoped, was shared in
+  chat on 2026-11-06 — second such token; treat every chat-pasted credential
+  as burned the moment the session ends). Never written into any repo file —
+  it appeared only in the one `git push` command. Rotate the Alchemy key when
+  done; it lives only in `~/.ryo_env`, never in the repo.
+- `~/.ryo_env` lives OUTSIDE the repo (chmod 600). `source` it, never echo it.
+- `Watcher/deployments/8453.race.json` contains only addresses (no secrets) —
+  safe to commit; it is regenerated per fork and is local-fork-only.
+- The replay re-SIGNS historical transactions locally to impersonate senders;
+  that is a fork-local operation and touches no real account. Funding replayed
+  senders only ever RAISES local balances. Nothing here can move real funds:
+  the watcher still cannot and does not send (verified again §0x: no signer,
+  no `send_transaction` anywhere in `src/`).

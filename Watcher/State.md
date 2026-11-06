@@ -1,9 +1,11 @@
 # Ryo Watcher — Development State
 
-Last updated: 2026-11-04 (§0w scopes the next big program — race-readiness:
-gap autopsy on historical market data, replay benchmarking, and the
-optimization loop until the pipeline beats measured competitor close times;
-§0v shipped §0u's local CL math, live-differentiated wei-for-wei)
+Last updated: 2026-11-06 (§0x — replay harness rebuilt from scratch on a
+fresh machine: five fidelity bug-classes found and fixed (clock, feeHistory,
+block overflow, block-NUMBER-bound auth, mempool ordering), Record A
+reproduced exactly, Denim verified live at 233 ms + 5M-wei floor, first
+replayable episode (rank 3) in flight at commit time — read §0x and
+RACE_PROGRAM.md §4/§8 before touching anything)
 
 This file is written so that a fresh session can resume the watcher without
 re-reading the whole chat. It records what exists, what was tested, what is
@@ -2893,7 +2895,166 @@ each lever's keep/drop evidenced in this file. That is when we can answer
 
 ---
 
+### 0x. Replay harness: five fidelity bug-classes killed; Record A rebuilt; first replayable episode in flight (2026-11-06)
+
+Fresh machine (nothing installed, no `data/`), so this session rebuilt the
+environment, reproduced Record A from scratch as a cross-check, and drove the
+Phase-3 replay harness through five distinct fidelity failures — each found
+only by running the real thing, each fixed with evidence, none papered over.
+**No `src/` files were touched: the watcher's behaviour is exactly §0v's.**
+All changes are in `tests/replay_race.rs`, `tools/race_replay.sh`, and the
+deployments artifact. `RACE_PROGRAM.md` §4/§8 is the authoritative resume.
+
+**Environment**: Rust 1.99.1; Foundry 1.9.0 via foundryup (`~/.config/.foundry/bin`);
+forge-std v1.17.0 + OZ v5.7.0 reinstalled per `ryo/SETUP.md` (vendored libs and
+`foundry.lock` are now git-ignored — they must never be committed).
+Alchemy endpoint supplied by the user; kept in `~/.ryo_env` only (key is in
+the chat transcript — rotate it when the program ends).
+
+**Data rebuilt (all git-ignored; commands in RACE_PROGRAM §8)**:
+`data/swaps_24h.jsonl` = the pre-Denim window 53,548,970..53,592,170 from
+publicnode (216,906 swap records, 0 duplicates, 22,077 distinct blocks). Note:
+the `history` progress log counts CUMULATIVE records, not per-chunk — do not
+panic when the numbers "grow". **Record A reproduced the OLD detector's
+output exactly at 60 bps (then superseded by the corrected event-wise
+detector — see the Record A correction below):
+61,272 episodes, 29 same-block closes, 46 contested (lag ≤ 1), same-block
+position gap median 210 / p90 883; rank 0 = the documented episode**
+(slipstream:50 → pancake:100 @ 53,550,718, 236.5 bps, pos 212, closer
+`0x45a16A56…`). Win-rate curves at 2/20/60/200 bps in `data/`.
+
+**Denim verified live**: ~233 ms/block at head 53.95M; the minimum base fee is
+live at exactly 5,000,000 wei (0.005 gwei — matches the arXiv paper's Feb-2026
+ramp endpoint). Post-Denim cutover over a 1 h window: **≥60 bps contested
+cohort is EMPTY**; 2 bps → 11,123 episodes/h, 1,050 contested, 73% winnable at
+ready ≤ 200 ms. A 6–12 h post-Denim re-baseline is still open (1 h is too thin
+to conclude at 60 bps).
+
+**Winner-tx decode (rank-0 closer, live intel)**: 105-byte calldata, custom
+selector `0xf61daca8` on executor `0x45a16A56…`, gasUsed 251,738 of 556,600
+limit, **priority fee 0.0038 gwei** — the third independent confirmation that
+arrival time, not bidding, wins these races (paper: off-chain-discovery cohort
+median 0 pre-reads, success 35.8%→43.6% as ordering got finer, 42.5%
+full-sample success, cost/capture 0.000095 ETH; Denim continues that selection).
+
+**The five harness bug-classes** (each: symptom → measured cause → fix):
+
+1. **Clock rewind is impossible, full stop.** Measured on 1.9.0: `--timestamp`
+   on a forked node is CLAMPED to the fork block's ts; BOTH
+   `evm_setNextBlockTimestamp` and `anvil_setNextBlockTimestamp` reject
+   values ≤ parent ("lower than previous block's timestamp") — the §0w
+   note that only `evm_` refused was wrong, and the harness's
+   `evm_increaseTime(-N)` hack never worked (silently `.ok()`-swallowed).
+   Fix: the deploy's D blocks of +1 s are absorbed by a 60-block warmup
+   budget mined forward-only at `max(source_ts, head+1)`, with a HARD BAIL
+   unless the open block pins at exactly its source ts (that guard paid
+   for itself immediately — see 4).
+2. **forge broadcast died on `eth_feeHistory` "invalid block range"**
+   (Alchemy rejects the passthrough for the pre-Cobalt range; foundry pins a
+   Base hardfork table with cobalt/denim timestamps absent — foundry#17950).
+   Fix: pre-mine 12 local blocks so feeHistory serves locally (+12 s folded
+   into the D measurement).
+3. **Block overflow poisoned everything.** Anvil's 30M gas limit cannot hold
+   117-transaction warmup blocks; leftovers spilled into later blocks — the
+   rank-0 opener executed against a polluted world and reverted.
+   Fix: `--gas-limit 500000000 --max-transactions 4096` (proved on bare
+   anvil: 130 queued txs land in ONE mined block) plus a pool-drain guard
+   that BAILS IMMEDIATELY on any unmined replay tx anywhere — "draining"
+   with extra +1 s mines is what turned run 3 into permanent +65 s clock
+   drift, so the guard must never cope, only scream.
+4. **Local block NUMBERS running +D ahead broke block-number-bound auth.**
+   Proven with a decisive experiment: `eth_call` of the opener at its
+   pre-open parent SUCCEEDS on mainnet and REVERTS locally with an error
+   whose payload is literally the local block number. The opener of rank 0
+   is a **CoW Swap GPv2Settlement** batch (`0x9008d19f…`, not a router as
+   assumed) whose EIP-1271 smart-account orders bind to REAL block hashes —
+   and a re-signed/impersonated replay can never reproduce mainnet
+   stateRoots/txRoots, hence not blockhashes, hence those orders can NEVER
+   verify. Fix in two parts: (a) **number alignment** — race_replay.sh now
+   forks D blocks earlier and iterates until `head == base`, so every
+   race-window block has its exact source NUMBER as well as its ts; the
+   harness hard-asserts head==base, verifies the fork-point hash against
+   source, and cross-checks `RYO_EXPECT_OPEN_BLOCK` so script and harness
+   can never select different episodes; (b) **opener skip-list** —
+   GPv2-class openers are un-replayable by construction and are skipped
+   with logged evidence (ranks 0–2 of Record A are CoW; the 109.6 bps
+   rank-3 episode takes their place as the first real Record B subject).
+5. **Mempool ordering + fabricated fees.** Anvil's default `fees` sorting
+   permuted intra-block execution (the world's causality scrambled); and
+   replay txs sent without fee fields got node defaults. Fix: `--order fifo`
+   (arrival = source order; `priority`/`ludo`/`index` are not valid values
+   in 1.9.0 — measured) and replay txs carry their source
+   `maxFeePerGas`/`maxPriorityFeePerGas` (or legacy `gasPrice`).
+
+**Race-semantics fix (M1 → same-block episodes)**: delivering the open block's
+logs as ONE trigger batch shows the scanner the gap already closed by the
+winner — same-block episodes would be un-winnable by construction. The open
+block is now fed in TWO passes: the opener's logs ALONE (mirroring how
+pre-Denim `pendingLogs` delivered that swap ~1.2 s before the block), the
+scanner times `ready_ms` there, then the rest of the block is delivered to
+keep caches honest.
+
+**Opener taxonomy of the 46 contested episodes (measured)**: 41 ×
+`0xcdcd644b…` — a bot executor contract driven by a vanity EOA
+(`0x00000051e7…`), selector `0x00000005`, ~270 B calldata: expected replayable
+(EOA tx-level ECDSA only), FIRST RUN 6 WILL PROVE IT; 4 × CoW GPv2 (skipped);
+1 × `0xb300000b72…` (unknown).
+
+**Infrastructure added**: per-run log rotation to `data/runs/<episodes>_rankN_<UTC>_*`
+(run 3's evidence was lost to an overwrite before diagnosis — never again);
+source-block disk cache `data/srcblocks/<n>.json` (fetched once per block
+EVER — publicnode serves archive blocks+receipts with no CU cap, so the
+SOURCE stream moved off the Alchemy key entirely; Alchemy is used only for
+the fork's state).
+
+**In flight at commit time — READ THIS FIRST NEXT SESSION**: run 6 COMPLETED
+and answered with its own sixth bug-class: verdict **NO READY CALLDATA**
+with every harness gate green (`open_ts_exact`, zero drift, zero send
+failures). Root cause: `open_tx` was NEVER the gap-opening trade — the
+autopsy recorded the STALE pool's last trade, which can predate the gap by
+~1,000 blocks (one "opener" served as open_tx for 6,150 episodes). The gap
+is actually CREATED by whichever trade inside `open_block` pushes a
+direction over the line. Consequence: the two-pass feed never fired (its tx
+wasn't in the block) and the scanner got the whole block including the
+winner → structurally no opportunity. Fixed (`tools/gap_autopsy.py` +
+harness + `race_replay.sh` selection): the detector is now an event-wise
+state machine emitting **`gap_tx`/`gap_log`/`gap_pool`** per crossing with
+continuous peak tracking; `closers()` measures from the gap event; the
+harness keys the two-pass feed AND the fidelity gate on `gap_tx`
+(`trigger_tx` in the summary); the runner's replayability filter checks
+`gap_tx`'s callee.
+
+**Record A correction (important)**: the block-wise detector counted every
+persistent block as a new "episode" — 61,272 @60 bps/day was an artifact.
+Crossing-based truth: **294 gap events/day ≥60 bps; 158 closed by a counter
+trade; 62 same-block (21%); 88 contested (lag ≤1); median lifetime 1 block**
+(lag: 39% same-block / 16% lag-1 / 32% never-in-window). Reclassified the
+contested ranks by gap-tx: ranks 0–2 = `0x6a000f2000…` — a **627.5 bps**
+triple at block 53,552,121 (slipstream:200 stale; sells univ3:3000 /
+pancake:500 / slipstream:100; winner at position 384 → proxy 1,280 ms);
+ranks 3–5 = CoW GPv2-settled gaps (auto-skipped); rank 7 = `0x02c91f058e…`
+112.1 bps at 53,553,199. `0x6a000f2000`'s replayability is UNKNOWN — run 7
+(launched at commit time, same command as §8) tests it.
+
+If run 7 died on `trigger tx REVERTED` with a signature-style error from
+`0x6a000f2000…`, add that address to the `SKIP_TO` list in
+`race_replay.sh` (or `RYO_SKIP_OPENER_TO` env) — selection walks to the
+next class automatically. If it printed READY: that's Record B point #1 —
+append ready_ms/phases/verdict here and in RACE_PROGRAM §4, then the ranks
+distribution (§8 step 4) and the first lever side-tests (§7).
+
+**Not done / not regressed**: `cargo test --lib` re-verified after all
+edits: **129 pass**; clippy/fmt not re-run (only `tests/` + `tools/` are
+touched, which lib/clippy don't compile — but run them before any src/
+work). No live run was performed this session; all Alchemy use was
+fork-state or reads. No transaction was signed or sent by anything, ever.
+Vendored forge libs + `foundry.lock` are git-ignored; the `forge install`
+submodule staging was un-staged (repo excludes deps by design).
+
+---
+
 ## 8. Key protocol facts / gotchas
+
 
 - `RyoCore.simulate` **always reverts**. Success is
   `SimulationResult(int256)` selector `0x00cf1ea6`.
