@@ -169,7 +169,7 @@ default `mainnet.base.org` endpoint rejects `eth_getLogs` with
 | `--ws-rpc` | `RYO_WS_RPC` | – | WebSocket RPC, required by `watch`; an `http(s)://` value is auto-upgraded, and when it is the same endpoint as `--http-rpc` all calls run over this one persistent connection |
 | `--manifest` | `RYO_MANIFEST` | `deployments/8453.json` | Deployment manifest |
 | `--mode` | `RYO_MODE` | `dry-run` | `dry-run` / `paper` / `live` (live still logs only) |
-| `--source` | `RYO_SOURCE` | `pending-logs` | `logs`, `pending-logs`, `flashblocks`, `both`, `once` |
+| `--source` | `RYO_SOURCE` | `logs` | `logs`, `pending-logs`, `flashblocks`, `both`, `once` (post-Denim only `logs` exists on Base) |
 | `--min-net-profit-usd` | `RYO_MIN_NET_PROFIT_USD` | `0.25` | Minimum profit after gas |
 | `--max-gas-price-gwei` | `RYO_MAX_GAS_PRICE_GWEI` | `0.05` | Watcher-side gas ceiling |
 | `--per-leg-slippage-bps` | `RYO_SLIPPAGE_BPS` | `20` | Per-leg floor tolerance |
@@ -224,12 +224,19 @@ purpose. Losing candidates are also skipped in later scans when their exact
 simulation inputs (quotes, gas, USD prices) are unchanged — `sims_cached` in
 the metrics line counts those skips, and opportunities are never affected.
 
-On Alchemy's Base endpoint, `newFlashblocks` sends preconfirmed block objects
-and `newFlashblockTransactions` sends bare transaction hashes; neither carries
-logs, so those events cannot identify which pool traded. Use
-`--source pending-logs` (default) or `both`: pending logs deliver the actual
-swap roughly a second before the block lands. `flashblocks` still subscribes
-to `newHeads`, which is only used to notice skipped blocks.
+**Denim changed the trigger source.** Since 2026-11-05 18:00 UTC Base has
+canonical 200 ms blocks; `pendingLogs`, the Flashblocks subscriptions and all
+`pending` reads are gone, and Alchemy rejects `pendingLogs` with
+`-32602 unknown variant pendingLogs`. The live trigger is now `--source logs`
+(the default). `pending-logs`/`flashblocks` remain parseable for historical
+configs and replay fixtures but cannot produce a live trigger on mainnet.
+`newHeads` is subscribed alongside every source: it supplies the socket pin
+(zero per-scan round-trip) and gap/reorg detection.
+
+Historical note (pre-Denim, kept for reading old logs): `newFlashblocks` sent
+preconfirmed block objects and `newFlashblockTransactions` bare hashes;
+neither carried logs, so a Flashblock could not identify which pool traded.
+`pendingLogs` delivered the swap roughly a second before the block.
 
 ## Tests
 

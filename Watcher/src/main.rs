@@ -53,11 +53,16 @@ struct Cli {
     )]
     mode: Mode,
 
+    // Denim (2026-11-05) removed `pendingLogs` and Flashblocks: Alchemy now
+    // rejects the subscription outright (`unknown variant pendingLogs`), so
+    // the old default would leave `watch` subscribed to heads only and
+    // silently idle. `logs` is the post-Denim trigger; `newHeads` still rides
+    // along for socket-head pins and gap detection.
     #[arg(
         long,
         env = "RYO_SOURCE",
         value_enum,
-        default_value = "pending-logs",
+        default_value = "logs",
         global = true
     )]
     source: EventSource,

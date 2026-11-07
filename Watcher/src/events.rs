@@ -374,10 +374,20 @@ impl EventStream {
                     info!(id, subscription = result, kind = ?kind, "subscribed");
                 }
             } else if let Some(error) = value.get("error") {
-                if let Some(conn) = self.conn.as_mut() {
-                    conn.pending.remove(&id);
-                }
-                warn!(%error, id, "subscription request failed");
+                let kind = self
+                    .conn
+                    .as_mut()
+                    .and_then(|conn| conn.pending.remove(&id));
+                // Post-Denim a rejected `pendingLogs`/flashblock subscription is
+                // terminal for that feed, and the stream would otherwise look
+                // healthy while only `newHeads` (liveness) arrives: zero scans,
+                // indistinguishable from a quiet market. Name the cause.
+                warn!(
+                    %error,
+                    id,
+                    kind = ?kind,
+                    "subscription request failed; this trigger source is unavailable (Base Denim removed pendingLogs/Flashblocks — use --source logs)"
+                );
             }
             return None;
         }

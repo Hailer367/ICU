@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, address};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use anyhow::{Context, Result, bail};
@@ -103,6 +103,11 @@ struct SourceTx {
     gas_price: Option<String>,
     status: bool,
     touches_pools: bool,
+    /// Emitted a log on a tracked token / Permit2 / Balancer vault, i.e. it
+    /// moves the balances or allowances a swap spends. Replaying only the
+    /// swap-dataset txs left those predecessor transfers out, so swappers had
+    /// no tokens and reverted (observed 2026-11-07).
+    touches_state: bool,
 }
 
 async fn raw<T>(provider: &ChainProvider, method: &str, params: Value) -> Result<T>
@@ -151,16 +156,37 @@ fn is_system_tx(to: Option<Address>) -> bool {
 
 /// Parse a full block + its receipts into (timestamp, txs). Split out of the
 /// fetch so cached windows re-enter through the identical code path.
-fn parse_source_block(b: u64, block: &Value, receipts: &Value) -> Result<(u64, Vec<SourceTx>)> {
+fn parse_source_block(
+    b: u64,
+    block: &Value,
+    receipts: &Value,
+    tracked: &HashSet<Address>,
+) -> Result<(u64, u64, Vec<SourceTx>)> {
     let ts = hx_u64(block["timestamp"].as_str().unwrap_or("0x0")).unwrap_or(0);
+    let base_fee = hx_u64(block["baseFeePerGas"].as_str().unwrap_or("0x0")).unwrap_or(0);
     let mut status_by_hash: HashMap<String, bool> = HashMap::new();
+    let mut state_by_hash: HashSet<String> = HashSet::new();
     if let Some(arr) = receipts.as_array() {
         for r in arr {
-            if let (Some(h), Some(st)) = (
-                r.get("transactionHash").and_then(Value::as_str),
-                r.get("status").and_then(Value::as_str),
-            ) {
-                status_by_hash.insert(h.to_string(), hx_u64(st) == Some(1));
+            let Some(tx_hash) = r.get("transactionHash").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(st) = r.get("status").and_then(Value::as_str) {
+                status_by_hash.insert(tx_hash.to_string(), hx_u64(st) == Some(1));
+            }
+            let touches = r
+                .get("logs")
+                .and_then(Value::as_array)
+                .is_some_and(|logs| {
+                    logs.iter().any(|log| {
+                        log.get("address")
+                            .and_then(Value::as_str)
+                            .and_then(|a| Address::from_str(a).ok())
+                            .is_some_and(|a| tracked.contains(&a))
+                    })
+                });
+            if touches {
+                state_by_hash.insert(tx_hash.to_string());
             }
         }
     }
@@ -195,10 +221,11 @@ fn parse_source_block(b: u64, block: &Value, receipts: &Value) -> Result<(u64, V
             gas_price: tx.get("gasPrice").and_then(Value::as_str).map(str::to_string),
             status: status_by_hash.get(hash_s).copied().unwrap_or(false),
             touches_pools: false,
+            touches_state: state_by_hash.contains(hash_s),
         });
     }
     let _ = b;
-    Ok((ts, out))
+    Ok((ts, base_fee, out))
 }
 
 /// Fetch a source block + receipts, with a per-block disk cache under
@@ -208,12 +235,13 @@ async fn fetch_source_block_cached(
     source: &ChainProvider,
     cache_dir: &str,
     b: u64,
-) -> Result<(u64, Vec<SourceTx>)> {
+    tracked: &HashSet<Address>,
+) -> Result<(u64, u64, Vec<SourceTx>)> {
     let path = format!("{cache_dir}/{b}.json");
     if let Ok(cached) = std::fs::read_to_string(&path) {
         let v: Value = serde_json::from_str(&cached)
             .with_context(|| format!("cached block {b} corrupt; delete {path}"))?;
-        return parse_source_block(b, &v["block"], &v["receipts"]);
+        return parse_source_block(b, &v["block"], &v["receipts"], tracked);
     }
     let hex = format!("0x{b:x}");
     let block = src_json(source, "eth_getBlockByNumber", json!([hex.clone(), true]))
@@ -225,7 +253,7 @@ async fn fetch_source_block_cached(
     std::fs::create_dir_all(cache_dir).ok();
     std::fs::write(&path, serde_json::to_vec(&json!({"block": block, "receipts": receipts}))?)
         .with_context(|| format!("write cache {path}"))?;
-    parse_source_block(b, &block, &receipts)
+    parse_source_block(b, &block, &receipts, tracked)
 }
 
 /// Unmined replay txs (pending + queued) waiting in the local pool.
@@ -245,6 +273,20 @@ async fn run() -> Result<()> {
     let rank: usize = env_or("RYO_EPISODE_RANK", "0").parse().unwrap_or(0);
     let warmup: u64 = env_or("RYO_WARMUP_BLOCKS", "3").parse().unwrap_or(3);
     let post: u64 = env_or("RYO_POST_BLOCKS", "3").parse().unwrap_or(3);
+    // Fidelity-first: a swap's predecessor transfers/approvals are usually
+    // NOT pool txs, so replaying only the swap-dataset txs strips the balances
+    // those swaps spend and they revert locally (observed 2026-11-07: 421
+    // warmup reverts, 58/1419 race-window pool-tx mismatches, and the gap
+    // never reproduced). Replaying every non-system tx in source order makes
+    // the world self-consistent; `touches_pools` still gates scanning and the
+    // mismatch counters. `RYO_REPLAY_ALL=0` restores the old cheap mode.
+    // Default: every tx whose receipt touches a registry pool, a tracked
+    // token, Permit2 or the Balancer vault — that is the state a swap spends.
+    // `RYO_REPLAY_ALL=1` replays literally every non-system tx (most faithful,
+    // but cold unrelated state made it ~2 min/block on a fork).
+    let replay_all = std::env::var("RYO_REPLAY_ALL")
+        .map(|v| v != "0")
+        .unwrap_or(false);
 
     let episodes_raw = std::fs::read_to_string(&episodes_path)
         .with_context(|| format!("run tools/gap_autopsy.py first: missing {episodes_path}"))?;
@@ -304,6 +346,12 @@ async fn run() -> Result<()> {
     settings.validate()?;
     let scanner = Scanner::new(provider.clone(), manifest.clone(), settings)?;
     let pools: HashSet<Address> = scanner.registry().all_pool_addresses().into_iter().collect();
+    // Balance/allowance state a swap can spend lives on the traded tokens,
+    // Permit2 (approvals) and the Balancer vault (flash-loan repayment).
+    let mut tracked = pools.clone();
+    tracked.extend(manifest.tokens.values().copied());
+    tracked.insert(address!("000000000022D473030F116dDEE9F6B43aC78BA3")); // Permit2
+    tracked.insert(address!("BA12222222228d8Ba445958a75a0704d566BF2C8")); // Balancer V2 Vault
 
     let source = chain::connect_http(&source_rpc).await?;
     // Pin integrity is anchored at the FORK block F (= base - deploy blocks):
@@ -325,16 +373,16 @@ async fn run() -> Result<()> {
 
     // 1. Source window blocks (disk-cached; fetched once per block ever).
     let cache_dir = format!("{}/srcblocks", dataset_path.rsplit_once('/').map_or("data", |x| x.0));
-    let mut tx_by_block: Vec<(u64, u64, Vec<SourceTx>)> = Vec::new(); // (block, ts, txs)
+    let mut tx_by_block: Vec<(u64, u64, u64, Vec<SourceTx>)> = Vec::new(); // (block, ts, base_fee, txs)
     let mut fresh_fetches = 0usize;
     for b in base + 1..=end {
         let existed = std::path::Path::new(&format!("{cache_dir}/{b}.json")).exists();
-        let (ts, txs) = fetch_source_block_cached(&source, &cache_dir, b).await?;
+        let (ts, base_fee, txs) = fetch_source_block_cached(&source, &cache_dir, b, &tracked).await?;
         if !existed {
             fresh_fetches += 1;
             tokio::time::sleep(Duration::from_millis(150)).await; // courtesy pacing
         }
-        tx_by_block.push((b, ts, txs));
+        tx_by_block.push((b, ts, base_fee, txs));
     }
     eprintln!(
         "[source] window ready: {} blocks ({fresh_fetches} fetched, {} cached)",
@@ -357,14 +405,18 @@ async fn run() -> Result<()> {
             }
         }
     }
-    for (_b, _ts, txs) in tx_by_block.iter_mut() {
+    for (_b, _ts, _bf, txs) in tx_by_block.iter_mut() {
         for tx in txs.iter_mut() {
             tx.touches_pools = dataset_txs.contains(&tx.hash);
         }
     }
-    let total_txs: usize = tx_by_block.iter().map(|t| t.2.len()).sum();
-    let pool_txs: usize = tx_by_block.iter().map(|t| t.2.iter().filter(|x| x.touches_pools).count()).sum();
-    eprintln!("[replay] {total_txs} source txs, {pool_txs} touch registry pools");
+    let total_txs: usize = tx_by_block.iter().map(|t| t.3.len()).sum();
+    let pool_txs: usize = tx_by_block.iter().map(|t| t.3.iter().filter(|x| x.touches_pools).count()).sum();
+    let state_txs: usize = tx_by_block
+        .iter()
+        .map(|t| t.3.iter().filter(|x| x.touches_state).count())
+        .sum();
+    eprintln!("[replay] {total_txs} source txs, {pool_txs} touch registry pools, {state_txs} touch tracked state");
 
     // 3. Freeze automine, replay block by block with forward-only pins.
     //    Clock reality (verified on anvil 1.9.0, 2026-11-06): Anvil CANNOT go
@@ -380,7 +432,32 @@ async fn run() -> Result<()> {
     //    timestamp — a race window replayed on the wrong clock is worthless,
     //    so drift surviving that long is a hard bail, not a silent lie.
     raw::<Value>(&provider, "evm_setAutomine", json!([false])).await?;
-    scanner.prime_cl().await;
+    // Lazy by default: the first scan bootstraps only the CL pools its
+    // affected routes walk (one trigger rarely needs all 29). `RYO_PRIME_CL=1`
+    // restores the eager startup wave for a like-for-like live comparison.
+    // Resolve the episode's stale pool once: its routes are the only ones this
+    // race can quote. `episode.buy` carries an 8-hex prefix, not a full address.
+    let stale_prefix = episode
+        .buy
+        .split('/')
+        .nth(1)
+        .unwrap_or("")
+        .to_lowercase();
+    let stale_index = scanner.registry().pools.iter().position(|pool| {
+        pool.address.to_string().to_lowercase().starts_with(&stale_prefix)
+    });
+    if std::env::var("RYO_PRIME_CL").map(|v| v != "0").unwrap_or(false) {
+        match stale_index {
+            Some(index) => {
+                scanner.prime_cl_for(&[index]).await;
+                eprintln!("[race] primed stale routes (pool index {index})");
+            }
+            None => {
+                scanner.prime_cl().await;
+                eprintln!("[race] primed eagerly (stale pool prefix unresolved)");
+            }
+        }
+    }
     eprintln!("[race] primed; replaying at source cadence");
 
     let mut sent = 0usize;
@@ -397,8 +474,12 @@ async fn run() -> Result<()> {
     let mut race_started = false;
     let mut opps_after_open: Vec<String> = Vec::new();
     let mut scan_times: Vec<u128> = Vec::new();
+    // Anvil impersonation and funding persist for the process; global sets
+    // avoid re-issuing them for every block once all txs are replayed.
+    let mut impersonated: HashSet<Address> = HashSet::new();
+    let mut funded: HashSet<Address> = HashSet::new();
 
-    for (b, ts, txs) in &tx_by_block {
+    for (b, ts, base_fee, txs) in &tx_by_block {
         // Forward-only pin: exact source ts when the local clock is behind it,
         // otherwise (warmup only) one second past the head. See section 3.
         let head_now = raw::<Value>(&provider, "eth_getBlockByNumber", json!(["latest", false])).await?;
@@ -418,39 +499,214 @@ async fn run() -> Result<()> {
         raw::<Value>(&provider, "evm_setNextBlockTimestamp", json!([format!("0x{pin:x}")]))
             .await
             .with_context(|| format!("cannot pin block {b} to ts {pin}"))?;
+        // EIP-1559 base fee, pinned to the SOURCE block. Anvil otherwise
+        // derives the pending base fee itself and validates queued txs
+        // against it; forked-block parent accounting made it reject real
+        // source txs whose maxFee sat just under the parent fee (observed:
+        // 3 txs at 53552045, `max fee per gas less than block base fee`).
+        // Pinning removes that whole class and makes gas cost exact.
+        raw::<Value>(&provider, "anvil_setNextBlockBaseFeePerGas", json!([format!("0x{base_fee:x}")]))
+            .await
+            .with_context(|| format!("cannot pin block {b} base fee to {base_fee}"))?;
+
+        // --- Opener-only race state (same-block semantics) -------------------
+        // The source block contains the opener AND the winning closes. Mining
+        // it whole and feeding logs in two passes does not help on-chain
+        // `simulate`: at the pin it already sees the gap closed by the same-
+        // block winner, so every contested episode is un-winnable by
+        // construction (observed 2026-11-07: 627 bps gap, all routes probed,
+        // zero calldata). Instead, mine a synthetic block containing ONLY the
+        // opener at the exact source timestamp/base-fee, measure
+        // trigger→ready-calldata there (exactly the state a backrunner targets
+        // when its tx lands after the opener and before the winner), then
+        // revert and replay the full source block for cache/status evidence.
+        if *b == open_block
+            && let Some(opener) = txs.iter().find(|t| t.hash == trigger_tx)
+        {
+            // Fund and impersonate BEFORE the snapshot so the revert restores the
+            // funded balance the full-block replay also relies on (`funded`
+            // would otherwise skip a sender whose top-up the revert undid).
+            if impersonated.insert(opener.from) {
+                raw::<Value>(&provider, "anvil_impersonateAccount", json!([opener.from])).await.ok();
+            }
+            const FUND_WEI: &str = "0x21e19e0c9bab2400000";
+            if funded.insert(opener.from) {
+                raw::<Value>(&provider, "anvil_setBalance", json!([opener.from, FUND_WEI])).await.ok();
+            }
+            let snap = raw::<Value>(&provider, "evm_snapshot", json!([])).await?;
+            let snap = snap.as_str().unwrap_or_default().to_string();
+            let mut request = json!({
+                "from": opener.from.to_string(),
+                "to": opener.to.map(|a| a.to_string()),
+                "nonce": format!("0x{:x}", opener.nonce),
+                "gas": opener.gas,
+                "value": opener.value,
+                "input": opener.input,
+            });
+            // Do NOT use the opener's own bid for this synthetic block. This episode's
+            // searcher set maxFee=maxPriority=301.8 gwei; Anvil's eth_gasPrice
+            // suggestion then echoes ~301 gwei, and the watcher rejects the
+            // whole scan on its 5 gwei ceiling (and the cost model prices 1M
+            // gas at ~$680). Execution and pool output are fee-independent, so
+            // give the synthetic tx a market fee (0.1 gwei) and keep the
+            // source fees for the full-block replay below.
+            request["maxFeePerGas"] = json!("0x5f5e100");
+            request["maxPriorityFeePerGas"] = json!("0x5f5e100");
+            let _ = (&opener.max_fee, &opener.max_prio, &opener.gas_price);
+            let sent_opener: Result<String> =
+                raw(&provider, "eth_sendTransaction", json!([request])).await;
+            if sent_opener.is_ok() {
+                raw::<Value>(&provider, "evm_mine", json!([])).await?;
+                let mined = raw::<Value>(
+                    &provider,
+                    "eth_getBlockByNumber",
+                    json!(["latest", true]),
+                )
+                .await?;
+                let mined_ts = hx_u64(mined["timestamp"].as_str().unwrap_or("0x0")).unwrap_or(0);
+                open_ts_exact = mined_ts == *ts;
+                if !open_ts_exact {
+                    bail!(
+                        "opener-only block {open_block} mined at ts {mined_ts}, source ts {ts}"
+                    );
+                }
+                let number = hx_u64(mined["number"].as_str().unwrap_or("0x0")).unwrap_or(0);
+                let head = HeadInfo {
+                    number,
+                    hash: B256::from_str(mined["hash"].as_str().unwrap_or_default())?,
+                    timestamp: mined_ts,
+                    base_fee_per_gas: hx_u64(mined["baseFeePerGas"].as_str().unwrap_or("0x0")),
+                };
+                let receipts = raw::<Value>(
+                    &provider,
+                    "eth_getBlockReceipts",
+                    json!([format!("0x{number:x}")]),
+                )
+                .await?;
+                let receipt = receipts
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let opener_status =
+                    hx_u64(receipt["status"].as_str().unwrap_or("0x0")) == Some(1);
+                open_ok = Some(opener_status);
+                let empty: Vec<Value> = Vec::new();
+                let mut pass: Vec<Trigger> = receipt["logs"]
+                    .as_array()
+                    .unwrap_or(&empty)
+                    .iter()
+                    .filter_map(|l| {
+                        l.get("address")
+                            .and_then(Value::as_str)
+                            .and_then(|a| Address::from_str(a).ok())
+                            .filter(|a| pools.contains(a))?;
+                        serde_json::from_value::<Log>(l.clone()).ok()
+                    })
+                    .map(|log| Trigger::Log { log, preconfirmed: false })
+                    .collect();
+                pass.push(Trigger::Head { head });
+                race_started = true;
+                // Warm the cache AT THIS STATE, off the ready clock. The prime
+                // above read open-1; the opener moved the stale pool, and a
+                // cold tick word would otherwise be fetched inside the timed
+                // scan (observed: 91.5 s ready_ms, all of it bootstrap). Live,
+                // the watcher's cache is maintained continuously, so this is
+                // the faithful equivalent of it already being current.
+                if let Some(index) = stale_index {
+                    scanner.prime_cl_for(&[index]).await;
+                    eprintln!("[race] warmed stale routes at the opener-only state");
+                }
+                let started = Instant::now();
+                let report = scanner.scan_triggers(&pass).await?;
+                let ms = started.elapsed().as_millis();
+                scan_times.push(ms);
+                eprintln!(
+                    "[race] opener-only scan: {ms} ms | pin={} routes={} quotes={} fails={} sims={} cached={} opps={} notes={:?}",
+                    report.block,
+                    report.routes_considered,
+                    report.quotes,
+                    report.quote_failures,
+                    report.simulations,
+                    report.sims_cached,
+                    report.opportunities.len(),
+                    report.notes.iter().take(4).collect::<Vec<_>>()
+                );
+                if !report.opportunities.is_empty() {
+                    let first = &report.opportunities[0];
+                    eprintln!(
+                        "[race] READY (opener-only) {ms} ms: asset={} route={:?} net_usd={:.4} calldata={}B opps={}",
+                        first.asset_symbol,
+                        first.labels(scanner.registry()),
+                        first.net_usd,
+                        first.calldata.len(),
+                        report.opportunities.len(),
+                    );
+                    ready_ms = Some(ms);
+                    ready_phases = vec![
+                        ("pin".into(), report.pin_ms as u128),
+                        ("core".into(), report.core_ms as u128),
+                        ("gas".into(), report.gas_ms as u128),
+                        ("probe".into(), report.probe_ms as u128),
+                        ("refine".into(), report.refine_ms as u128),
+                        ("simulate".into(), report.simulate_ms as u128),
+                        ("fresh".into(), report.fresh_ms as u128),
+                    ];
+                    opps_after_open = report
+                        .opportunities
+                        .iter()
+                        .take(4)
+                        .map(|o| {
+                            format!(
+                                "{} {} net={:.4}",
+                                o.asset_symbol,
+                                o.labels(scanner.registry()).join("+"),
+                                o.net_usd
+                            )
+                        })
+                        .collect();
+                }
+            } else if let Err(err) = sent_opener {
+                eprintln!("[replay] opener-only send failed: {err:#}");
+            }
+            let reverted = raw::<Value>(&provider, "evm_revert", json!([snap])).await?;
+            if reverted != Value::Bool(true) {
+                bail!("evm_revert of the opener-only block failed");
+            }
+            // Re-establish the source clock/fee for the full-block replay.
+            raw::<Value>(&provider, "evm_setNextBlockTimestamp", json!([format!("0x{pin:x}")]))
+                .await
+                .with_context(|| format!("cannot re-pin block {b} timestamp after revert"))?;
+            raw::<Value>(&provider, "anvil_setNextBlockBaseFeePerGas", json!([format!("0x{base_fee:x}")]))
+                .await
+                .with_context(|| format!("cannot re-pin block {b} base fee after revert"))?;
+        }
+
         // Anvil re-signs impersonated sends, so each source tx lands under a
         // NEW local hash. Record the mapping to attribute receipts back.
         let mut src_by_local: HashMap<B256, B256> = HashMap::new();
-        let mut senders: HashSet<Address> = HashSet::new();
         let mut sent_this_block = 0usize;
-        for tx in txs.iter().filter(|t| t.touches_pools) {
+        let mut sent_pool_this_block = 0usize;
+        for tx in txs
+            .iter()
+            .filter(|t| replay_all || t.touches_pools || t.touches_state)
+        {
             if is_system_tx(tx.to) {
                 continue;
             }
-            if senders.insert(tx.from) {
+            // Impersonate and over-fund each sender ONCE. The old path read
+            // `eth_getBalance` and issued `anvil_setNonce` per transaction,
+            // which on a full-block replay (~300-400 txs/block) dominated the
+            // wall clock at ~45 s/block. Funding only ever RAISES a balance and
+            // gas paid never changes a swap's output, so one generous top-up
+            // is safe; the source nonce still rides in the request itself.
+            if impersonated.insert(tx.from) {
                 raw::<Value>(&provider, "anvil_impersonateAccount", json!([tx.from])).await.ok();
             }
-            let bal = raw::<String>(&provider, "eth_getBalance", json!([tx.from, "latest"]))
-                .await
-                .unwrap_or_default();
-            let bal = U256::from_str_radix(bal.strip_prefix("0x").unwrap_or("0"), 16).unwrap_or(U256::ZERO);
-            let value_u =
-                U256::from_str_radix(tx.value.strip_prefix("0x").unwrap_or("0"), 16).unwrap_or(U256::ZERO);
-            // Fund `value + gas_limit * price + buffer`. Anvil sizes the local
-            // 1559 maxFee well above the fork base fee, so a flat ETH buffer
-            // underfunds high-gas-limit txs (the `-32003` failure). Over-
-            // funding an impersonated account is harmless: we only ever RAISE
-            // the balance, and gas paid never changes a swap's output.
-            let gas_limit = hx_u64(&tx.gas).unwrap_or(21_000);
-            let need = value_u
-                + U256::from(gas_limit) * U256::from(50_000_000_000u64) // 50 gwei headroom
-                + U256::from(10u64.pow(15)); // 0.001 ETH slack
-            if bal < need {
-                raw::<Value>(&provider, "anvil_setBalance", json!([tx.from, format!("0x{need:x}")]))
-                    .await
-                    .ok();
+            const FUND_WEI: &str = "0x21e19e0c9bab2400000"; // 10,000 ETH
+            if funded.insert(tx.from) {
+                raw::<Value>(&provider, "anvil_setBalance", json!([tx.from, FUND_WEI])).await.ok();
             }
-            raw::<Value>(&provider, "anvil_setNonce", json!([tx.from, format!("0x{:x}", tx.nonce)])).await.ok();
             let mut request = json!({
                 "from": tx.from.to_string(),
                 "to": tx.to.map(|a| a.to_string()),
@@ -465,7 +721,15 @@ async fn run() -> Result<()> {
             } else if let Some(gp) = &tx.gas_price {
                 request["gasPrice"] = json!(gp);
             }
-            let res: Result<String> = raw(&provider, "eth_sendTransaction", json!([request])).await;
+            let mut res: Result<String> = raw(&provider, "eth_sendTransaction", json!([request.clone()])).await;
+            if res.is_err() {
+                // A nonce gap (a skipped/failed predecessor) or a base-fee
+                // mismatch is the usual cause; force the source nonce and the
+                // funded balance once, then retry the same tx.
+                raw::<Value>(&provider, "anvil_setNonce", json!([tx.from, format!("0x{:x}", tx.nonce)])).await.ok();
+                raw::<Value>(&provider, "anvil_setBalance", json!([tx.from, FUND_WEI])).await.ok();
+                res = raw(&provider, "eth_sendTransaction", json!([request])).await;
+            }
             match res {
                 Ok(local_hash) => {
                     if let Ok(lh) = B256::from_str(local_hash.trim()) {
@@ -473,15 +737,21 @@ async fn run() -> Result<()> {
                     }
                     sent += 1;
                     sent_this_block += 1;
+                    if tx.touches_pools {
+                        sent_pool_this_block += 1;
+                    }
                 }
                 Err(err) => {
                     send_failed += 1;
-                    eprintln!("[replay] pool tx {} send failed: {err:#}", tx.hash);
+                    // Never leave a nonce hole: the next tx from this sender
+                    // must not queue behind a transaction that was never sent.
+                    raw::<Value>(&provider, "anvil_setNonce", json!([tx.from, format!("0x{:x}", tx.nonce + 1)])).await.ok();
+                    eprintln!("[replay] tx {} send failed: {err:#}", tx.hash);
                 }
             }
         }
         eprintln!(
-            "[replay] block {b}: sent {sent_this_block} pool txs, mining at ts {pin}{}",
+            "[replay] block {b}: sent {sent_pool_this_block} pool / {sent_this_block} total txs, mining at ts {pin}{}",
             if pin == *ts {
                 " (source)".to_string()
             } else {
@@ -618,6 +888,14 @@ async fn run() -> Result<()> {
             batch.push(Trigger::Head { head: head_copy });
             passes.push(batch);
         }
+        if *b == open_block {
+            eprintln!(
+                "[race] open block: {} passes, {} pool-log txs, trigger_local={:?}",
+                passes.len(),
+                per_tx.len(),
+                trigger_local
+            );
+        }
         for pass in passes.iter() {
             let started = Instant::now();
             let report = scanner.scan_triggers(pass).await?;
@@ -626,6 +904,20 @@ async fn run() -> Result<()> {
             if !is_race_block {
                 continue;
             }
+            // The verdict's evidence: what the production path actually saw.
+            // Without this a NO READY CALLDATA run is indistinguishable from a
+            // market with no gap.
+            eprintln!(
+                "[race] scan block {b}: {ms} ms | pin={} routes={} quotes={} fails={} sims={} cached={} opps={} notes={:?}",
+                report.block,
+                report.routes_considered,
+                report.quotes,
+                report.quote_failures,
+                report.simulations,
+                report.sims_cached,
+                report.opportunities.len(),
+                report.notes.iter().take(4).collect::<Vec<_>>()
+            );
             if ready_ms.is_none() && !report.opportunities.is_empty() && race_started {
             let first = &report.opportunities[0];
             eprintln!(
@@ -718,6 +1010,8 @@ async fn run() -> Result<()> {
         "warmup_reverts": warmup_reverts,
         "open_ts_exact": open_ts_exact,
         "source_txs": total_txs,
+        "replay_all": replay_all,
+        "state_txs": state_txs,
         "sent": sent,
         "send_failed": send_failed,
         "status_mismatch": status_mismatch,
@@ -744,8 +1038,18 @@ fn replay_settings(fork_rpc: &str, manifest_path: &str) -> Settings {
         mode: Mode::DryRun,
         max_gas_price_gwei: 5.0,
         min_net_profit_usd: 0.25,
-        max_candidates: 16,
-        max_simulations: 8,
+        max_candidates: std::env::var("RYO_MAX_CANDIDATES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16),
+        max_simulations: std::env::var("RYO_MAX_SIMULATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8),
+        probe_amounts_usd: std::env::var("RYO_REPLAY_PROBE_USD")
+            .ok()
+            .and_then(|v| v.split(',').map(|s| s.trim().parse::<f64>().ok()).collect())
+            .unwrap_or_else(|| vec![500.0, 2_000.0, 8_000.0]),
         // Race semantics: submission is the decision point. The freshness
         // pass re-prices at a NEWER block — it makes the report prettier and
         // loses the same-block race, so it is excluded from ready_ms.

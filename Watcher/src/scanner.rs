@@ -478,12 +478,24 @@ impl Scanner {
                     enumerate_cycles(&registry, *asset, settings.max_hops),
                 )
             })
+            .collect::<HashMap<Address, Vec<Route>>>();
+
+        // A pool that appears in no enumerated route can never answer a quote,
+        // so it must not be bootstrapped or maintained. At the default
+        // `max_hops = 2` this excludes every cross-pair (cbBTC/EURC) CL pool,
+        // roughly halving the cold-fork bootstrap wave without changing a
+        // single candidate: the route set *is* the quoting universe.
+        let routed_pools: HashSet<usize> = routes
+            .values()
+            .flatten()
+            .flat_map(|route| route.pool_indices())
             .collect();
 
         let cl_specs: Vec<ClPoolSpec> = registry
             .pools
             .iter()
             .enumerate()
+            .filter(|(index, _)| routed_pools.contains(index))
             .filter_map(|(index, pool)| match pool.venue {
                 Venue::UniV3 { .. } | Venue::PancakeV3 { .. } => Some(ClPoolSpec {
                     index,
@@ -1279,10 +1291,34 @@ impl Scanner {
             }
         }
 
+        // A trigger only invalidates the routes that contain its pools, so the CL
+        // cache needs only the pools those routes walk. Bootstrapping the rest
+        // is pure archive I/O (a cold fork pays it tick by tick) and cannot
+        // affect this scan. A full scan / reconnect (`affected == None`) still
+        // needs everything.
+        let relevant_pools: Option<HashSet<usize>> = affected_set.as_ref().map(|affected| {
+            let mut set = HashSet::new();
+            for routes in self.routes.values() {
+                for route in routes {
+                    if route
+                        .steps
+                        .iter()
+                        .any(|step| affected.contains(&step.pool_index))
+                    {
+                        set.extend(route.pool_indices());
+                    }
+                }
+            }
+            set
+        });
+
         // One round-trip fetches every constant-product pool's reserves so the
         // probe/refine below can price those legs locally instead of via the
         // router. Shared across assets (same pinned block).
-        let (cp, cl) = tokio::join!(self.cp_pools(block_id), self.cl_states());
+        let (cp, cl) = tokio::join!(
+            self.cp_pools(block_id),
+            self.cl_states(relevant_pools.as_ref())
+        );
 
         // Assets are independent after the shared context is resolved, so
         // scan them concurrently. `buffered` (not `buffer_unordered`) keeps
@@ -1760,7 +1796,30 @@ impl Scanner {
         if !self.settings.local_cl {
             return;
         }
-        self.cl_cache_sync().await;
+        self.cl_cache_sync(None).await;
+    }
+
+    /// Warm only the CL pools that a trigger on `affected` can reach. One
+    /// trigger invalidates a narrow route set; bootstrapping the other pools
+    /// is archive I/O for legs this scan cannot quote.
+    pub async fn prime_cl_for(&self, affected: &[usize]) {
+        if !self.settings.local_cl {
+            return;
+        }
+        let affected: HashSet<usize> = affected.iter().copied().collect();
+        let mut relevant = HashSet::new();
+        for routes in self.routes.values() {
+            for route in routes {
+                if route
+                    .steps
+                    .iter()
+                    .any(|step| affected.contains(&step.pool_index))
+                {
+                    relevant.extend(route.pool_indices());
+                }
+            }
+        }
+        self.cl_cache_sync(Some(&relevant)).await;
     }
 
     /// Snapshot the CL cache for one scan: re-bootstrap pools that are
@@ -1772,19 +1831,23 @@ impl Scanner {
     /// and the `plan` path are always priced on chain at the pin (§0u).
     /// Returns empty until the trigger inbox has run at least once
     /// (`cl_armed`): a cache nobody feeds is not an honest cache.
-    async fn cl_states(&self) -> HashMap<usize, ClPoolState> {
+    async fn cl_states(&self, relevant: Option<&HashSet<usize>>) -> HashMap<usize, ClPoolState> {
         if !self.settings.local_cl || !self.cl_armed.load(Ordering::Relaxed) {
             return HashMap::new();
         }
-        self.cl_cache_sync().await
+        self.cl_cache_sync(relevant).await
     }
 
-    async fn cl_cache_sync(&self) -> HashMap<usize, ClPoolState> {
+    async fn cl_cache_sync(
+        &self,
+        relevant: Option<&HashSet<usize>>,
+    ) -> HashMap<usize, ClPoolState> {
         let (mut map, need) = {
             let cache = self.cl_pools.lock().expect("cl cache mutex poisoned");
             let mut need: Vec<ClPoolSpec> = self
                 .cl_specs
                 .iter()
+                .filter(|spec| relevant.is_none_or(|set| set.contains(&spec.index)))
                 .filter(|spec| cache.get(&spec.index).is_none_or(|state| state.stale))
                 .copied()
                 .collect();
@@ -1873,6 +1936,18 @@ impl Scanner {
                 };
                 match clamm::swap_after_words(log) {
                     Some((sqrt, liquidity, tick)) => state.apply_swap_after(sqrt, liquidity, tick),
+                    // Collect/Flash/CollectProtocol/SetFeeProtocol/
+                    // IncreaseObservationCardinalityNext move fees, oracle
+                    // slots or the protocol-fee split only. None of them can
+                    // change price, liquidity, the bitmap or the tick nets,
+                    // so treating them as "unknown, re-bootstrap" forced a
+                    // cold tick wave on the busiest pools for no information.
+                    None if log
+                        .topics()
+                        .first()
+                        .is_some_and(|topic| clamm::is_benign_event(*topic)) => {}
+                    // Mint/Burn (and any unrecognised event) can flip tick
+                    // state the cached bitmap has not seen: re-read.
                     None => state.mark_stale(),
                 }
             }
@@ -2375,18 +2450,32 @@ async fn simulate_route(
         }
     };
 
-    // One pinned batch carries both probes: the simulation and the L1 bound
-    // for the execute transaction these same steps will produce (§0t).
-    let costs = match simulate::simulate_with_l1_fee(
-        provider,
-        manifest.core,
+    // Gas estimation does not depend on the *value* of `minProfit` (it is one
+    // static word and the only branch reads it after the route has run), so
+    // price the execute calldata with a placeholder of zero and start the
+    // estimate concurrently with the simulate + L1 batch. This overlaps the
+    // two expensive EVM executions instead of serialising them. The final
+    // calldata length is asserted against the batched L1 bound below, so an
+    // ABI change still fails loudly.
+    let placeholder = ryo::executeCall {
         asset,
         amount,
-        steps.clone(),
-        block,
-    )
-    .await
-    {
+        steps: steps.clone(),
+        minProfit: U256::ZERO,
+    };
+    let gas_future = chain::estimate_gas_from(
+        provider,
+        manifest.core,
+        Bytes::from(placeholder.abi_encode()),
+        Some(manifest.operator),
+    );
+    // One pinned batch carries both probes: the simulation and the L1 bound
+    // for the execute transaction these same steps will produce (§0t).
+    let (sim_result, gas_result) = tokio::join!(
+        simulate::simulate_with_l1_fee(provider, manifest.core, asset, amount, steps.clone(), block),
+        gas_future,
+    );
+    let costs = match sim_result {
         Ok(costs) => costs,
         Err(simulate::SimCostError::Definitive(SimulateError::Revert { decoded, .. })) => {
             debug!(route = ?route.labels(registry), %decoded, "simulation reverted");
@@ -2444,14 +2533,7 @@ async fn simulate_route(
         return (None, false);
     };
 
-    let gas_used = match chain::estimate_gas_from(
-        provider,
-        manifest.core,
-        calldata.clone(),
-        Some(manifest.operator),
-    )
-    .await
-    {
+    let gas_used = match gas_result {
         Ok(gas) => gas,
         Err(err) => {
             debug!(error = %err, "gas estimate failed; using fallback");

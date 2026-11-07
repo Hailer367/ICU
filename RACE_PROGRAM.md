@@ -17,6 +17,96 @@
 
 ---
 
+## 0-A. 2026-11-07 session update — tradability correction, fast bench, first Record B
+
+> Read this before §3/§4/§8. It supersedes the episode *ranking* and records
+> the first measured ready number.
+
+### Environment
+- Foundry **1.9.0** (`foundryup -i 1.9.0`); forge-std v1.17.0 + OZ v5.7.0.
+  `ryo/lib/` and `ryo/foundry.lock` are git-ignored — never commit the
+  `.gitmodules`/gitlinks that `forge install` stages.
+- Alchemy Base endpoints live only in **`~/.ryo_env`** (chmod 600, outside the
+  repo). Use them sparingly and **only for fork state**; harvest and source
+  blocks use `base-rpc.publicnode.com`. Anvil caches fork RPC under
+  `~/.foundry/cache/rpc/`.
+- Data rebuilt exactly: `data/swaps_24h.jsonl` = 216,906 swaps.
+- **Record A reproduced exactly at 60 bps**: 294 episodes / 158 closed / 62
+  same-block / 88 contested; rank 0 = 627.51 bps @ 53,552,121.
+
+### Tradability correction (the important result)
+- The 627.5 bps rank-0 opener is **0.00168 WETH / 3.78 USDC on a $45-depth
+  pool**. The dynamic floor correctly skips it: it is unmonetizable dust, not
+  a lost race.
+- At 60 bps, every deep-pool episode fails either its own pool floor or the
+  round-trip cost at the watcher's probe sizes. **A bps-ranked Record A is the
+  wrong cohort.**
+- Rebuilt at **20 bps**: 1,848 episodes, 440 same-block, 567 contested
+  (lag <= 1). 341 clear opener >= floor, gap > fees + 5 bps, sell depth >= $10k
+  (`data/episodes_tradable_20bps.json`).
+- Best clean race: **58.53 bps, open 53,551,224**, slipstream:100 ($8.3M) ->
+  pancake:100 ($19.9M), $44.3k opener (floor $41.2k), 9.1 bps fees, winner at
+  log position 20 (~67 ms proxy). Same block also sells at positions
+  7/69/80/142/149/306/379/386 (~23-1,287 ms proxies).
+
+### First Record B (2026-11-07)
+- The production path produced **8 opportunities**, best
+  `pancake:100 > slipstream:100`, **net $37.06**, **676-byte** calldata.
+- `ready_ms = 91,493 ms` in that run — the entire number was a cold
+  tick-bootstrap chunk inside the timed scan. The harness now warms the cache
+  at the opener-only state off-clock; the warm number is the one to trust.
+- The verdict vs position 20 (67 ms) is therefore not yet meaningful.
+
+### Race-semantics discovery (product gap)
+Mining the whole open block and feeding logs in two passes does not help
+on-chain `simulate`: at the pin the winner's close is already in state, so
+every contested episode is un-winnable by construction. The harness now mines
+a synthetic **opener-only** block, times trigger -> ready there (the state a
+backrunner targets), then reverts and replays the full block. To compete live,
+the watcher needs **projected-state simulation**: apply the pending swap's
+post-state to the pool used by `simulate` (e.g. `eth_call` state overrides for
+`slot0` + `liquidity`, or a local EVM). Until then it can only find gaps that
+already exist on-chain.
+
+### Harness changes (`tests/replay_race.rs`, `tools/`)
+- State-injected deployment at the exact base block (`anvil_setCode` /
+  `anvil_setStorageAt`) — no deploy blocks, no missing source blocks.
+  Regenerate with `tools/capture_deploy_state.py`; apply with
+  `tools/inject_deploy.py`.
+- Replays every tx whose receipt touches a registry pool, tracked token,
+  Permit2 or the Balancer vault (default); `RYO_REPLAY_ALL=1` for all txs.
+- Pins source timestamp, base fee (`anvil_setNextBlockBaseFeePerGas`) and fork
+  gas price (`--gas-price 15000000`); gas limit 400M = Base.
+- Targeted off-clock CL prime (`prime_cl_for`, `RYO_CL_WORDS`,
+  `RYO_CL_TICK_CAP`) plus lazy per-scan bootstrap of affected routes only.
+- Opener-only block uses a market fee: a 301.8 gwei searcher bid otherwise
+  pollutes Anvil's `eth_gasPrice` and rejects the scan.
+
+### Production levers landed
+- `--source` default is now `logs` (post-Denim; Alchemy rejects `pendingLogs`).
+- Benign V3 events no longer invalidate the CL cache (Collect/Flash/etc.;
+  verified against v3-core). Mint/Burn/unknown still do.
+- `eth_estimateGas` overlaps the simulate+L1 batch (placeholder `minProfit=0`;
+  final calldata length asserted).
+- 130 lib tests pass; tight-coverage live CL differential: 498 exact,
+  0 mismatches, 58 designed refusals -> remote.
+
+### Fast vs faithful
+Use `tools/latency_bench.sh [minutes]` for iteration: live Base `logs`
+triggers + latest-state fork + injected core; read `avg_scan_ms` and phase
+averages in minutes. Use the historical replay only for head-to-head
+validation. Speed is necessary, not sufficient: inclusion/queue position and
+projected-state calldata remain gating.
+
+### Immediate next steps
+1. Warm-ready run on 53,551,224 (and the same-block sell sides via `--reuse`);
+   record `ready_ms` + phases in §3/§4.
+2. A/B `max_simulations` 8 vs 4 and probe sizes on the same fork.
+3. Implement projected-state simulation (state overrides) — the real gate.
+4. Re-baseline Record A at 20 bps ranked by depth/notional, not bps.
+
+---
+
 ## 0. What this program IS (read first)
 
 The watcher (`Watcher/`, Rust crate `ryo-watch`) already **finds and prices

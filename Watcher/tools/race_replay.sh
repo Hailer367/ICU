@@ -94,7 +94,61 @@ if [ "$REUSE" = "--reuse" ] && [ -f /tmp/race_snap.txt ] && [ -f /tmp/race_base.
 fi
 
 if [ "$REUSED" = "0" ]; then
-# --- Block-NUMBER alignment -------------------------------------------------
+INJECT="${RYO_INJECT_DEPLOY:-1}"
+if [ "$INJECT" = "1" ] && [ -f data/race_deploy_state.json ]; then
+# --- State injection (fidelity-first) ---------------------------------------
+# Deploying with `forge script` mines D local blocks. Forking D blocks
+# earlier keeps block NUMBERS aligned, but those D source blocks are then
+# never applied, so the pool state entering the race window is D blocks
+# stale (found 2026-11-07: this alone can erase the gap being replayed).
+# Instead: fork exactly at BASE and inject the already-built core + adapters
+# with anvil_setCode/anvil_setStorageAt. No blocks are mined, head == BASE,
+# and every source block BASE+1..base+1 is replayed onto exact source state.
+    FORK_BLOCK=$BASE
+    echo "[race] inject mode: fork at base $FORK_BLOCK; deployment injected (no synthetic blocks)"
+    pkill -x anvil 2>/dev/null || true
+    sleep 1
+    # Gas limit MUST equal the source block's (Base: 400M). EIP-1559 derives
+    # the next base fee from `parent.gasUsed / (parent.gasLimit/2)`, so a
+    # different limit here makes the local base fee drift away from source;
+    # transactions whose maxFee sits between the two are then rejected with
+    # `max fee per gas less than block base fee` and the world diverges.
+    # --gas-price pins eth_gasPrice to the MARKET price. Without it Anvil
+    # echoes the last/pending tx's own bid: this episode's searcher opener
+    # carries maxFee=maxPriority=301.8 gwei, so the watcher saw a 301 gwei
+    # market and rejected the scan on its 5 gwei ceiling (and the cost model
+    # would have priced 1M gas at ~$680). Base's real floor here is ~0.015
+    # gwei (base 0.01437 + ~0.001 tip).
+    nohup anvil --fork-url "$ALCHEMY_BASE_HTTP" --fork-block-number "$FORK_BLOCK" --chain-id 8453 --order fifo --gas-limit 400000000 --gas-price 15000000 --max-transactions 4096 --port 8545 >/tmp/anvil_race.log 2>&1 &
+    for i in $(seq 1 20); do curl -s -X POST http://127.0.0.1:8545 -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' >/dev/null && break; sleep 1; done
+    python3 - <<'PY'
+import json, subprocess
+state = json.load(open('data/race_deploy_state.json'))
+RPC = 'http://127.0.0.1:8545'
+def cast(*args):
+    r = subprocess.run(['cast', *args, '--rpc-url', RPC], capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit(f"cast {' '.join(args)} failed: {r.stderr}")
+    return r.stdout.strip()
+core = state['core']
+cast('rpc', 'anvil_setCode', core, state['core_code'])
+for name, adapter in state['adapters'].items():
+    cast('rpc', 'anvil_setCode', adapter['address'], adapter['code'])
+for slot, value in state['core_storage'].items():
+    cast('rpc', 'anvil_setStorageAt', core, slot, value)
+manifest = state['manifest']
+for role in {manifest['owner'], manifest['operator'], manifest['profitRecipient']}:
+    cast('rpc', 'anvil_setBalance', role, '0x21e19e0c9bab2400000')  # 10k ETH
+print('[race] injected core', core,
+      'paused', cast('call', core, 'paused()(bool)'),
+      'maxGas', cast('call', core, 'maxGasPrice()(uint256)'),
+      'wethCap', cast('call', core, 'maxTradeSize(address)(uint256)', manifest['tokens']['WETH']))
+PY
+    echo "$BASE" > /tmp/race_base.txt
+    echo "$FORK_BLOCK" > /tmp/race_fork.txt
+    rpc evm_snapshot '[]' | python3 -c "import json,sys;print(json.load(sys.stdin)['result'])" > /tmp/race_snap.txt
+else
+# --- Block-NUMBER alignment (legacy deploy path) ----------------------------
 # Replayed txs often carry block.number deadlines (Permit2 expirations, V4
 # hook windows — observed 2026-11-06: the rank-0 opener reverts with a
 # block-number error when local numbers run ahead of source). Deploy consumes
@@ -116,14 +170,11 @@ while :; do
     # the default `fees` re-sorts by tip and reorders the world (observed
     # 2026-11-06: the rank-0 opener reverted purely because its blockmates
     # were permuted).
-    # --gas-limit 500M + --max-transactions 4096: a whole source block's
-    # pool-touching txs (observed up to 117 txs) MUST fit in the single local
-    # block we mine for it. Overflow is not just messy — the harness's drain
-    # guard mines leftovers as extra +1s blocks, and every extra mine pushes
-    # the local clock ahead of source cadence permanently (run 3 died of
-    # exactly that: +65s drift by the open block). Size ceilings must make
-    # the guard unreachable, not exercise it.
-    nohup anvil --fork-url "$ALCHEMY_BASE_HTTP" --fork-block-number "$FORK_BLOCK" --chain-id 8453 --order fifo --gas-limit 500000000 --max-transactions 4096 --port 8545 >/tmp/anvil_race.log 2>&1 &
+    # --gas-limit 400M must equal Base's source block limit (see the inject
+    # branch above: EIP-1559 base-fee tracking depends on it). --max-transactions
+    # 4096 gives a full block's txs (observed up to 421) room to land in one
+    # local block; the harness's drain guard treats any overflow as a bail.
+    nohup anvil --fork-url "$ALCHEMY_BASE_HTTP" --fork-block-number "$FORK_BLOCK" --chain-id 8453 --order fifo --gas-limit 400000000 --gas-price 15000000 --max-transactions 4096 --port 8545 >/tmp/anvil_race.log 2>&1 &
     for i in $(seq 1 20); do curl -s -X POST http://127.0.0.1:8545 -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' >/dev/null && break; sleep 1; done
     # forge script estimates EIP-1559 fees via eth_feeHistory; on a fresh fork
     # the request falls through to Alchemy, which errors "invalid block range"
@@ -154,7 +205,8 @@ done
 echo "$BASE" > /tmp/race_base.txt
 echo "$FORK_BLOCK" > /tmp/race_fork.txt
 rpc evm_snapshot '[]' | python3 -c "import json,sys;print(json.load(sys.stdin)['result'])" > /tmp/race_snap.txt
-fi
+fi  # legacy deploy path
+fi  # REUSED=0
 FORK_BLOCK=$(cat /tmp/race_fork.txt)
 
 BIN=$(ls -t target/debug/deps/ | grep '^replay_race-' | grep -v '\.d$' | head -1)

@@ -957,6 +957,27 @@ pub const WORDS_PER_DIRECTION: i32 = 16;
 /// densest side when a word range exceeds it. Deep pools keep their whole
 /// current word (max 256 bits) regardless.
 pub const TICK_CAP_PER_DIRECTION: usize = 150;
+
+/// Harness/test overrides for the bootstrap coverage. Production keeps the
+/// conservative defaults above; a replay fork pays the tick reads one by one
+/// from an archive RPC, and a tighter band makes iterative runs minutes
+/// faster. A refusal is still "quote on chain", so narrowing coverage can
+/// only add round-trips, never a wrong price.
+fn words_per_direction() -> i32 {
+    std::env::var("RYO_CL_WORDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &i32| *v > 0)
+        .unwrap_or(WORDS_PER_DIRECTION)
+}
+
+fn tick_cap_per_direction() -> usize {
+    std::env::var("RYO_CL_TICK_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .unwrap_or(TICK_CAP_PER_DIRECTION)
+}
 /// Multicall3 chunk size, matching `venues::quote_batch`.
 const MULTICALL_CHUNK: usize = 80;
 
@@ -1103,7 +1124,7 @@ pub async fn bootstrap_pools(
         let compressed = draft.tick.div_euclid(draft.tick_spacing);
         let center = compressed >> 8;
         let positions: Vec<i32> =
-            (center - WORDS_PER_DIRECTION..=center + WORDS_PER_DIRECTION).collect();
+            (center - words_per_direction()..=center + words_per_direction()).collect();
         for &wp in &positions {
             word_calls.push((
                 draft.spec.address,
@@ -1180,7 +1201,7 @@ pub async fn bootstrap_pools(
             } else {
                 (next_hi, cost_hi)
             };
-            if used.saturating_add(cost) > 2 * TICK_CAP_PER_DIRECTION {
+            if used.saturating_add(cost) > 2 * tick_cap_per_direction() {
                 break;
             }
             if take == next_lo {
@@ -1299,6 +1320,36 @@ pub fn swap_after_words(log: &Log) -> Option<(U256, U256, i32)> {
     let liquidity = U256::from_be_slice(data.get(96..128)?);
     let tick: [u8; 4] = data.get(156..160)?.try_into().ok()?;
     Some((sqrt_price_x96, liquidity, i32::from_be_bytes(tick)))
+}
+
+/// Pool events that cannot change any state the quote math reads. Verified
+/// against upstream `UniswapV3Pool.sol` (v3-core, 0.7.6):
+/// `collect()` touches only `positions[].tokensOwed` and token balances,
+/// `flash()` moves fee-growth/protocol-fee accumulators, `collectProtocol()`
+/// moves protocol fees, `setFeeProtocol()` changes `slot0.feeProtocol` (which
+/// v3-core deducts *after* input consumption, so quoted amounts are
+/// independent of it), and `increaseObservationCardinalityNext()` grows the
+/// oracle ring. None touches `slot0.sqrtPriceX96/tick`, `liquidity`, the tick
+/// bitmap or a tick's `liquidityNet`.
+///
+/// Treating these as "unknown" forced a full cold re-bootstrap of the pool on
+/// every fee collection — the single most common non-swap event on busy pools.
+/// `Mint`/`Burn` are deliberately absent: they *do* change liquidity and the
+/// bitmap, so they must still mark the cache stale.
+pub const BENIGN_EVENT_SIGS: [&str; 5] = [
+    "Collect(address,address,int24,int24,uint128,uint128)",
+    "Flash(address,address,uint256,uint256,uint256,uint256)",
+    "CollectProtocol(address,address,uint128,uint128)",
+    "SetFeeProtocol(uint8,uint8,uint8,uint8)",
+    "IncreaseObservationCardinalityNext(uint16,uint16)",
+];
+
+/// True when `topic0` names an event that cannot invalidate the cached quote
+/// state. Unknown topics are *not* benign: they mark the pool stale.
+pub fn is_benign_event(topic0: B256) -> bool {
+    static TOPICS: OnceLock<[B256; BENIGN_EVENT_SIGS.len()]> = OnceLock::new();
+    let topics = TOPICS.get_or_init(|| BENIGN_EVENT_SIGS.map(|sig| keccak256(sig.as_bytes())));
+    topics.contains(&topic0)
 }
 
 /// Read `fee()` for a batch of pools at one block. Slipstream fees are
@@ -1706,5 +1757,25 @@ mod tests {
         ] {
             let _ = state.quote_exact_in(Address(FixedBytes([1u8; 20])), amount);
         }
+    }
+
+    #[test]
+    fn only_events_that_cannot_move_price_or_liquidity_are_benign() {
+        let topic = |sig: &str| keccak256(sig.as_bytes());
+        for sig in BENIGN_EVENT_SIGS {
+            assert!(is_benign_event(topic(sig)), "{sig} must not force a re-bootstrap");
+        }
+        // Structural events: they change liquidity / the bitmap and must mark
+        // the cache stale so it is re-read.
+        for sig in [
+            "Mint(address,address,int24,int24,uint128,uint256,uint256)",
+            "Burn(address,int24,int24,uint128,uint256,uint256)",
+            "Swap(address,address,int256,int256,uint160,uint128,int24)",
+        ] {
+            assert!(!is_benign_event(topic(sig)), "{sig} must invalidate the cache");
+        }
+        // An unknown event is never assumed harmless.
+        assert!(!is_benign_event(B256::ZERO));
+        assert!(!is_benign_event(topic("SomethingNew(uint256)")));
     }
 }

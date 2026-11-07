@@ -3053,6 +3053,56 @@ submodule staging was un-staged (repo excludes deps by design).
 
 ---
 
+### 0y. 2026-11-07 — tradability correction, first Record B, replay fidelity rebuilt
+
+Full detail in `RACE_PROGRAM.md §0-A`; this is the session log.
+
+**Environment.** Foundry 1.9.0 installed; forge deps v1.17.0/v5.7.0 (`ryo/lib`
+and `foundry.lock` stay git-ignored). Alchemy endpoints only in `~/.ryo_env`
+(chmod 600); harvest/source use publicnode, Alchemy is fork-state only. Data
+rebuilt exactly: 216,906 swaps. **Record A reproduced exactly** at 60 bps:
+294 / 158 closed / 62 same-block / 88 contested, rank 0 = 627.51 bps @
+53,552,121.
+
+**Tradability correction.** Rank 0's opener is **0.00168 WETH / 3.78 USDC on
+a $45-depth pool** — the dynamic floor correctly skips it. At 60 bps every
+deep-pool episode fails either its pool floor or the round-trip cost at the
+watcher's probe sizes; the bps-ranked cohort is the wrong one. Rebuilt at
+20 bps: 1,848 episodes, 440 same-block, 567 contested; 341 clear
+opener >= floor, gap > fees + 5 bps, sell depth >= $10k. Best clean race:
+58.53 bps @ 53,551,224 (slipstream:100 $8.3M -> pancake:100 $19.9M, $44.3k
+opener vs $41.2k floor, fees 9.1 bps, winner at log pos 20 ~ 67 ms proxy).
+
+**First Record B.** Production path produced **8 opportunities**, best
+`pancake:100 > slipstream:100`, **net $37.06**, **676 B** calldata. The first
+`ready_ms` reading was 91,493 ms and was *entirely* a cold tick-bootstrap
+chunk inside the timed scan; the harness now warms the cache at the
+opener-only state off-clock, so the warm number is the next run.
+
+**Race semantics (product gap).** Mining the whole open block and feeding logs
+in two passes does not help on-chain `simulate`: the pin already contains the
+winner's close, so contested episodes are un-winnable by construction. The
+harness now mines a synthetic opener-only block, times trigger -> ready there,
+then reverts and replays the full block. Live competition needs
+**projected-state simulation** (apply the pending swap's post-state to the
+pool `simulate` reads — e.g. `eth_call` state overrides for `slot0` +
+`liquidity`, or a local EVM).
+
+**Harness fixes (all in `tests/replay_race.rs` / `tools/`).** State-injected
+deployment at the exact base block (no deploy blocks / missing source blocks);
+state-relevant or all-tx replay; source timestamp + base fee + gas price
+pinned; gas limit 400M; target/off-clock CL prime and lazy per-scan bootstrap;
+opener-only market fee (a 301.8 gwei searcher bid otherwise poisons Anvil's
+`eth_gasPrice`). New: `tools/capture_deploy_state.py`, `tools/inject_deploy.py`,
+`tools/latency_bench.sh`.
+
+**Production levers.** `--source` default `logs` (post-Denim); benign V3 events
+no longer invalidate the CL cache; `eth_estimateGas` overlaps the simulate+L1
+batch; lazy/affected-only CL bootstrap. **130 lib tests pass**; tight-coverage
+live differential 498 exact / 0 mismatches / 58 designed refusals.
+
+---
+
 ## 8. Key protocol facts / gotchas
 
 
